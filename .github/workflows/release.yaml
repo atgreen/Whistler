@@ -1,0 +1,105 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  # ========================================
+  # Fetch dependencies using ocicl
+  # ========================================
+  fetch-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ocicl
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sbcl curl jq
+          OCICL_URL=$(curl -sL -H "Authorization: token $GH_TOKEN" \
+            https://api.github.com/repos/ocicl/ocicl/releases/latest | \
+            jq -r '.assets[] | select(.name | endswith("_amd64.deb")) | .browser_download_url')
+          curl -sL "$OCICL_URL" -o /tmp/ocicl.deb
+          sudo dpkg -i /tmp/ocicl.deb
+          ocicl setup > ~/.sbclrc
+
+      - name: Fetch Lisp dependencies
+        run: ocicl install
+
+      - name: Upload ocicl directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocicl-deps
+          path: ocicl
+          retention-days: 1
+
+  # ========================================
+  # Build Linux binary
+  # ========================================
+  build-linux:
+    needs: fetch-deps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download ocicl dependencies
+        uses: actions/download-artifact@v4
+        with:
+          name: ocicl-deps
+          path: ocicl
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sbcl make
+
+      - name: Build
+        run: make
+
+      - name: Verify
+        run: |
+          ./whistler --version
+          ./whistler compile examples/count-xdp.lisp -o /tmp/count-xdp.bpf.o
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          tar czf whistler-${VERSION}-linux-amd64.tar.gz whistler README.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: ./*.tar.gz
+
+  # ========================================
+  # Create GitHub Release
+  # ========================================
+  release:
+    needs: [build-linux]
+    permissions: write-all
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          generateReleaseNotes: true
+          artifacts: |
+            artifacts/linux-package/*.tar.gz
+          allowUpdates: true
