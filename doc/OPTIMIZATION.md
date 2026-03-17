@@ -160,8 +160,5 @@ After register allocation and BPF emission, the peephole optimizer runs:
 - `examples/drop-port.lisp` — Port-based packet filtering (25 insns)
 - `examples/synflood-xdp.lisp` — SYN flood mitigation (65 insns)
 - `examples/runqlat.lisp` — Run queue latency histogram (57 insns)
-- `examples/cilium/ct4-basic.lisp` — Connection tracker (101 insns)
-- `examples/cilium/nodeport-lb4.lisp` — Load balancer with DNAT (75 insns)
-- `examples/cilium/policy-l4.lisp` — Identity-based policy (72 insns)
 - `examples/tc-classifier.lisp` — TC packet classifier (68 insns)
 - `examples/ringbuf-events.lisp` — Ring buffer events (53 insns)

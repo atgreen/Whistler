@@ -21,7 +21,7 @@ Update the version in `whistler.asd`:
 
 ```bash
 make clean && make
-for f in examples/*.lisp examples/cilium/*.lisp; do
+for f in examples/*.lisp; do
   ./whistler compile "$f" -o /tmp/$(basename "$f" .lisp).bpf.o
 done
 ```
@@ -65,7 +65,7 @@ and attach the `whistler` binary.
 
 ```bash
 ./whistler compile examples/count-xdp.lisp
-./whistler compile examples/cilium/nodeport-lb4.lisp --gen c
+./whistler compile examples/ringbuf-events.lisp --gen c
 ./whistler --version
 ```
 

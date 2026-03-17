@@ -34,12 +34,11 @@ Initial release. A Lisp that compiles to eBPF.
 
 ## Examples
 
-14 examples included:
+9 examples included:
 - Packet counter, port blocker, SYN flood filter, rate limiter
 - Run queue latency histogram (tracepoint)
 - Tail call dispatcher, multi-program ELF
 - TC classifier, ring buffer events
-- 5 Cilium-style programs: connection tracker, load balancer, policy enforcer, CIDR prefilter, health ping responder
 
 ## Benchmarks
 
@@ -48,5 +47,3 @@ Initial release. A Lisp that compiles to eBPF.
 | count-xdp | 11 | 11 |
 | drop-port | 25 | 26 |
 | synflood | 65 | 68 |
-| ct4-basic | 101 | 97 |
-| nodeport-lb4 | 75 | 75 |

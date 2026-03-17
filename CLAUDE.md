@@ -10,7 +10,7 @@ sbcl --noinform --non-interactive \
   --eval '(require :asdf)' \
   --eval '(push #P"/home/green/git/whistler/" asdf:*central-registry*)' \
   --eval '(asdf:load-system "whistler")' \
-  --eval '(whistler::compile-file* "examples/cilium/nodeport-lb4.lisp" "output.bpf.o")'
+  --eval '(whistler::compile-file* "examples/synflood-xdp.lisp" "output.bpf.o")'
 
 # Disassemble (inspect instruction output)
 # Use whistler::disassemble-cu on the compilation-unit returned by compile-to-elf

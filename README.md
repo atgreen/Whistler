@@ -771,13 +771,7 @@ whistler/
 │   ├── synflood-xdp.lisp           SYN flood filter (74 insns)
 │   ├── runqlat.lisp                 Run queue latency histogram (57 insns)
 │   ├── tail-call-dispatch.lisp      Protocol dispatch via tail calls (26 insns)
-│   ├── multi-prog.lisp             Multi-program ELF (2 programs, 44 insns)
-│   └── cilium/
-│       ├── ct4-basic.lisp          Connection tracker (105 insns)
-│       ├── nodeport-lb4.lisp       Load balancer with DNAT (76 insns)
-│       ├── policy-l4.lisp          Identity-based policy (73 insns)
-│       ├── xdp-prefilter.lisp      CIDR blocklist (32 insns)
-│       └── health-ping.lisp        ICMP health responder (75 insns)
+│   └── multi-prog.lisp             Multi-program ELF (2 programs, 44 insns)
 └── tests/
     ├── test.lisp             14 tests
     └── test-ssa.lisp         SSA pipeline integration test
