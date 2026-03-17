@@ -1,0 +1,384 @@
+;;; -*- Mode: Lisp -*-
+;;;
+;;; Copyright (c) 2026 Anthony Green <green@moxielogic.com>
+;;;
+;;; SPDX-License-Identifier: MIT
+
+(in-package #:whistler/btf)
+
+;;; BTF (BPF Type Format) encoder
+;;; Produces .BTF section bytes for BPF ELF objects.
+;;; Reference: kernel Documentation/bpf/btf.rst
+
+;;; BTF constants
+
+(defconstant +btf-magic+ #xeB9F)
+(defconstant +btf-version+ 1)
+(defconstant +btf-header-size+ 24)
+
+;; BTF type kinds (stored in bits 24-28 of info field)
+(defconstant +btf-kind-int+       1)
+(defconstant +btf-kind-struct+    4)
+(defconstant +btf-kind-func-proto+ 13)
+(defconstant +btf-kind-func+     12)
+
+;; BTF_INT encoding bits
+(defconstant +btf-int-signed+ (ash 1 0))
+
+;;; BTF string table
+
+(defstruct btf-strtab
+  (data (let ((v (make-array 16 :element-type '(unsigned-byte 8)
+                                :adjustable t :fill-pointer 0)))
+          (vector-push-extend 0 v)  ; initial NUL byte
+          v)))
+
+(defun btf-strtab-add (strtab string)
+  "Add a string to the BTF string table, return its offset."
+  (let ((data (btf-strtab-data strtab))
+        (offset (length (btf-strtab-data strtab))))
+    (loop for ch across string
+          do (vector-push-extend (char-code ch) data))
+    (vector-push-extend 0 data)
+    offset))
+
+;;; BTF context
+
+(defstruct btf-ctx
+  (types (make-array 16 :element-type '(unsigned-byte 8)
+                        :adjustable t :fill-pointer 0))
+  (strtab (make-btf-strtab))
+  (next-id 1)
+  (type-cache (make-hash-table :test 'equal)))  ; name -> type-id
+
+(defun btf-emit-u32 (vec val)
+  "Append a little-endian u32 to an adjustable byte vector."
+  (vector-push-extend (logand val #xff) vec)
+  (vector-push-extend (logand (ash val -8) #xff) vec)
+  (vector-push-extend (logand (ash val -16) #xff) vec)
+  (vector-push-extend (logand (ash val -24) #xff) vec))
+
+(defun btf-alloc-id (ctx)
+  "Allocate and return the next type ID."
+  (prog1 (btf-ctx-next-id ctx)
+    (incf (btf-ctx-next-id ctx))))
+
+;;; BTF type emitters
+
+(defun btf-info-field (kind vlen)
+  "Encode the BTF type info word: kind in bits 24-28, vlen in bits 0-15."
+  (logior (ash kind 24) (logand vlen #xffff)))
+
+(defun btf-add-int (ctx name bits)
+  "Add a BTF_KIND_INT type. Returns the type ID."
+  (let* ((id (btf-alloc-id ctx))
+         (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
+         (types (btf-ctx-types ctx)))
+    ;; Type header: name_off(4), info(4), size(4) = 12 bytes
+    (btf-emit-u32 types name-off)
+    (btf-emit-u32 types (btf-info-field +btf-kind-int+ 0))
+    (btf-emit-u32 types (/ bits 8))  ; size in bytes
+    ;; INT data: encoding(8:8), offset(8:8), bits(8:8) packed in 4 bytes
+    ;; encoding = 0 (unsigned), offset = 0, bits = actual bit width
+    (btf-emit-u32 types (logior (ash 0 24)    ; encoding: unsigned
+                                (ash 0 16)    ; offset: 0
+                                bits))        ; nr_bits
+    (setf (gethash name (btf-ctx-type-cache ctx)) id)
+    id))
+
+(defun btf-add-struct (ctx name fields)
+  "Add a BTF_KIND_STRUCT type.
+   FIELDS is a list of (field-name type offset size) as from *struct-defs*.
+   Returns the type ID."
+  (let* ((id (btf-alloc-id ctx))
+         (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
+         (types (btf-ctx-types ctx))
+         (total-size (loop for (nil nil off sz) in fields
+                           maximize (+ off sz))))
+    ;; Type header
+    (btf-emit-u32 types name-off)
+    (btf-emit-u32 types (btf-info-field +btf-kind-struct+ (length fields)))
+    (btf-emit-u32 types total-size)
+    ;; Member entries: name_off(4), type(4), offset(4) = 12 bytes each
+    (dolist (field fields)
+      (destructuring-bind (fname ftype foffset fsize) field
+        (declare (ignore fsize))
+        (let* ((fname-off (btf-strtab-add (btf-ctx-strtab ctx)
+                                          (string-downcase (string fname))))
+               (type-name (string-downcase (string ftype)))
+               (type-id (or (gethash type-name (btf-ctx-type-cache ctx))
+                            (error "Unknown BTF type for field ~a: ~a" fname ftype))))
+          (btf-emit-u32 types fname-off)
+          (btf-emit-u32 types type-id)
+          ;; Offset in bits
+          (btf-emit-u32 types (* foffset 8)))))
+    (setf (gethash name (btf-ctx-type-cache ctx)) id)
+    id))
+
+(defun btf-add-func-proto (ctx ret-type-id params)
+  "Add a BTF_KIND_FUNC_PROTO type.
+   PARAMS is a list of (name-string type-id).
+   Returns the type ID."
+  (let* ((id (btf-alloc-id ctx))
+         (types (btf-ctx-types ctx)))
+    ;; name_off = 0 for FUNC_PROTO
+    (btf-emit-u32 types 0)
+    (btf-emit-u32 types (btf-info-field +btf-kind-func-proto+ (length params)))
+    (btf-emit-u32 types ret-type-id)
+    ;; Param entries: name_off(4), type(4) = 8 bytes each
+    (dolist (param params)
+      (destructuring-bind (pname ptype-id) param
+        (let ((pname-off (btf-strtab-add (btf-ctx-strtab ctx) pname)))
+          (btf-emit-u32 types pname-off)
+          (btf-emit-u32 types ptype-id))))
+    id))
+
+(defun btf-add-func (ctx name proto-type-id)
+  "Add a BTF_KIND_FUNC type. Returns the type ID."
+  (let* ((id (btf-alloc-id ctx))
+         (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
+         (types (btf-ctx-types ctx)))
+    ;; FUNC: name_off(4), info(4), type(4) — type points to FUNC_PROTO
+    (btf-emit-u32 types name-off)
+    ;; vlen=0 for FUNC; BTF_FUNC_STATIC=0, BTF_FUNC_GLOBAL=1
+    (btf-emit-u32 types (btf-info-field +btf-kind-func+ 0))
+    (btf-emit-u32 types proto-type-id)
+    id))
+
+;;; Encoding
+
+(defun btf-encode (ctx)
+  "Serialize the BTF context into a complete .BTF section byte vector."
+  (let* ((type-data (btf-ctx-types ctx))
+         (str-data (btf-strtab-data (btf-ctx-strtab ctx)))
+         (type-len (length type-data))
+         (str-len (length str-data))
+         (total (+ +btf-header-size+ type-len str-len))
+         (out (make-array total :element-type '(unsigned-byte 8) :initial-element 0))
+         (pos 0))
+    (flet ((put-u8 (val)
+             (setf (aref out pos) (logand val #xff))
+             (incf pos))
+           (put-u16 (val)
+             (setf (aref out pos) (logand val #xff))
+             (setf (aref out (+ pos 1)) (logand (ash val -8) #xff))
+             (incf pos 2))
+           (put-u32 (val)
+             (setf (aref out pos) (logand val #xff))
+             (setf (aref out (+ pos 1)) (logand (ash val -8) #xff))
+             (setf (aref out (+ pos 2)) (logand (ash val -16) #xff))
+             (setf (aref out (+ pos 3)) (logand (ash val -24) #xff))
+             (incf pos 4)))
+      ;; Header (24 bytes)
+      (put-u16 +btf-magic+)                    ; magic
+      (put-u8 +btf-version+)                   ; version
+      (put-u8 0)                                ; flags
+      (put-u32 +btf-header-size+)              ; hdr_len
+      ;; Type section: immediately after header
+      (put-u32 0)                               ; type_off
+      (put-u32 type-len)                        ; type_len
+      ;; String section: after types
+      (put-u32 type-len)                        ; str_off
+      (put-u32 str-len))                        ; str_len
+    ;; Copy type data
+    (replace out type-data :start1 +btf-header-size+)
+    ;; Copy string data
+    (replace out str-data :start1 (+ +btf-header-size+ type-len))
+    out))
+
+;;; Top-level entry points
+
+(defun build-btf-ctx (struct-defs section-names)
+  "Build a BTF context with base types, struct defs, and function info.
+   SECTION-NAMES is a string or list of strings (one per program).
+   Returns (values ctx func-type-ids) where func-type-ids is a list of FUNC type IDs."
+  (let ((ctx (make-btf-ctx))
+        (names (if (listp section-names) section-names (list section-names))))
+    ;; 1. Add base integer types
+    (btf-add-int ctx "u8"  8)
+    (btf-add-int ctx "u16" 16)
+    (btf-add-int ctx "u32" 32)
+    (btf-add-int ctx "u64" 64)
+
+    ;; 2. Add struct types from *struct-defs*
+    (maphash (lambda (name def)
+               (let ((fields (cdr def)))  ; skip total-size
+                 (btf-add-struct ctx (string-downcase name) fields)))
+             struct-defs)
+
+    ;; 3. Add xdp_md if any section is XDP and not already defined
+    (when (and (some (lambda (s) (search "xdp" (string-downcase s))) names)
+               (not (gethash "xdp_md" (btf-ctx-type-cache ctx))))
+      (btf-add-struct ctx "xdp_md"
+                      '((data u32 0 4)
+                        (data_end u32 4 4)
+                        (data_meta u32 8 4)
+                        (ingress_ifindex u32 12 4)
+                        (rx_queue_index u32 16 4))))
+
+    ;; 4. Add FUNC_PROTO (ret=u32, param ctx=u64) + FUNC for each program
+    (let* ((u32-id (gethash "u32" (btf-ctx-type-cache ctx)))
+           (u64-id (gethash "u64" (btf-ctx-type-cache ctx)))
+           (proto-id (btf-add-func-proto ctx u32-id (list (list "ctx" u64-id))))
+           (func-ids (mapcar (lambda (name)
+                               (btf-add-func ctx name proto-id))
+                             names)))
+      (values ctx func-ids))))
+
+(defun generate-btf (struct-defs section-names)
+  "Generate BTF section bytes.
+   STRUCT-DEFS is a hash table of name -> (total-size . fields).
+   SECTION-NAMES is a string or list of section names.
+   Returns a byte vector suitable for a .BTF ELF section."
+  (let ((ctx (build-btf-ctx struct-defs section-names)))
+    (btf-encode ctx)))
+
+;;; ========== BTF.ext encoding ==========
+
+(defconstant +btf-ext-magic+ #xeB9F)
+(defconstant +btf-ext-version+ 1)
+(defconstant +btf-ext-header-size+ 32)
+
+;; CO-RE relocation kinds
+(defconstant +bpf-core-field-byte-offset+ 0)
+
+(defun lisp-to-c-name (sym)
+  "Convert a Lisp symbol name to C-style: lowercase, hyphens to underscores."
+  (substitute #\_ #\- (string-downcase (string sym))))
+
+;; Known kernel struct field lists for CO-RE (not in user *struct-defs*)
+(defparameter *kernel-struct-fields*
+  '(("xdp_md" . (data data_end data_meta ingress_ifindex rx_queue_index))))
+
+(defun struct-field-index (struct-defs struct-name field-name)
+  "Look up the field index for FIELD-NAME in STRUCT-NAME.
+   Checks user struct-defs first, then kernel struct definitions.
+   Returns the 0-based index in the field list."
+  (let* ((c-struct (lisp-to-c-name struct-name))
+         (c-field (lisp-to-c-name field-name))
+         ;; Check user-defined structs
+         (def (or (gethash (string struct-name) struct-defs)
+                  (gethash (string-downcase (string struct-name)) struct-defs))))
+    (if def
+        (let ((fields (cdr def)))
+          (loop for field in fields
+                for idx from 0
+                when (string-equal (string (first field)) (string field-name))
+                return idx))
+        ;; Check kernel structs
+        (let ((kernel (assoc c-struct *kernel-struct-fields* :test #'string=)))
+          (when kernel
+            (loop for f in (cdr kernel)
+                  for idx from 0
+                  when (string= (string f) c-field)
+                  return idx))))))
+
+(defun btf-ext-encode (ctx section-names func-type-ids per-section-core-relocs struct-defs)
+  "Encode .BTF.ext section bytes for one or more programs.
+   CTX: the btf-ctx (shared string table).
+   SECTION-NAMES: list of program section name strings.
+   FUNC-TYPE-IDS: list of BTF FUNC type IDs (one per program).
+   PER-SECTION-CORE-RELOCS: list of core-reloc lists (one list per program).
+   STRUCT-DEFS: struct definitions hash table.
+   Returns a byte vector."
+  (let ((strtab (btf-ctx-strtab ctx)))
+
+    ;; Build func_info subsection — one entry per program
+    (let ((func-info (make-array 32 :element-type '(unsigned-byte 8)
+                                    :adjustable t :fill-pointer 0)))
+      ;; rec_size = 8
+      (btf-emit-u32 func-info 8)
+      ;; One section header + record per program
+      (loop for sec-name in section-names
+            for func-id in func-type-ids
+            do (let ((sec-off (btf-strtab-add strtab sec-name)))
+                 (btf-emit-u32 func-info sec-off)
+                 (btf-emit-u32 func-info 1)          ; num_info = 1
+                 (btf-emit-u32 func-info 0)          ; insn_off = 0
+                 (btf-emit-u32 func-info func-id)))  ; type_id
+
+      ;; Build core_relo subsection
+      (let ((core-relo (make-array 32 :element-type '(unsigned-byte 8)
+                                      :adjustable t :fill-pointer 0))
+            (has-any-relocs (some #'identity per-section-core-relocs)))
+        (when has-any-relocs
+          ;; rec_size = 16
+          (btf-emit-u32 core-relo 16)
+          ;; Per-section core relocs
+          (loop for sec-name in section-names
+                for core-relocs in per-section-core-relocs
+                when core-relocs
+                do (let ((sec-off (btf-strtab-add strtab sec-name)))
+                     (btf-emit-u32 core-relo sec-off)
+                     (btf-emit-u32 core-relo (length core-relocs))
+                     (dolist (reloc core-relocs)
+                       (destructuring-bind (byte-off struct-name field-name) reloc
+                         (let* ((type-name (lisp-to-c-name struct-name))
+                                (type-id (gethash type-name (btf-ctx-type-cache ctx)))
+                                (field-idx (or (struct-field-index struct-defs struct-name field-name)
+                                               0))
+                                (access-str (format nil "0:~d" field-idx))
+                                (access-off (btf-strtab-add strtab access-str)))
+                           (btf-emit-u32 core-relo byte-off)
+                           (btf-emit-u32 core-relo (or type-id 0))
+                           (btf-emit-u32 core-relo access-off)
+                           (btf-emit-u32 core-relo +bpf-core-field-byte-offset+)))))))
+
+        ;; Assemble header + subsections
+        (let* ((func-info-len (length func-info))
+               (line-info-len 0)
+               (core-relo-len (length core-relo))
+               (func-info-off 0)
+               (line-info-off func-info-len)
+               (core-relo-off (+ func-info-len line-info-len))
+               (total (+ +btf-ext-header-size+ func-info-len line-info-len core-relo-len))
+               (out (make-array total :element-type '(unsigned-byte 8) :initial-element 0))
+               (pos 0))
+          (flet ((put-u8 (val)
+                   (setf (aref out pos) (logand val #xff))
+                   (incf pos))
+                 (put-u16 (val)
+                   (setf (aref out pos) (logand val #xff))
+                   (setf (aref out (+ pos 1)) (logand (ash val -8) #xff))
+                   (incf pos 2))
+                 (put-u32 (val)
+                   (setf (aref out pos) (logand val #xff))
+                   (setf (aref out (+ pos 1)) (logand (ash val -8) #xff))
+                   (setf (aref out (+ pos 2)) (logand (ash val -16) #xff))
+                   (setf (aref out (+ pos 3)) (logand (ash val -24) #xff))
+                   (incf pos 4)))
+            ;; Header (32 bytes)
+            (put-u16 +btf-ext-magic+)
+            (put-u8 +btf-ext-version+)
+            (put-u8 0)  ; flags
+            (put-u32 +btf-ext-header-size+)
+            (put-u32 func-info-off)
+            (put-u32 func-info-len)
+            (put-u32 line-info-off)
+            (put-u32 line-info-len)
+            (put-u32 core-relo-off)
+            (put-u32 core-relo-len))
+          ;; Copy subsection data
+          (replace out func-info :start1 +btf-ext-header-size+)
+          (when (plusp core-relo-len)
+            (replace out core-relo :start1 (+ +btf-ext-header-size+ core-relo-off)))
+          out)))))
+
+(defun generate-btf-and-ext (struct-defs section-names per-section-core-relocs)
+  "Generate both .BTF and .BTF.ext section bytes for one or more programs.
+   STRUCT-DEFS: hash table of name -> (total-size . fields).
+   SECTION-NAMES: string or list of section name strings.
+   PER-SECTION-CORE-RELOCS: list of core-reloc lists (one per program),
+     or a single flat list (for backward compat with single-program callers).
+   Returns (values btf-bytes btf-ext-bytes)."
+  (let ((names (if (listp section-names) section-names (list section-names)))
+        (relocs-per-section (if (and (listp section-names)
+                                     (listp per-section-core-relocs))
+                                per-section-core-relocs
+                                (list per-section-core-relocs))))
+    (multiple-value-bind (ctx func-ids) (build-btf-ctx struct-defs names)
+      ;; Encode BTF.ext BEFORE btf-encode, so access strings get into the
+      ;; shared string table before it's serialized.
+      (let ((btf-ext (btf-ext-encode ctx names func-ids
+                                     relocs-per-section struct-defs)))
+        (values (btf-encode ctx) btf-ext)))))

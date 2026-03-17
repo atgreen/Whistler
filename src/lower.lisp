@@ -1,0 +1,943 @@
+;;; -*- Mode: Lisp -*-
+;;;
+;;; Copyright (c) 2026 Anthony Green <green@moxielogic.com>
+;;;
+;;; SPDX-License-Identifier: MIT
+
+;;; lower.lisp — Lower macro-expanded s-expressions to SSA IR
+;;;
+;;; Translates Whistler surface forms into SSA IR instructions with
+;;; virtual registers and basic blocks.
+
+(in-package #:whistler/ir)
+
+;;; Lowering context
+
+(defstruct lower-ctx
+  (prog nil)          ; ir-program being built
+  (block nil)         ; current basic-block
+  (env '())           ; ((name type vreg) ...) variable bindings
+  (maps '())          ; ((name . bpf-map) ...) map definitions
+  (next-id 0))        ; instruction sequence counter
+
+(defun ctx-emit (ctx op dst args &optional type)
+  "Emit an IR instruction into the current block."
+  (let ((insn (make-ir-insn :op op :dst dst :args args :type type
+                            :id (lower-ctx-next-id ctx))))
+    (incf (lower-ctx-next-id ctx))
+    (bb-emit (lower-ctx-block ctx) insn)
+    dst))
+
+(defun ctx-fresh-vreg (ctx &optional type)
+  "Allocate a fresh virtual register."
+  (declare (ignore type))
+  (ir-fresh-vreg (lower-ctx-prog ctx)))
+
+(defun ctx-switch-block (ctx new-block)
+  "Switch emission to a new basic block."
+  (ir-add-block (lower-ctx-prog ctx) new-block)
+  (setf (lower-ctx-block ctx) new-block))
+
+(defun ctx-lookup-var (ctx name)
+  "Look up variable. Returns (type . vreg) or nil."
+  (let ((entry (assoc (symbol-name name) (lower-ctx-env ctx)
+                      :key (lambda (x) (symbol-name x))
+                      :test #'string=)))
+    (when entry (cdr entry))))
+
+(defun ctx-bind-var (ctx name type vreg)
+  (push (cons name (cons type vreg)) (lower-ctx-env ctx)))
+
+(defun ctx-update-var (ctx name new-vreg)
+  "Update the vreg for an existing variable (for setf in SSA)."
+  (let ((entry (assoc (symbol-name name) (lower-ctx-env ctx)
+                      :key (lambda (x) (symbol-name x))
+                      :test #'string=)))
+    (when entry
+      (setf (cddr entry) new-vreg))))
+
+;;; Symbol comparison — delegate to whistler/compiler
+(defun sym= (a b) (whistler/compiler:sym= a b))
+
+;;; ALU / jump op mapping (returns keyword for IR)
+
+(defun ir-alu-op (sym)
+  (when (symbolp sym)
+    (let ((name (symbol-name sym)))
+      (cond
+        ((string= name "+")     :add)
+        ((string= name "-")     :sub)
+        ((string= name "*")     :mul)
+        ((string= name "/")     :div)
+        ((string= name "MOD")   :mod)
+        ((string= name "LOGIOR") :or)  ((string= name "BIT-OR")  :or)
+        ((string= name "LOGAND") :and) ((string= name "BIT-AND") :and)
+        ((string= name "LOGXOR") :xor) ((string= name "BIT-XOR") :xor)
+        ((string= name "<<")    :lsh)  ((string= name "ASH-LEFT")  :lsh)
+        ((string= name ">>")    :rsh)  ((string= name "ASH-RIGHT") :rsh)
+        ((string= name ">>>")   :arsh) ((string= name "ASH-RIGHT-SIGNED") :arsh)))))
+
+(defun ir-jmp-op (sym)
+  (when (symbolp sym)
+    (let ((name (symbol-name sym)))
+      (cond
+        ((string= name "=")    :jeq)
+        ((string= name "/=")   :jne)
+        ((string= name ">")    :jgt)
+        ((string= name ">=")   :jge)
+        ((string= name "<")    :jlt)
+        ((string= name "<=")   :jle)
+        ((string= name "S>")   :jsgt)
+        ((string= name "S>=")  :jsge)
+        ((string= name "S<")   :jslt)
+        ((string= name "S<=")  :jsle)))))
+
+(defun ir-invert-jmp (op)
+  (ecase op
+    (:jeq :jne) (:jne :jeq)
+    (:jgt :jle) (:jge :jlt) (:jlt :jge) (:jle :jgt)
+    (:jsgt :jsle) (:jsge :jslt) (:jslt :jsge) (:jsle :jsgt)))
+
+;;; Size info
+(defun ir-type-bytes (type-kw)
+  (let ((name (string-upcase (string type-kw))))
+    (cond
+      ((or (string= name "U8")  (string= name "I8"))  1)
+      ((or (string= name "U16") (string= name "I16")) 2)
+      ((or (string= name "U32") (string= name "I32")) 4)
+      ((or (string= name "U64") (string= name "I64")) 8)
+      (t 8))))
+
+;;; Builtin constants, helpers, and forms — from whistler/compiler (single source of truth)
+(defun ir-builtin-helper-p (sym)
+  "Return the helper ID if SYM names a known BPF helper, or NIL."
+  (whistler/compiler:builtin-helper-p sym))
+
+;;; ========== Main lowering entry point ==========
+
+(defun lower-program (section license maps body)
+  "Lower a Whistler program to SSA IR.
+   MAPS: list of bpf-map structs.
+   BODY: list of macro-expanded, constant-folded s-expressions."
+  (let* ((prog (make-ir-program :section section :license license
+                                :maps maps :next-vreg 0))
+         (entry-label (ir-fresh-label prog "entry"))
+         (entry-block (make-basic-block :label entry-label))
+         (ctx (make-lower-ctx :prog prog :block entry-block)))
+    (setf (ir-program-entry prog) entry-label)
+    (ir-add-block prog entry-block)
+
+    ;; Map index for map lookups
+    (dolist (m maps)
+      (push (cons (whistler/compiler:bpf-map-name m) m) (lower-ctx-maps ctx)))
+
+    ;; Emit ctx save: %ctx = arg0 (R1 on entry)
+    (let ((ctx-vreg (ctx-fresh-vreg ctx)))
+      (ctx-emit ctx :arg0 ctx-vreg '() 'u64)
+      (ctx-bind-var ctx (intern "%%CTX" (find-package '#:whistler/ir)) 'u64 ctx-vreg))
+
+    ;; Lower body
+    (let ((result nil))
+      (dolist (form body)
+        (setf result (lower-expr ctx form)))
+
+      ;; Ensure terminator
+      (unless (bb-terminator-p (lower-ctx-block ctx))
+        (let ((zero (ctx-fresh-vreg ctx)))
+          (ctx-emit ctx :mov zero (list '(:imm 0)) 'u64)
+          (ctx-emit ctx :ret nil (list zero)))))
+
+    prog))
+
+;;; ========== Expression lowering ==========
+
+(defun lower-expr (ctx form)
+  "Lower FORM, returning the vreg holding the result (or nil for void)."
+  (cond
+    ((null form)
+     (let ((v (ctx-fresh-vreg ctx)))
+       (ctx-emit ctx :mov v (list `(:imm 0)) 'u64)
+       v))
+
+    ((integerp form)
+     (let ((v (ctx-fresh-vreg ctx)))
+       (ctx-emit ctx :mov v (list `(:imm ,form)) 'u64)
+       v))
+
+    ((symbolp form)
+     (lower-symbol ctx form))
+
+    ((consp form)
+     (lower-form ctx form))
+
+    (t (error "Cannot lower: ~s" form))))
+
+(defun lower-symbol (ctx sym)
+  "Lower a symbol reference — variable or constant."
+  (let ((const (assoc (symbol-name sym) whistler/compiler:*builtin-constants*
+                      :test #'string=)))
+    (cond
+      (const
+       (let ((v (ctx-fresh-vreg ctx)))
+         (ctx-emit ctx :mov v (list `(:imm ,(cdr const))) 'u64)
+         v))
+      ;; CL constant
+      ((and (boundp sym) (constantp sym) (integerp (symbol-value sym)))
+       (let ((v (ctx-fresh-vreg ctx)))
+         (ctx-emit ctx :mov v (list `(:imm ,(symbol-value sym))) 'u64)
+         v))
+      (t
+       (let ((binding (ctx-lookup-var ctx sym)))
+         (unless binding (error "Unbound variable in IR lowering: ~a" sym))
+         (cdr binding))))))  ; return the vreg directly
+
+;;; ========== Compound form lowering ==========
+
+(defun lower-form (ctx form)
+  (let ((head (car form))
+        (args (cdr form)))
+    (cond
+      ((sym= head 'progn)
+       (let ((result nil))
+         (dolist (expr args) (setf result (lower-expr ctx expr)))
+         result))
+
+      ((sym= head 'let)
+       (lower-let ctx (first args) (rest args)))
+
+      ((sym= head 'if)
+       (lower-if ctx (first args) (second args) (third args)))
+
+      ((sym= head 'return)
+       (let ((val (if args (lower-expr ctx (first args))
+                      (let ((v (ctx-fresh-vreg ctx)))
+                        (ctx-emit ctx :mov v (list '(:imm 0)) 'u64)
+                        v))))
+         (ctx-emit ctx :ret nil (list val))
+         nil))
+
+      ((ir-alu-op head)
+       (lower-alu ctx head args))
+
+      ((ir-jmp-op head)
+       (lower-cmp ctx head (first args) (second args)))
+
+      ((sym= head 'load)
+       (lower-load ctx args))
+
+      ((sym= head 'core-load)
+       (lower-core-load ctx args))
+
+      ((sym= head 'store)
+       (lower-store ctx args))
+
+      ((sym= head 'core-store)
+       (lower-core-store ctx args))
+
+      ((sym= head 'atomic-add)
+       (lower-atomic-add ctx args))
+
+      ((sym= head 'map-lookup)
+       (lower-map-lookup ctx (first args) (second args)))
+
+      ((sym= head 'map-lookup-ptr)
+       (lower-map-lookup-ptr ctx (first args) (second args)))
+
+      ((sym= head 'map-update)
+       (lower-map-update ctx (first args) (second args) (third args)
+                         (or (fourth args) 0)))
+
+      ((sym= head 'map-delete)
+       (lower-map-delete ctx (first args) (second args)))
+
+      ((sym= head 'map-update-ptr)
+       (lower-map-update-ptr ctx (first args) (second args) (third args)
+                             (or (fourth args) 0)))
+
+      ((sym= head 'map-delete-ptr)
+       (lower-map-delete-ptr ctx (first args) (second args)))
+
+      ;; Ring buffer operations (first arg is map name)
+      ((sym= head 'ringbuf-reserve)
+       (lower-ringbuf-reserve ctx (first args) (second args) (third args)))
+
+      ((sym= head 'ringbuf-submit)
+       (lower-ringbuf-submit ctx (first args) (second args)))
+
+      ((sym= head 'ringbuf-discard)
+       (lower-ringbuf-discard ctx (first args) (second args)))
+
+      ((sym= head 'ctx-load)
+       (lower-ctx-load ctx (first args) (second args)))
+
+      ((sym= head 'tail-call)
+       (lower-tail-call ctx (first args) (second args)))
+
+      ((sym= head 'core-ctx-load)
+       (lower-core-ctx-load ctx args))
+
+      ((sym= head 'setf)
+       (lower-setf ctx (first args) (second args)))
+
+      ((sym= head 'stack-addr)
+       (lower-stack-addr ctx (first args)))
+
+      ((sym= head 'struct-alloc)
+       (lower-struct-alloc ctx (first args)))
+
+      ((sym= head 'when)
+       (lower-if ctx (first args) (cons 'progn (rest args)) nil))
+
+      ((sym= head 'unless)
+       (lower-if ctx (first args) nil (cons 'progn (rest args))))
+
+      ((sym= head 'cond)
+       (lower-cond ctx args))
+
+      ((sym= head 'and)
+       (lower-and ctx args))
+
+      ((sym= head 'or)
+       (lower-or ctx args))
+
+      ((sym= head 'not)
+       (lower-not ctx (first args)))
+
+      ((sym= head 'log2)
+       (lower-log2 ctx (first args)))
+
+      ((sym= head 'dotimes)
+       (lower-dotimes ctx (first args) (rest args)))
+
+      ((sym= head 'cast)
+       (lower-cast ctx (first args) (second args)))
+
+      ((or (sym= head 'ntohs) (sym= head 'htons))
+       (let ((v (lower-expr ctx (first args)))
+             (dst (ctx-fresh-vreg ctx)))
+         (ctx-emit ctx :bswap16 dst (list v) 'u16)
+         dst))
+
+      ((or (sym= head 'ntohl) (sym= head 'htonl))
+       (let ((v (lower-expr ctx (first args)))
+             (dst (ctx-fresh-vreg ctx)))
+         (ctx-emit ctx :bswap32 dst (list v) 'u32)
+         dst))
+
+      ((or (sym= head 'ntohll) (sym= head 'htonll))
+       (let ((v (lower-expr ctx (first args)))
+             (dst (ctx-fresh-vreg ctx)))
+         (ctx-emit ctx :bswap64 dst (list v) 'u64)
+         dst))
+
+      ;; (helper-name arg1 arg2 ...) — BPF helper call in function position
+      ((ir-builtin-helper-p head)
+       (lower-helper-call ctx head args))
+
+      (t (error "Unknown form in IR lowering: ~s" head)))))
+
+;;; ========== Let bindings ==========
+
+(defun bpf-type-sym-p (sym) (whistler/compiler:bpf-type-p sym))
+
+(defun infer-expr-type (form)
+  "Infer BPF type from a macro-expanded s-expression.
+   Returns a type symbol (u8, u16, u32, u64) or nil for default u64."
+  (cond
+    ((integerp form) nil)   ; default to u64 — ssa-opt narrows later
+    ((symbolp form) nil)    ; variable ref — type comes from binding
+    ((atom form) nil)
+    (t
+     (let ((head (car form)))
+       (cond
+         ;; (load TYPE ...) / (core-load TYPE ...)
+         ((or (sym= head 'load) (sym= head 'core-load))
+          (cadr form))
+         ;; (ctx-load TYPE ...) / (core-ctx-load TYPE ...)
+         ((or (sym= head 'ctx-load) (sym= head 'core-ctx-load))
+          (cadr form))
+         ;; (cast TYPE ...)
+         ((sym= head 'cast) (cadr form))
+         ;; Byte swap → known widths
+         ((or (sym= head 'ntohs) (sym= head 'htons)) 'u16)
+         ((or (sym= head 'ntohl) (sym= head 'htonl)) 'u32)
+         ((or (sym= head 'ntohll) (sym= head 'htonll)) 'u64)
+         ;; Helper calls with known return types
+         ((sym= head 'get-prandom-u32) 'u32)
+         ((sym= head 'get-smp-processor-id) 'u32)
+         ;; Default — u64 is safe for everything else
+         (t nil))))))
+
+(defun parse-let-binding (binding)
+  "Parse a let binding, supporting both (var type init), (var type), and (var init).
+   Returns (values var type init) where type may be nil (infer) and init may be nil."
+  (cond
+    ;; 3-element: (var type init) — explicit type
+    ((and (consp binding) (cddr binding))
+     (values (first binding) (second binding) (third binding)))
+    ;; 2-element: (var X) — X is either a type or an init
+    ((and (consp binding) (cdr binding))
+     (if (bpf-type-sym-p (second binding))
+         ;; (var type) — typed, no init
+         (values (first binding) (second binding) nil)
+         ;; (var init) — infer type from init
+         (values (first binding) (infer-expr-type (second binding)) (second binding))))
+    ;; 1-element: (var) — default u64, zero init
+    (t (values (first binding) nil nil))))
+
+(defun extract-type-declarations (body)
+  "Extract type declarations from the start of BODY.
+   Returns (values type-alist remaining-body) where type-alist maps
+   variable names to declared types: ((var . type) ...)."
+  (let ((type-alist '())
+        (remaining body))
+    (loop while (and remaining
+                     (consp (first remaining))
+                     (sym= (car (first remaining)) 'declare))
+          do (dolist (decl (cdr (first remaining)))
+               (when (and (consp decl)
+                          (sym= (car decl) 'type)
+                          (>= (length decl) 3))
+                 ;; (type TYPE var1 var2 ...)
+                 (let ((type (second decl)))
+                   (dolist (var (cddr decl))
+                     (push (cons var type) type-alist)))))
+             (setf remaining (rest remaining)))
+    (values type-alist remaining)))
+
+(defun lower-let (ctx bindings body)
+  ;; Extract (declare (type ...)) forms from the start of body
+  (multiple-value-bind (type-decls actual-body) (extract-type-declarations body)
+    (let ((saved-env (lower-ctx-env ctx)))
+      (dolist (binding bindings)
+        (multiple-value-bind (var parsed-type init) (parse-let-binding binding)
+          ;; Priority: inline type > declare type > inferred type > u64
+          (let* ((declared (cdr (assoc (symbol-name var) type-decls
+                                       :key #'symbol-name :test #'string=)))
+                 (type (or parsed-type declared 'u64)))
+            (if init
+                ;; Use declared type for integer literals so stack allocation
+                ;; uses the right size (e.g., u32 gets 4 bytes, not 8)
+                (if (integerp init)
+                    (let ((vreg (ctx-fresh-vreg ctx)))
+                      (ctx-emit ctx :mov vreg (list `(:imm ,init)) type)
+                      (ctx-bind-var ctx var type vreg))
+                    (let ((vreg (lower-expr ctx init)))
+                      (ctx-bind-var ctx var type vreg)))
+                (let ((vreg (ctx-fresh-vreg ctx)))
+                  (ctx-emit ctx :mov vreg (list '(:imm 0)) type)
+                  (ctx-bind-var ctx var type vreg))))))
+      (let ((result nil))
+        (dolist (form actual-body)
+          (setf result (lower-expr ctx form)))
+        (setf (lower-ctx-env ctx) saved-env)
+        result))))
+
+;;; ========== If ==========
+
+(defun lower-if (ctx test then-form else-form)
+  (let* ((prog (lower-ctx-prog ctx))
+         (then-label (ir-fresh-label prog "then"))
+         (else-label (ir-fresh-label prog "else"))
+         (join-label (ir-fresh-label prog "join")))
+
+    ;; Emit conditional branch
+    (if (and (consp test) (ir-jmp-op (car test)))
+        ;; Comparison test: emit br-cond with comparison args
+        (let* ((jmp-op (ir-jmp-op (car test)))
+               (lhs (lower-expr ctx (second test)))
+               (rhs (lower-expr ctx (third test))))
+          (ctx-emit ctx :br-cond nil
+                    (list `(:cmp ,jmp-op) lhs rhs
+                          `(:label ,then-label) `(:label ,else-label))))
+        ;; Value test: branch on non-zero
+        (let ((test-vreg (lower-expr ctx test)))
+          (ctx-emit ctx :br-cond nil
+                    (list '(:cmp :jne) test-vreg `(:imm 0)
+                          `(:label ,then-label) `(:label ,else-label)))))
+
+    ;; Then block
+    (let ((then-block (make-basic-block :label then-label)))
+      (ctx-switch-block ctx then-block)
+      (let ((then-val (when then-form (lower-expr ctx then-form))))
+        (let ((then-exit-block (basic-block-label (lower-ctx-block ctx)))
+              (then-needs-br (not (bb-terminator-p (lower-ctx-block ctx)))))
+
+          ;; Else block
+          (let ((else-block (make-basic-block :label else-label)))
+            (ctx-switch-block ctx else-block)
+            (let ((else-val (when else-form (lower-expr ctx else-form))))
+              (let ((else-exit-block (basic-block-label (lower-ctx-block ctx)))
+                    (else-needs-br (not (bb-terminator-p (lower-ctx-block ctx)))))
+
+                ;; If both branches terminate (return), no join needed
+                (cond
+                  ((and (not then-needs-br) (not else-needs-br))
+                   ;; Both branches return — no join block needed
+                   nil)
+                  (t
+                   ;; Add jumps to join
+                   (when then-needs-br
+                     ;; Go back and add br to then-block's exit
+                     (let ((tb (ir-find-block prog then-exit-block)))
+                       (bb-emit tb (make-ir-insn :op :br :args (list `(:label ,join-label))))))
+                   (when else-needs-br
+                     (ctx-emit ctx :br nil (list `(:label ,join-label))))
+
+                   ;; Join block with phi if needed
+                   (let ((join-block (make-basic-block :label join-label)))
+                     (ctx-switch-block ctx join-block)
+                     (if (and then-val else-val then-needs-br else-needs-br)
+                         (let ((phi-vreg (ctx-fresh-vreg ctx)))
+                           (ctx-emit ctx :phi phi-vreg
+                                     (list (list then-val `(:label ,then-exit-block))
+                                           (list else-val `(:label ,else-exit-block))))
+                           phi-vreg)
+                         (or then-val else-val)))))))))))))
+
+;;; ========== ALU ==========
+
+(defun vreg-type-in-env (ctx vreg)
+  "Look up the type of a vreg by searching the environment bindings."
+  (dolist (entry (lower-ctx-env ctx))
+    (when (and (consp entry) (consp (cdr entry))
+               (eql (cddr entry) vreg))
+      (return (cadr entry))))
+  ;; Check if defined by an IR instruction with a type
+  (dolist (block (ir-program-blocks (lower-ctx-prog ctx)))
+    (dolist (insn (basic-block-insns block))
+      (when (and (ir-insn-dst insn) (eql (ir-insn-dst insn) vreg)
+                 (ir-insn-type insn))
+        (return-from vreg-type-in-env (ir-insn-type insn)))))
+  nil)
+
+(defun type-width (type-kw)
+  "Return bit width for a type keyword, or 64 if unknown."
+  (if (null type-kw) 64
+      (let ((name (string-upcase (string type-kw))))
+        (cond
+          ((or (string= name "U8")  (string= name "I8"))  8)
+          ((or (string= name "U16") (string= name "I16")) 16)
+          ((or (string= name "U32") (string= name "I32")) 32)
+          (t 64)))))
+
+(defun narrowest-type (t1 t2)
+  "Return the wider of two types (the result of an ALU op on both).
+   If both are <= 32 bits, return u32."
+  (let ((w1 (type-width t1))
+        (w2 (type-width t2)))
+    (if (<= (max w1 w2) 32) 'u32 'u64)))
+
+(defun infer-alu-type (ctx ir-op lhs-vreg rhs-vreg)
+  "Infer the result type of an ALU operation from its operands.
+   Only narrows for ops that can't overflow their input width.
+   Add/sub are kept at u64 since carry bits may exceed input width."
+  (let ((t1 (vreg-type-in-env ctx lhs-vreg))
+        (t2 (vreg-type-in-env ctx rhs-vreg)))
+    ;; For bit ops and shifts, result width = max input width
+    ;; For add/sub, result can overflow → keep u64
+    (if (member ir-op '(:and :or :xor :rsh :arsh :mod))
+        (narrowest-type t1 t2)
+        'u64)))
+
+(defun lower-alu (ctx op args)
+  (let ((ir-op (ir-alu-op op)))
+    (cond
+      ;; Unary neg
+      ((and (sym= op '-) (= (length args) 1))
+       (let ((v (lower-expr ctx (first args)))
+             (dst (ctx-fresh-vreg ctx)))
+         (ctx-emit ctx :neg dst (list v) 'u64)
+         dst))
+      ;; Binary
+      ((= (length args) 2)
+       (let* ((lhs (lower-expr ctx (first args)))
+              (rhs (lower-expr ctx (second args)))
+              (dst (ctx-fresh-vreg ctx))
+              (result-type (infer-alu-type ctx ir-op lhs rhs)))
+         (ctx-emit ctx ir-op dst (list lhs rhs) result-type)
+         dst))
+      ;; N-ary: fold left
+      ((> (length args) 2)
+       (let ((acc (lower-expr ctx (first args))))
+         (dolist (arg (rest args))
+           (let* ((rhs (lower-expr ctx arg))
+                  (dst (ctx-fresh-vreg ctx))
+                  (result-type (infer-alu-type ctx ir-op acc rhs)))
+             (ctx-emit ctx ir-op dst (list acc rhs) result-type)
+             (setf acc dst)))
+         acc))
+      (t (error "~a requires at least 1 argument" op)))))
+
+;;; ========== Comparison ==========
+
+(defun lower-cmp (ctx op lhs rhs)
+  "Lower comparison to a value (0 or 1)."
+  (let* ((jmp-op (ir-jmp-op op))
+         (lhs-v (lower-expr ctx lhs))
+         (rhs-v (lower-expr ctx rhs))
+         (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :cmp dst (list `(:cmp ,jmp-op) lhs-v rhs-v) 'u64)
+    dst))
+
+;;; ========== Load / Store / Atomic ==========
+
+(defun lower-load (ctx args)
+  (let* ((type-kw (first args))
+         (ptr (lower-expr ctx (second args)))
+         (off (or (third args) 0))
+         (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :load dst (list ptr `(:imm ,off) `(:type ,type-kw)) type-kw)
+    dst))
+
+(defun lower-store (ctx args)
+  (let* ((type-kw (first args))
+         (ptr (lower-expr ctx (second args)))
+         (off (or (third args) 0))
+         (val (lower-expr ctx (fourth args))))
+    (ctx-emit ctx :store nil (list ptr `(:imm ,off) val `(:type ,type-kw)))
+    nil))
+
+;;; ========== CO-RE annotated Load / Store / Ctx-load ==========
+
+(defun lower-core-load (ctx args)
+  "Lower (core-load TYPE ptr OFFSET STRUCT-NAME FIELD-NAME).
+   Delegates to load logic but appends a (:core ...) tag to args."
+  (let* ((type-kw (first args))
+         (ptr (lower-expr ctx (second args)))
+         (off (or (third args) 0))
+         (struct-name (fourth args))
+         (field-name (fifth args))
+         (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :load dst
+              (list ptr `(:imm ,off) `(:type ,type-kw)
+                    `(:core ,struct-name ,field-name))
+              type-kw)
+    dst))
+
+(defun lower-core-store (ctx args)
+  "Lower (core-store TYPE ptr OFFSET val STRUCT-NAME FIELD-NAME).
+   Delegates to store logic but appends a (:core ...) tag to args."
+  (let* ((type-kw (first args))
+         (ptr (lower-expr ctx (second args)))
+         (off (or (third args) 0))
+         (val (lower-expr ctx (fourth args)))
+         (struct-name (fifth args))
+         (field-name (sixth args)))
+    (ctx-emit ctx :store nil
+              (list ptr `(:imm ,off) val `(:type ,type-kw)
+                    `(:core ,struct-name ,field-name)))
+    nil))
+
+(defun lower-core-ctx-load (ctx args)
+  "Lower (core-ctx-load TYPE OFFSET STRUCT-NAME FIELD-NAME).
+   Delegates to ctx-load logic but appends a (:core ...) tag to args."
+  (let* ((type-kw (first args))
+         (offset (second args))
+         (struct-name (third args))
+         (field-name (fourth args))
+         (ctx-vreg (cdr (ctx-lookup-var ctx
+                          (intern "%%CTX" (find-package '#:whistler/ir)))))
+         (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :ctx-load dst
+              (list ctx-vreg `(:imm ,offset) `(:type ,type-kw)
+                    `(:core ,struct-name ,field-name))
+              type-kw)
+    dst))
+
+(defun lower-atomic-add (ctx args)
+  (let ((ptr (lower-expr ctx (first args)))
+        (off (or (second args) 0))
+        (val (lower-expr ctx (third args))))
+    (ctx-emit ctx :atomic-add nil (list ptr `(:imm ,off) val))
+    nil))
+
+;;; ========== Map operations ==========
+
+(defun lower-map-lookup (ctx map-name key-expr)
+  (let ((key-vreg (lower-expr ctx key-expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :map-lookup dst (list `(:map ,map-name) key-vreg) 'u64)
+    dst))
+
+(defun lower-map-update (ctx map-name key-expr val-expr flags)
+  (let ((key-vreg (lower-expr ctx key-expr))
+        (val-vreg (lower-expr ctx val-expr))
+        (flags-vreg (lower-expr ctx flags))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :map-update dst (list `(:map ,map-name) key-vreg val-vreg flags-vreg) 'u64)
+    dst))
+
+(defun lower-map-delete (ctx map-name key-expr)
+  (let ((key-vreg (lower-expr ctx key-expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :map-delete dst (list `(:map ,map-name) key-vreg) 'u64)
+    dst))
+
+(defun lower-map-lookup-ptr (ctx map-name ptr-expr)
+  "Lower map-lookup-ptr: key is already a pointer to stack data."
+  (let ((ptr-vreg (lower-expr ctx ptr-expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :map-lookup-ptr dst (list `(:map ,map-name) ptr-vreg) 'u64)
+    dst))
+
+;;; ========== Struct allocation ==========
+
+(defun lower-map-update-ptr (ctx map-name ptr-expr val-expr flags)
+  "Lower map-update-ptr: key is already a pointer to stack data."
+  (let ((ptr-vreg (lower-expr ctx ptr-expr))
+        (val-vreg (lower-expr ctx val-expr))
+        (flags-vreg (lower-expr ctx flags))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :map-update-ptr dst
+              (list `(:map ,map-name) ptr-vreg val-vreg flags-vreg) 'u64)
+    dst))
+
+(defun lower-map-delete-ptr (ctx map-name ptr-expr)
+  "Lower map-delete-ptr: key is already a pointer to stack data."
+  (let ((ptr-vreg (lower-expr ctx ptr-expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :map-delete-ptr dst (list `(:map ,map-name) ptr-vreg) 'u64)
+    dst))
+
+;;; ========== Ring buffer operations ==========
+
+(defun lower-ringbuf-reserve (ctx map-name size-expr flags-expr)
+  "Lower (ringbuf-reserve map size flags): reserve space in a ring buffer."
+  (let ((size-vreg (lower-expr ctx size-expr))
+        (flags-vreg (lower-expr ctx flags-expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :ringbuf-reserve dst
+              (list `(:map ,map-name) size-vreg flags-vreg) 'u64)
+    dst))
+
+(defun lower-ringbuf-submit (ctx data-expr flags-expr)
+  "Lower (ringbuf-submit data flags): submit a reserved ring buffer record."
+  (let ((data-vreg (lower-expr ctx data-expr))
+        (flags-vreg (lower-expr ctx flags-expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :ringbuf-submit dst (list data-vreg flags-vreg) 'u64)
+    dst))
+
+(defun lower-ringbuf-discard (ctx data-expr flags-expr)
+  "Lower (ringbuf-discard data flags): discard a reserved ring buffer record."
+  (let ((data-vreg (lower-expr ctx data-expr))
+        (flags-vreg (lower-expr ctx flags-expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :ringbuf-discard dst (list data-vreg flags-vreg) 'u64)
+    dst))
+
+(defun lower-struct-alloc (ctx size)
+  "Lower (struct-alloc SIZE): allocate SIZE bytes on stack, emit explicit
+   zero stores (which DSE can later eliminate), return pointer."
+  (let ((dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :struct-alloc dst (list `(:imm ,size)) 'u64)
+    ;; Emit explicit zero stores instead of zeroing inside emit-struct-alloc-insn.
+    ;; DSE will remove any that are overwritten before being read.
+    ;; Uses (:imm 0) as the value so emit can use st-mem (immediate store).
+    (let ((pos 0))
+      (loop while (< pos size)
+            do (let ((remaining (- size pos)))
+                 (cond
+                   ((>= remaining 8)
+                    (ctx-emit ctx :store nil
+                              (list dst `(:imm ,pos) '(:imm 0) '(:type u64)))
+                    (incf pos 8))
+                   ((>= remaining 4)
+                    (ctx-emit ctx :store nil
+                              (list dst `(:imm ,pos) '(:imm 0) '(:type u32)))
+                    (incf pos 4))
+                   ((>= remaining 2)
+                    (ctx-emit ctx :store nil
+                              (list dst `(:imm ,pos) '(:imm 0) '(:type u16)))
+                    (incf pos 2))
+                   (t
+                    (ctx-emit ctx :store nil
+                              (list dst `(:imm ,pos) '(:imm 0) '(:type u8)))
+                    (incf pos 1))))))
+    dst))
+
+;;; ========== Tail call ==========
+
+(defun lower-tail-call (ctx map-name index-expr)
+  "Lower (tail-call MAP INDEX). Emits bpf_tail_call(ctx, map, index).
+   If the tail call succeeds, execution transfers to the target program.
+   If it fails (bad index, no program loaded), execution continues."
+  (let ((idx-vreg (lower-expr ctx index-expr))
+        (ctx-vreg (cdr (ctx-lookup-var ctx (intern "%%CTX" (find-package '#:whistler/ir)))))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :tail-call dst
+              (list `(:map ,map-name) ctx-vreg idx-vreg) 'u64)
+    dst))
+
+;;; ========== Helper calls ==========
+
+(defun lower-helper-call (ctx helper-name args)
+  (let ((func-id (cdr (assoc (symbol-name helper-name) whistler/compiler:*builtin-helpers*
+                              :test #'string=))))
+    (unless func-id
+      (error "Unknown BPF helper: ~a (known: ~{~a~^, ~})" helper-name
+             (mapcar #'car whistler/compiler:*builtin-helpers*)))
+    (let ((arg-vregs (mapcar (lambda (a) (lower-expr ctx a)) args))
+          (dst (ctx-fresh-vreg ctx)))
+      (ctx-emit ctx :call dst (cons `(:helper ,func-id) arg-vregs) 'u64)
+      dst)))
+
+;;; ========== Context load ==========
+
+(defun lower-ctx-load (ctx type-kw offset)
+  (let ((ctx-vreg (cdr (ctx-lookup-var ctx (intern "%%CTX" (find-package '#:whistler/ir)))))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :ctx-load dst (list ctx-vreg `(:imm ,offset) `(:type ,type-kw)) type-kw)
+    dst))
+
+;;; ========== Setf ==========
+
+(defun lower-setf (ctx var-name expr)
+  (let ((new-vreg (lower-expr ctx expr)))
+    ;; SSA: update the variable to point to the new vreg
+    (ctx-update-var ctx var-name new-vreg)
+    new-vreg))
+
+;;; ========== Stack-addr ==========
+
+(defun lower-stack-addr (ctx var-name)
+  "Lower (stack-addr VAR) — get a pointer to a variable's stack location."
+  (let ((binding (ctx-lookup-var ctx var-name)))
+    (unless binding (error "Unbound variable for stack-addr: ~a" var-name))
+    (let ((vreg (cdr binding))
+          (dst (ctx-fresh-vreg ctx)))
+      (ctx-emit ctx :stack-addr dst (list vreg) 'u64)
+      dst)))
+
+;;; ========== Log2 intrinsic ==========
+
+(defun lower-log2 (ctx expr)
+  (let ((val (lower-expr ctx expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :log2 dst (list val) 'u64)
+    dst))
+
+;;; ========== Dotimes ==========
+
+(defun lower-dotimes (ctx var-spec body)
+  (destructuring-bind (var count) var-spec
+    (let ((n (cond ((integerp count) count)
+                   ((and (symbolp count) (boundp count) (constantp count))
+                    (symbol-value count))
+                   (t (error "dotimes count must be constant: ~a" count)))))
+      (let* ((prog (lower-ctx-prog ctx))
+             (saved-env (lower-ctx-env ctx))
+             (header-label (ir-fresh-label prog "loop_hdr"))
+             (body-label (ir-fresh-label prog "loop_body"))
+             (exit-label (ir-fresh-label prog "loop_exit"))
+             ;; Init counter
+             (init-vreg (ctx-fresh-vreg ctx)))
+        (ctx-emit ctx :mov init-vreg (list '(:imm 0)) 'u32)
+        (ctx-emit ctx :br nil (list `(:label ,header-label)))
+
+        ;; Header block with phi for counter
+        (let ((header-block (make-basic-block :label header-label)))
+          (ctx-switch-block ctx header-block)
+          (let ((phi-vreg (ctx-fresh-vreg ctx)))
+            (ctx-emit ctx :phi phi-vreg
+                      (list (list init-vreg `(:label ,(basic-block-label
+                                                       (first (ir-program-blocks prog)))))
+                            ;; back-edge phi arg filled later
+                            ))
+            (ctx-bind-var ctx var 'u32 phi-vreg)
+            ;; Bounds check
+            (let ((n-vreg (ctx-fresh-vreg ctx)))
+              (ctx-emit ctx :mov n-vreg (list `(:imm ,n)) 'u32)
+              (ctx-emit ctx :br-cond nil
+                        (list '(:cmp :jge) phi-vreg n-vreg
+                              `(:label ,exit-label) `(:label ,body-label))))
+
+            ;; Body block
+            (let ((body-block (make-basic-block :label body-label)))
+              (ctx-switch-block ctx body-block)
+              (dolist (form body)
+                (lower-expr ctx form))
+              ;; Increment counter
+              (let* ((one (ctx-fresh-vreg ctx))
+                     (inc-vreg (ctx-fresh-vreg ctx)))
+                (ctx-emit ctx :mov one (list '(:imm 1)) 'u32)
+                (ctx-emit ctx :add inc-vreg (list phi-vreg one) 'u32)
+                ;; Update phi back-edge
+                (let ((phi-insn (first (basic-block-insns header-block))))
+                  (setf (ir-insn-args phi-insn)
+                        (list (first (ir-insn-args phi-insn))
+                              (list inc-vreg `(:label ,(basic-block-label
+                                                        (lower-ctx-block ctx)))))))
+                (ctx-emit ctx :br nil (list `(:label ,header-label)))))))
+
+        ;; Exit block
+        (let ((exit-block (make-basic-block :label exit-label)))
+          (ctx-switch-block ctx exit-block))
+        (setf (lower-ctx-env ctx) saved-env)
+        nil))))
+
+;;; ========== Cast ==========
+
+(defun lower-cast (ctx type-kw expr)
+  (let ((v (lower-expr ctx expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :cast dst (list v `(:type ,type-kw)) type-kw)
+    dst))
+
+;;; ========== Cond ==========
+
+(defun lower-cond (ctx clauses)
+  (if (null clauses)
+      (let ((v (ctx-fresh-vreg ctx)))
+        (ctx-emit ctx :mov v (list '(:imm 0)) 'u64)
+        v)
+      (let* ((clause (first clauses))
+             (test (first clause))
+             (body (rest clause)))
+        (if (or (eq test t) (sym= test 't))
+            (let ((result nil))
+              (dolist (expr body) (setf result (lower-expr ctx expr)))
+              result)
+            (lower-if ctx test
+                      (if (= (length body) 1) (first body) (cons 'progn body))
+                      (if (rest clauses) (cons 'cond (rest clauses)) nil))))))
+
+;;; ========== And / Or ==========
+
+(defun lower-and (ctx args)
+  (if (null args)
+      (let ((v (ctx-fresh-vreg ctx)))
+        (ctx-emit ctx :mov v (list '(:imm 1)) 'u64)
+        v)
+      (if (= (length args) 1)
+          (lower-expr ctx (first args))
+          ;; Desugar: (and a b c) → (if a (and b c) 0)
+          (lower-if ctx (first args)
+                    (if (= (length (rest args)) 1)
+                        (second args)
+                        (cons 'and (rest args)))
+                    0))))
+
+(defun lower-or (ctx args)
+  (if (null args)
+      (let ((v (ctx-fresh-vreg ctx)))
+        (ctx-emit ctx :mov v (list '(:imm 0)) 'u64)
+        v)
+      (if (= (length args) 1)
+          (lower-expr ctx (first args))
+          ;; Desugar: (or a b) → (let ((tmp a)) (if tmp tmp (or b ...)))
+          ;; Simplified: just use if with the first arg
+          (lower-if ctx (first args)
+                    (first args)  ; then: re-evaluate (ok since it's a var or const)
+                    (if (= (length (rest args)) 1)
+                        (second args)
+                        (cons 'or (rest args)))))))
+
+;;; ========== Not ==========
+
+(defun lower-not (ctx expr)
+  (let* ((v (lower-expr ctx expr))
+         (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :cmp dst (list '(:cmp :jeq) v `(:imm 0)) 'u64)
+    dst))

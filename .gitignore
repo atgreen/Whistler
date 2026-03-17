@@ -1,0 +1,20 @@
+# Build artifacts
+whistler
+*.fasl
+
+# Compiled BPF objects
+*.bpf.o
+
+# Generated headers
+*_types.go
+*_types.rs
+*_types.py
+*_types.lisp
+examples/*.h
+
+# SBCL/ASDF cache
+.cache/
+
+# ocicl vendored dependencies (but keep the manifest)
+ocicl/
+!ocicl.csv

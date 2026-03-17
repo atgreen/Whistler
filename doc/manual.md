@@ -1,0 +1,655 @@
+# Whistler Language Manual
+
+## Overview
+
+Whistler is a Lisp that compiles to eBPF bytecode. Programs are written as
+Common Lisp s-expressions and compiled to ELF object files containing eBPF
+instructions. The full power of Common Lisp is available at compile time
+(macros, code generation, the REPL); at runtime, only eBPF bytecode executes
+in the kernel.
+
+This document covers every form the compiler accepts, the compilation model,
+and the constraints imposed by the eBPF virtual machine.
+
+## Compilation model
+
+### Phases
+
+1. **Load** — The source file is loaded as Common Lisp. `defmap` and `defprog`
+   macros register map and program definitions.
+2. **Macroexpand** — The compiler walks the program body and expands all CL
+   macros (user-defined macros, protocol macros from `protocols.lisp`).
+   Whistler built-in forms (`let`, `if`, `when`, `map-lookup`, etc.) are NOT
+   expanded — they are compiled directly.
+3. **Constant fold** — `defconstant` symbols are resolved to integer values
+   and arithmetic on constants is evaluated at compile time.
+4. **Lower to SSA IR** — The macro-expanded s-expression tree is lowered to an
+   intermediate representation with virtual registers, basic blocks, explicit
+   control flow edges, and φ-functions at join points.
+5. **SSA optimize** — Optimization passes run in sequence:
+   - Copy propagation
+   - Constant propagation
+   - Byte-swap comparison folding (eliminates runtime bswap when comparing
+     against constants)
+   - Constant offset folding (folds pointer arithmetic into load offsets)
+   - Tracepoint return elision
+   - Dead code elimination
+   - Dead destination elimination
+   - Dead store elimination (byte-level coverage tracking)
+   - Lookup-delete fusion (dominance-based, merges map-lookup + map-delete)
+   - Load hoisting (moves loads before helper calls when safe)
+   - PHI-branch threading (eliminates redundant branches via φ-function analysis)
+   - Bitmask-check fusion (combines mask + compare into single test)
+   - ALU type narrowing (promotes 32-bit ALU when operands are ≤32 bits)
+   - Live-range splitting (rematerialization of constants and reloadable values)
+6. **Register allocation** — Linear-scan allocator over SSA liveness intervals
+   with two register pools (callee-saved R6-R9 for values live across helper
+   calls, caller-saved R0-R5 for short-lived values), stack spilling, value
+   classification, and spill-cost heuristics. A backend portfolio tries
+   multiple allocation policies and keeps the best result.
+7. **BPF emission** — SSA IR with physical register assignments is emitted as
+   eBPF instructions. Includes map-fd caching (reuses callee-saved registers
+   for frequently referenced maps), struct key pointer caching, and CO-RE
+   relocation tracking.
+8. **Peephole optimization** — Post-emission pass eliminates redundant moves,
+   unreachable code, and merges common tail sequences.
+9. **ELF emit** — Instructions, map definitions, relocations, BTF, BTF.ext,
+   and metadata are written to an ELF object file. Supports multiple programs
+   per ELF.
+
+### Register allocation
+
+eBPF has 11 registers:
+
+| Register | Purpose | Lifetime |
+|----------|---------|----------|
+| R0 | Return value, helper call results | Clobbered by calls |
+| R1–R5 | Helper call arguments, temporaries | Clobbered by calls |
+| R6–R9 | Callee-saved registers | Preserved across calls |
+| R10 | Frame pointer (read-only) | Immutable |
+
+The linear-scan register allocator manages two pools:
+
+- **Callee-saved pool (R6–R9):** Assigned to virtual registers whose liveness
+  intervals span helper calls. R6 is reserved for the context pointer when the
+  program uses `ctx-load` after a helper call; otherwise R6 is available for
+  general allocation.
+- **Caller-saved pool (R0–R5):** Assigned to short-lived virtual registers that
+  don't survive across calls. When this pool is exhausted, the allocator
+  overflows into the callee-saved pool before spilling.
+
+When all registers are exhausted, values are spilled to the stack frame. The
+allocator classifies values (packet pointer, hot scalar, recomputable,
+helper-setup, temporary) and uses spill-cost heuristics to choose candidates.
+Rematerializable values (constants, loads from stable pointers) are preferred
+for spilling since they can be recomputed instead of reloaded. The eBPF stack
+is limited to 512 bytes.
+
+### eBPF constraints
+
+The kernel's BPF verifier enforces:
+
+- **No unbounded loops.** `dotimes` requires a compile-time constant bound.
+- **No recursion.** Programs are straight-line or branching, not recursive.
+- **512-byte stack limit.** The compiler tracks stack usage and errors if
+  exceeded.
+- **Pointer safety.** All memory accesses must be within bounds. Use
+  `with-packet` / `with-ipv4` / etc. to satisfy the verifier's bounds checks.
+- **Helper restrictions.** Some helpers are only available to certain program
+  types. The kernel verifier enforces this at load time.
+
+## Top-level declarations
+
+### defmap
+
+```lisp
+(defmap name :type TYPE :key-size N :value-size N :max-entries N
+        [:map-flags FLAGS])
+```
+
+Declares a BPF map. Emitted as a map definition in the ELF `maps` section.
+
+**Parameters:**
+- `:type` — One of `:hash`, `:array`, `:percpu-hash`, `:percpu-array`,
+  `:ringbuf`, `:prog-array`, `:lpm-trie`
+- `:key-size` — Key size in bytes
+- `:value-size` — Value size in bytes
+- `:max-entries` — Maximum number of entries
+- `:map-flags` — Optional flags (e.g., `1` for `BPF_F_NO_PREALLOC` with LPM trie)
+
+### defprog
+
+```lisp
+(defprog name (&key (type :xdp) (section nil) (license "GPL"))
+  body...)
+```
+
+Declares a BPF program. The body consists of Whistler forms that are compiled
+to eBPF instructions. The last expression is implicitly returned — no need
+for `(return ...)` unless returning early.
+
+Multiple `defprog` forms compile into a single ELF with separate sections.
+
+**Parameters:**
+- `:type` — Program type: `:xdp`, `:socket-filter`, `:tracepoint`, `:kprobe`
+- `:section` — ELF section name (defaults to lowercase type name)
+- `:license` — License string (must be `"GPL"` for GPL-only helpers)
+
+### defstruct
+
+```lisp
+(defstruct name
+  (field1 type1)
+  (field2 type2)
+  ...)
+```
+
+Defines a BPF struct with C-compatible layout (natural alignment, padding).
+Generates:
+
+- `(make-NAME)` — Allocates the struct on the stack, returns a pointer.
+- `(NAME-FIELD ptr)` — Reads a field. Emits CO-RE relocations.
+- `(setf (NAME-FIELD ptr) val)` — Writes a field. Emits CO-RE relocations.
+
+Example:
+
+```lisp
+(defstruct ct-key
+  (src-addr u32)
+  (dst-addr u32)
+  (proto    u8)
+  (pad      u8))
+
+(let ((key (make-ct-key)))
+  (setf (ct-key-src-addr key) src-ip)
+  (setf (ct-key-proto key) 6)
+  (ct-key-dst-addr key))   ; read
+```
+
+## Forms
+
+### Literals
+
+- **Integers** — Decimal or hex (`42`, `0xff`). 32-bit values use `MOV64_IMM`,
+  larger values use `LD_IMM64` (2-instruction sequence).
+- **nil** — Compiles to `MOV64_IMM reg, 0`.
+- **Symbols** — Looked up as: (1) built-in constants (`XDP_PASS`, etc.),
+  (2) `defconstant` values (inlined at compile time), (3) bound variables.
+
+### Variable binding
+
+```lisp
+;; Types are optional — default to u64 when omitted.
+(let ((data (xdp-data))
+      (count (load u32 ptr 0))
+      (flags (tcp-flags tcp)))
+  body...)
+
+;; Use (declare (type ...)) for sub-64-bit narrowing when needed.
+(let ((port (load u16 ptr 2))
+      (proto (ipv4-protocol ip)))
+  (declare (type u16 port))
+  body...)
+```
+
+Types are inferred from initializers when possible: `(load u32 ...)` → u32,
+`(ctx-load u32 ...)` → u32, `(cast u16 ...)` → u16, `(ntohs ...)` → u16,
+`(ntohl ...)` → u32, `(get-prandom-u32)` → u32. Everything else defaults
+to u64. Use `(declare (type TYPE var ...))` at the start of the let body
+when the type cannot be inferred (integer literals, arithmetic results).
+
+Bindings are sequential — each initializer can reference prior bindings
+in the same `let` (like CL `let*`).
+
+### Mutation
+
+```lisp
+(setf var expr)
+```
+
+Updates a bound variable. Works for both register and stack variables.
+
+### Control flow
+
+```lisp
+(if test then-form else-form)
+```
+
+When `test` is a comparison form (`>`, `=`, etc.), the compiler emits a single
+conditional jump. Otherwise, the test is evaluated and compared against zero.
+
+```lisp
+(when test body...)         ; if test is truthy, execute body
+(unless test body...)       ; if test is falsy, execute body
+```
+
+```lisp
+(when-let ((var init) ...) body...)
+```
+
+Binds variables and executes body only if all values are non-nil. Accepts
+both `(var init)` and `(var type init)` bindings.
+
+```lisp
+(if-let (var init) then else)
+```
+
+Binds a variable and branches on its value. Accepts both `(var init)`
+and `(var type init)`.
+
+```lisp
+(cond
+  (test1 body1...)
+  (test2 body2...)
+  ...
+  (t default-body...))
+```
+
+Multi-way conditional. Compiles to a chain of conditional jumps.
+
+```lisp
+(case key-expr
+  (value1 body1...)
+  ((v2 v3) body2...)      ; multiple values
+  (t default...))
+```
+
+Multi-way dispatch on a value. Shadows CL's `case`.
+
+```lisp
+(and expr1 expr2 ...)      ; short-circuit: returns 0 on first falsy
+(or  expr1 expr2 ...)      ; short-circuit: returns first truthy value
+```
+
+```lisp
+(progn expr1 expr2 ...)    ; evaluate sequentially, return last
+(return expr)              ; set R0 to expr value and exit
+(return)                   ; set R0 to 0 and exit
+```
+
+### Arithmetic
+
+All arithmetic is 64-bit (`BPF_ALU64`). The SSA optimizer narrows to 32-bit
+ALU when operand types allow.
+
+```lisp
+(+ a b)        ; add (n-ary)
+(- a b)        ; subtract
+(- a)          ; negate
+(* a b)        ; multiply
+(/ a b)        ; unsigned divide
+(mod a b)      ; unsigned modulo
+(incf var)     ; increment variable by 1
+(incf var n)   ; increment variable by n
+(decf var)     ; decrement variable by 1
+```
+
+### Bitwise operations
+
+```lisp
+(logand a b)   ; AND
+(logior a b)   ; OR
+(logxor a b)   ; XOR
+(<< a n)       ; left shift
+(>> a n)       ; logical right shift (unsigned)
+(>>> a n)      ; arithmetic right shift (signed)
+```
+
+### Comparison
+
+Returns 1 if true, 0 if false. When used as the test in `if` / `when` /
+`unless`, the compiler emits a direct conditional jump instead.
+
+```lisp
+;; Unsigned
+(= a b)   (/= a b)   (> a b)   (>= a b)   (< a b)   (<= a b)
+
+;; Signed
+(s> a b)  (s>= a b)  (s< a b)  (s<= a b)
+```
+
+### Logic
+
+```lisp
+(not expr)     ; 0 → 1, nonzero → 0
+```
+
+### Memory access
+
+```lisp
+(load type ptr offset)       ; *(type *)(ptr + offset)
+(store type ptr offset val)  ; *(type *)(ptr + offset) = val
+(ctx-load type offset)       ; load from context (R1/R6 + offset)
+(stack-addr var)             ; pointer to var's stack slot (&var)
+(atomic-add ptr offset val)  ; lock *(u64 *)(ptr + offset) += val
+```
+
+`type` is one of: `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`.
+
+### Type operations
+
+```lisp
+(cast u8 expr)     ; AND with 0xff
+(cast u16 expr)    ; AND with 0xffff
+(cast u32 expr)    ; 32-bit MOV (zero-extends)
+(cast u64 expr)    ; no-op
+```
+
+### Byte-order conversion
+
+```lisp
+(ntohs expr)   (htons expr)     ; 16-bit byte swap
+(ntohl expr)   (htonl expr)     ; 32-bit byte swap
+(ntohll expr)  (htonll expr)    ; 64-bit byte swap
+```
+
+Emits the BPF `END` instruction with the appropriate width. When a byte-swap
+result is compared against a constant, the compiler folds the swap into the
+constant at compile time, eliminating the runtime instruction.
+
+### Map operations
+
+#### Low-level interface
+
+```lisp
+(map-lookup map-name key-expr)     ; → pointer or 0 (NULL)
+(map-update map-name key val flags) ; insert/update
+(map-delete map-name key-expr)     ; delete entry
+```
+
+Calls `bpf_map_lookup_elem`, `bpf_map_update_elem`, `bpf_map_delete_elem`.
+Key and value expressions must be variables (the compiler takes their stack
+address). Flags: `BPF_ANY` (0), `BPF_NOEXIST` (1), `BPF_EXIST` (2).
+
+For struct keys already on the stack, use the pointer variants:
+
+```lisp
+(map-lookup-ptr map-name key-ptr)
+(map-update-ptr map-name key-ptr val-ptr flags)
+(map-delete-ptr map-name key-ptr)
+```
+
+#### High-level interface
+
+```lisp
+(getmap map-name key)                 ; lookup + deref, 0 if not found
+(setf (getmap map-name key) val)      ; insert or update (BPF_ANY)
+(remmap map-name key)                 ; delete entry
+(incf (getmap map-name key))          ; atomic increment
+(incf (getmap map-name key) delta)    ; atomic increment by delta
+```
+
+These mirror CL's `gethash` / `(setf (gethash ...))` / `remhash` pattern.
+`incf` on a getmap place uses `map-lookup` + `atomic-add` for existing
+entries, and `map-update` to initialize new entries in hash maps.
+
+#### Ring buffer operations
+
+```lisp
+(ringbuf-reserve map-name size flags) ; → pointer or NULL
+(ringbuf-submit ptr flags)            ; submit reserved data
+(ringbuf-discard ptr flags)           ; discard reserved data
+```
+
+### Tail calls
+
+```lisp
+(tail-call prog-array-map index)
+```
+
+Transfers execution to the program at `index` in a `:prog-array` map. If the
+index is out of range or no program is loaded at that slot, execution
+continues normally (falls through). The target program receives the same
+context as the caller.
+
+```lisp
+(defmap jt :type :prog-array :key-size 4 :value-size 4 :max-entries 256)
+
+(defprog dispatcher (:section "xdp")
+  (tail-call jt (ipv4-protocol ip))
+  XDP_PASS)
+```
+
+### BPF helper calls
+
+```lisp
+(helper-name arg1 arg2 ...)
+```
+
+BPF helpers are called directly by name in function position (Lisp-2 style).
+Arguments are loaded into R1–R5 (max 5). The return value is in R0.
+
+```lisp
+(let ((ts (ktime-get-ns)))         ; get current timestamp
+  (trace-printk fmt fmt-len ts))   ; print to trace pipe
+(redirect ifindex 0)               ; redirect packet
+```
+
+**Available helpers:**
+
+| Name | ID | Description |
+|------|----|-------------|
+| `map-lookup-elem` | 1 | Map lookup |
+| `map-update-elem` | 2 | Map update |
+| `map-delete-elem` | 3 | Map delete |
+| `probe-read` | 4 | Read kernel memory |
+| `ktime-get-ns` | 5 | Monotonic clock (nanoseconds) |
+| `trace-printk` | 6 | Debug printf to trace pipe |
+| `get-prandom-u32` | 7 | Pseudo-random u32 |
+| `get-smp-processor-id` | 8 | Current CPU ID |
+| `tail-call` | 12 | Tail call to program in prog-array |
+| `get-current-pid-tgid` | 14 | Current PID/TGID |
+| `get-current-uid-gid` | 15 | Current UID/GID |
+| `get-current-comm` | 16 | Current process name |
+| `redirect` | 23 | Redirect packet to interface |
+| `perf-event-output` | 25 | Send data to userspace perf ring |
+| `probe-read-str` | 45 | Read kernel string |
+| `get-current-cgroup-id` | 80 | Current cgroup ID |
+| `probe-read-user` | 112 | Read user memory |
+| `probe-read-user-str` | 114 | Read user string |
+| `ringbuf-output` | 130 | Output to ring buffer |
+| `ringbuf-reserve` | 131 | Reserve ring buffer space |
+| `ringbuf-submit` | 132 | Submit ring buffer reservation |
+| `ringbuf-discard` | 133 | Discard ring buffer reservation |
+
+### Bounded loops
+
+```lisp
+(dotimes (var count)
+  body...)
+```
+
+Iterates `count` times with `var` bound as a `u32` counting from 0 to
+`count - 1`. The count MUST be a compile-time constant (integer literal or
+`defconstant` value) — this is required for the BPF verifier to prove
+termination.
+
+### Inline assembly
+
+```lisp
+(asm opcode dst-reg src-reg offset immediate)
+```
+
+Emits a single raw BPF instruction. All arguments are integer constants. Use
+the BPF opcode encoding from the kernel headers. This is an escape hatch for
+instructions the compiler does not directly support.
+
+## Protocol library
+
+The protocol library (`protocols.lisp`) provides compile-time macros for
+parsing network packet headers. All accessors expand to `(load ...)` at compile
+time — there is no runtime overhead.
+
+### defheader
+
+```lisp
+(defheader name
+  (field-name :offset N :type TYPE [:net-order BOOL])
+  ...)
+```
+
+Defines a protocol header. For each field, generates a macro `(NAME-FIELD-NAME ptr)`
+that expands to `(load TYPE ptr OFFSET)`. If `:net-order t` is specified, the
+accessor wraps the load in `ntohs` or `ntohl` as appropriate.
+
+### Built-in headers
+
+**Ethernet** — `eth-type`, `eth-dst-mac-hi`, `eth-dst-mac-lo`,
+`eth-src-mac-hi`, `eth-src-mac-lo`
+
+**IPv4** — `ipv4-ver-ihl`, `ipv4-tos`, `ipv4-total-len`, `ipv4-id`,
+`ipv4-frag-off`, `ipv4-ttl`, `ipv4-protocol`, `ipv4-checksum`,
+`ipv4-src-addr`, `ipv4-dst-addr`
+
+**TCP** — `tcp-src-port`, `tcp-dst-port`, `tcp-seq`, `tcp-ack-seq`,
+`tcp-data-off`, `tcp-flags`, `tcp-window`, `tcp-checksum`, `tcp-urgent`
+
+**UDP** — `udp-src-port`, `udp-dst-port`, `udp-length`, `udp-checksum`
+
+### XDP context accessors
+
+```lisp
+(xdp-data)         ; load ctx->data (with CO-RE relocation for xdp_md)
+(xdp-data-end)     ; load ctx->data_end (with CO-RE relocation)
+```
+
+These emit CO-RE relocations for the kernel's `xdp_md` struct, so field
+offsets are patched automatically by libbpf at load time.
+
+### Parsing macros (statement-oriented)
+
+These macros parse headers with automatic bounds checking and early return
+on failure. They produce flat guard control flow (each check jumps directly
+to the exit), which is optimal for the BPF verifier.
+
+```lisp
+(with-packet (data data-end :min-len N) body...)
+(with-eth (data data-end) body...)
+(with-ipv4 (data data-end ip-var) body...)
+(with-tcp (data data-end tcp-var) body...)
+(with-udp (data data-end udp-var) body...)
+```
+
+### Parsing macros (expression-oriented)
+
+These return a pointer (or 0 on failure) and can be used in `when-let`:
+
+```lisp
+(parse-eth data data-end)     ; → data or 0
+(parse-ipv4 data data-end)    ; → ip-ptr or 0
+(parse-tcp data data-end)     ; → tcp-ptr or 0
+(parse-udp data data-end)     ; → udp-ptr or 0
+```
+
+Note: the `with-*` macros produce better code because they generate flat
+guard control flow. The `parse-*` macros create intermediate phi nodes.
+
+### Protocol constants
+
+```lisp
+;; EtherTypes
++ethertype-ipv4+    ; 0x0800
++ethertype-ipv6+    ; 0x86dd
++ethertype-arp+     ; 0x0806
+
+;; Header lengths (bytes)
++eth-hdr-len+       ; 14
++ipv4-hdr-len+      ; 20 (minimum, without options)
++tcp-hdr-len+       ; 20 (minimum)
++udp-hdr-len+       ; 8
+
+;; IP protocols
++ip-proto-icmp+     ; 1
++ip-proto-tcp+      ; 6
++ip-proto-udp+      ; 17
+
+;; TCP flags
++tcp-fin+  +tcp-syn+  +tcp-rst+  +tcp-psh+  +tcp-ack+  +tcp-urg+
+```
+
+## Macros
+
+Whistler macros are standard Common Lisp macros defined with `defmacro`. They
+are expanded at compile time before eBPF code generation.
+
+The macro expander walks the program body tree. It expands any macro that is
+NOT a Whistler built-in form. This means:
+
+- `when`, `unless`, `and`, `or` etc. are compiler primitives — they are NOT
+  CL macros, even though CL has macros with the same names.
+- User-defined macros expand normally.
+- Protocol library macros (`with-tcp`, `ipv4-src-addr`, etc.) expand normally.
+- `(setf (accessor ...))` forms are expanded via CL's `defsetf` machinery
+  before the Whistler compiler sees them.
+
+### Defining macros
+
+```lisp
+(defmacro with-map-value ((var map key) &body body)
+  `(let ((,var (map-lookup ,map ,key)))
+     (when ,var ,@body)))
+
+(with-map-value (ptr my-map key)
+  (atomic-add ptr 0 1))
+```
+
+Since the full CL runtime is available at macro-expansion time, macros can
+perform arbitrary computation:
+
+```lisp
+(defmacro define-port-checker (name &rest ports)
+  `(defmacro ,name (tcp-ptr)
+     `(or ,,@(mapcar (lambda (p) ``(= (tcp-dst-port ,,tcp-ptr) ,,p)) ports))))
+```
+
+## ELF output
+
+The compiler produces standard ELF64 relocatable objects with `EM_BPF` (247)
+machine type. Multiple programs compile into a single ELF with separate
+sections.
+
+| Section | Content |
+|---------|---------|
+| Program sections (e.g. `xdp`, `xdp/handler`) | BPF instruction bytecode |
+| `maps` | Map definitions (32 bytes each, shared across programs) |
+| `license` | Null-terminated license string |
+| `.BTF` | BTF type information (base types, structs, xdp_md, FUNC) |
+| `.BTF.ext` | BTF extensions (func_info per program, CO-RE relocations) |
+| `.symtab` | Symbol table (section syms, map syms, FUNC syms per program) |
+| `.strtab` | String table |
+| `.rel<section>` | Relocations per program section for map fd references |
+| `.shstrtab` | Section name strings |
+
+Relocations use `R_BPF_64_64` type for map fd fixups. The loader (bpftool,
+libbpf, etc.) creates the maps, obtains their file descriptors, and patches
+the `LD_IMM64` instructions.
+
+## Shared header generation
+
+The `--gen` CLI flag generates matching type definitions for userland code:
+
+```
+whistler compile prog.lisp --gen c          # → prog.h
+whistler compile prog.lisp --gen go         # → prog_types.go
+whistler compile prog.lisp --gen rust       # → prog_types.rs
+whistler compile prog.lisp --gen python     # → prog_types.py
+whistler compile prog.lisp --gen lisp       # → prog_types.lisp
+whistler compile prog.lisp --gen all        # → all of the above
+```
+
+Generated headers contain struct definitions and `defconstant` values from
+the source file, translated to the target language's idiom. Struct layouts
+are guaranteed to match the BPF side because they are derived from the same
+`defstruct` definitions.
+
+## CLI reference
+
+```
+whistler --version                          # version info
+whistler --help                             # usage
+whistler compile INPUT [-o OUTPUT] [--gen LANG...]
+whistler disasm INPUT                       # disassemble to stdout
+```
+
+When `-o` is omitted, the output path is derived from the input file
+(`.lisp` → `.bpf.o`).
