@@ -102,12 +102,18 @@ jobs:
         with:
           path: artifacts
 
+      - name: Extract version number
+        id: get_version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
       - name: Create GitHub release
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
-          generateReleaseNotes: true
+          bodyFile: doc/release-notes/RELEASE-NOTES-${{ steps.get_version.outputs.version }}.md
           artifacts: |
             artifacts/linux-package/*.tar.gz
           allowUpdates: true
