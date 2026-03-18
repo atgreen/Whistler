@@ -28,11 +28,15 @@ done
 
 ### 3. Create Release Notes
 
-Document:
-- Summary of changes
-- New features
+Create `doc/release-notes/RELEASE-NOTES-X.Y.Z.md`. Include only
+user-facing changes:
 - Bug fixes
+- New features
 - Breaking changes (if any)
+
+Do NOT include internal changes (refactors, lint fixes, doc updates,
+CI changes, directory reorganization). Those are visible in the git
+log for anyone who needs them.
 
 ### 4. Commit Changes
 
