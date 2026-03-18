@@ -287,7 +287,8 @@
           (when maps
             (loop for (name . rest) in maps
                   for i from 0
-                  for name-off = (strtab-add strtab (string name))
+                  for name-off = (strtab-add strtab
+                                  (substitute #\_ #\- (string-downcase (string name))))
                   do (push (encode-sym name-off
                                        (st-info +stb-global+ +stt-notype+) 0
                                        maps-sec-idx (* i 32) 0)

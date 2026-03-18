@@ -188,10 +188,32 @@
                   (push insn insn-list)))
               (nreverse insn-list)))))
 
+(defun block-has-ret-p (block)
+  "Does this block end with a :ret instruction?"
+  (let ((last-insn (car (last (basic-block-insns block)))))
+    (and last-insn (eq (ir-insn-op last-insn) :ret))))
+
 (defun order-blocks (prog)
-  "Order blocks: entry first, then by first appearance."
-  ;; Simple: just use the order they were added
-  (ir-program-blocks prog))
+  "Order blocks: keep creation order but move :ret blocks to the end
+   when there are multiple of them (from explicit return statements).
+   This ensures return statements always produce forward jumps, avoiding
+   the kernel BPF verifier's infinite loop detection.
+   When there is only one :ret block, keep original order (it is
+   already the natural fall-through target)."
+  (let* ((blocks (ir-program-blocks prog))
+         (entry-label (ir-program-entry prog))
+         (non-ret '())
+         (ret-blocks '()))
+    (dolist (b blocks)
+      (if (and (block-has-ret-p b)
+               (not (eq (basic-block-label b) entry-label)))
+          (push b ret-blocks)
+          (push b non-ret)))
+    (if (> (length ret-blocks) 1)
+        ;; Multiple return blocks: move them all to end
+        (nconc (nreverse non-ret) (nreverse ret-blocks))
+        ;; Zero or one return block: keep original order
+        blocks)))
 
 ;;; ========== Main emission ==========
 
@@ -717,41 +739,19 @@
 ;;; ========== Map operations emission ==========
 
 (defun emit-map-fd (ctx map-name dst-reg)
-  "Emit map fd load with relocation.  Caches the fd in a free callee-saved
-   register when available, replacing subsequent ld_pseudo (2 insns) with
-   mov (1 insn)."
-  (let ((cached-reg (gethash map-name (emit-ctx-map-fd-cache ctx))))
-    (if cached-reg
-        ;; Cache hit — just mov from cached register
-        (ectx-emit ctx (whistler/bpf:emit-mov64-reg dst-reg cached-reg))
-        ;; Cache miss — emit ld_pseudo, then optionally cache
-        (let* ((name-str (symbol-name map-name))
-               (map (find name-str (ir-program-maps (emit-ctx-ir-prog ctx))
-                          :key (lambda (m) (symbol-name (whistler/compiler:bpf-map-name m)))
-                          :test #'string=)))
-          (unless map (error "Unknown map: ~a" map-name))
-          (let ((byte-offset (* (ectx-current-idx ctx) 8)))
-            (push (list byte-offset (whistler/compiler:bpf-map-index map))
-                  (emit-ctx-map-relocs ctx)))
-          (ectx-emit ctx (whistler/bpf:emit-ld-map-fd dst-reg 0))
-          ;; Cache in a free callee-saved register when profitable (3+ refs).
-          ;; Only cache if this map has the most remaining refs among uncached maps,
-          ;; to avoid wasting the register on a less-used map.
-          (when (and (emit-ctx-free-callee-regs ctx)
-                     (>= (gethash map-name (emit-ctx-map-ref-counts ctx) 0) 3))
-            (let ((my-refs (gethash map-name (emit-ctx-map-ref-counts ctx) 0))
-                  (better-exists nil))
-              ;; Check if any uncached map has more remaining refs
-              (maphash (lambda (name count)
-                         (when (and (> count my-refs)
-                                    (not (gethash name (emit-ctx-map-fd-cache ctx))))
-                           (setf better-exists t)))
-                       (emit-ctx-map-ref-counts ctx))
-              (unless better-exists
-                (let ((cache-reg (pop (emit-ctx-free-callee-regs ctx))))
-                  (ectx-emit ctx (whistler/bpf:emit-mov64-reg cache-reg dst-reg))
-                  (setf (gethash map-name (emit-ctx-map-fd-cache ctx))
-                        cache-reg)))))))))
+  "Emit map fd load with relocation.
+   NOTE: Map FD caching in callee-saved registers is disabled because it
+   doesn't account for control flow — a cached register may not be
+   initialized on all paths that reach a cache-hit site."
+  (let* ((name-str (symbol-name map-name))
+         (map (find name-str (ir-program-maps (emit-ctx-ir-prog ctx))
+                    :key (lambda (m) (symbol-name (whistler/compiler:bpf-map-name m)))
+                    :test #'string=)))
+    (unless map (error "Unknown map: ~a" map-name))
+    (let ((byte-offset (* (ectx-current-idx ctx) 8)))
+      (push (list byte-offset (whistler/compiler:bpf-map-index map))
+            (emit-ctx-map-relocs ctx)))
+    (ectx-emit ctx (whistler/bpf:emit-ld-map-fd dst-reg 0))))
 
 (defun key-cache-key (ctx key-arg byte-size)
   "Build a stable cache key for stack-stored map keys.

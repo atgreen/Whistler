@@ -110,7 +110,8 @@
   (member op '(:call :tail-call :map-lookup :map-lookup-delete
                :map-update :map-update-ptr
                :map-delete :map-delete-ptr
-               :map-lookup-ptr)))
+               :map-lookup-ptr
+               :ringbuf-reserve :ringbuf-submit :ringbuf-discard)))
 
 (defun helper-effects (insn)
   "Return a list of effect keywords for a call-like instruction.

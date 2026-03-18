@@ -309,7 +309,7 @@
             (btf-emit-u32 types ftype-id)
             (btf-emit-u32 types fbits-offset))))
       ;; Create VAR for the map
-      (let ((var-id (btf-add-var ctx (string-downcase (string map-name))
+      (let ((var-id (btf-add-var ctx (lisp-to-c-name map-name)
                                  struct-id 1)))  ; linkage=global
         (values var-id struct-size)))))
 
@@ -329,7 +329,7 @@
     ;; 2. Add struct types from *struct-defs*
     (maphash (lambda (name def)
                (let ((fields (cdr def)))  ; skip total-size
-                 (btf-add-struct ctx (string-downcase name) fields)))
+                 (btf-add-struct ctx (lisp-to-c-name name) fields)))
              struct-defs)
 
     ;; 3. Add xdp_md if any section is XDP and not already defined
@@ -358,7 +358,12 @@
            (u64-id (gethash "u64" (btf-ctx-type-cache ctx)))
            (proto-id (btf-add-func-proto ctx u32-id (list (list "ctx" u64-id))))
            (func-ids (mapcar (lambda (name)
-                               (btf-add-func ctx name proto-id))
+                               ;; BTF FUNC names must be valid C identifiers.
+                               ;; Section names like "tracepoint/sock/foo"
+                               ;; need sanitizing — use last component.
+                               (let ((func-name (let ((pos (position #\/ name :from-end t)))
+                                                  (if pos (subseq name (1+ pos)) name))))
+                                 (btf-add-func ctx func-name proto-id)))
                              names)))
       (values ctx func-ids))))
 
@@ -407,7 +412,7 @@
           (when kernel
             (loop for f in (cdr kernel)
                   for idx from 0
-                  when (string= (string f) c-field)
+                  when (string-equal (string f) c-field)
                   return idx))))))
 
 (defun btf-ext-encode (ctx section-names func-type-ids per-section-core-relocs struct-defs)
@@ -433,6 +438,29 @@
                  (btf-emit-u32 func-info 1)          ; num_info = 1
                  (btf-emit-u32 func-info 0)          ; insn_off = 0
                  (btf-emit-u32 func-info func-id)))  ; type_id
+
+      ;; Build line_info subsection — one minimal entry per program.
+      ;; The kernel requires at least one bpf_line_info per function
+      ;; when func_info is present.
+      ;; bpf_line_info = { insn_off(u32), file_name_off(u32),
+      ;;                   line_off(u32), line_col(u32) } = 16 bytes
+      (let ((line-info (make-array 32 :element-type '(unsigned-byte 8)
+                                      :adjustable t :fill-pointer 0))
+            (synth-file-off (btf-strtab-add strtab "<whistler>"))
+            (synth-line-off (btf-strtab-add strtab "; whistler-generated")))
+        ;; rec_size = 16
+        (btf-emit-u32 line-info 16)
+        ;; One section header + one record per program
+        (loop for sec-name in section-names
+              do (let ((sec-off (btf-strtab-add strtab sec-name)))
+                   ;; Section header: sec_name_off, num_info
+                   (btf-emit-u32 line-info sec-off)
+                   (btf-emit-u32 line-info 1)           ; num_info = 1
+                   ;; bpf_line_info record
+                   (btf-emit-u32 line-info 0)           ; insn_off = 0 (first insn)
+                   (btf-emit-u32 line-info synth-file-off) ; file_name_off
+                   (btf-emit-u32 line-info synth-line-off) ; line_off
+                   (btf-emit-u32 line-info (ash 1 10)))) ; line_col = line 1, col 0
 
       ;; Build core_relo subsection
       (let ((core-relo (make-array 32 :element-type '(unsigned-byte 8)
@@ -463,7 +491,7 @@
 
         ;; Assemble header + subsections
         (let* ((func-info-len (length func-info))
-               (line-info-len 0)
+               (line-info-len (length line-info))
                (core-relo-len (length core-relo))
                (func-info-off 0)
                (line-info-off func-info-len)
@@ -497,9 +525,10 @@
             (put-u32 core-relo-len))
           ;; Copy subsection data
           (replace out func-info :start1 +btf-ext-header-size+)
+          (replace out line-info :start1 (+ +btf-ext-header-size+ line-info-off))
           (when (plusp core-relo-len)
             (replace out core-relo :start1 (+ +btf-ext-header-size+ core-relo-off)))
-          out)))))
+          out))))))
 
 (defun generate-btf-and-ext (struct-defs section-names per-section-core-relocs
                              &optional map-specs)

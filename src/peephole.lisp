@@ -146,13 +146,28 @@
 ;;; ========== Jump-to-next elimination ==========
 
 (defun peephole-eliminate-dead-jumps (insns)
-  "Remove unconditional jumps to the next instruction (ja +0)."
-  (let ((vec (coerce insns 'vector))
-        (to-delete (make-hash-table)))
-    (loop for i from 0 below (length vec)
+  "Remove unconditional jumps to the next instruction (ja +0).
+   Preserves the last such jump if removing it would leave conditional
+   branches targeting past-the-end of the instruction stream."
+  (let* ((vec (coerce insns 'vector))
+         (len (length vec))
+         (to-delete (make-hash-table))
+         ;; Find all conditional/unconditional jump targets
+         (jump-targets (make-hash-table)))
+    ;; Collect all jump targets
+    (loop for i from 0 below len
+          for insn = (aref vec i)
+          when (or (bpf-unconditional-jmp-p insn)
+                   (bpf-conditional-jmp-p insn))
+          do (let ((target (+ i 1 (whistler/bpf:bpf-insn-off insn))))
+               (setf (gethash target jump-targets) t)))
+    ;; Mark goto pc+0 for deletion, but NOT if it's a jump target itself
+    ;; (another branch needs to land here)
+    (loop for i from 0 below len
           for insn = (aref vec i)
           when (and (bpf-unconditional-jmp-p insn)
-                    (= (whistler/bpf:bpf-insn-off insn) 0))
+                    (= (whistler/bpf:bpf-insn-off insn) 0)
+                    (not (gethash i jump-targets)))
           do (setf (gethash i to-delete) t))
     (if (zerop (hash-table-count to-delete))
         insns
@@ -249,12 +264,14 @@
 ;;; a jump to the first.
 
 (defun peephole-tail-merge (insns)
-  "Replace duplicate mov r0, IMM; exit sequences with jumps to the first."
+  "Replace duplicate mov r0, IMM; exit sequences with jumps to the last.
+   Keeping the last occurrence ensures earlier duplicates jump forward,
+   which is required by the BPF verifier (no backward jumps)."
   (let ((vec (coerce insns 'vector))
         (len (length insns))
-        (first-exit (make-hash-table))  ; imm-value → first occurrence index
-        (to-replace '()))               ; (index . target-index) pairs
-    ;; Pass 1: find all "mov r0, IMM; exit" pairs and record first occurrence
+        (last-exit (make-hash-table))   ; imm-value → last occurrence index
+        (all-exits (make-hash-table)))  ; imm-value → list of all indices
+    ;; Pass 1: find all "mov r0, IMM; exit" pairs, record last occurrence
     (loop for i from 0 below (1- len)
           for insn = (aref vec i)
           for next = (aref vec (1+ i))
@@ -262,31 +279,34 @@
                     (= (whistler/bpf:bpf-insn-dst insn) 0) ; dst is r0
                     (bpf-exit-p next))
           do (let ((imm (whistler/bpf:bpf-insn-imm insn)))
-               (if (gethash imm first-exit)
-                   ;; Duplicate — mark for replacement
-                   (push (cons i (gethash imm first-exit)) to-replace)
-                   ;; First occurrence — record it
-                   (setf (gethash imm first-exit) i))))
-    (if to-replace
-        ;; Pass 2: replace duplicates with jumps
-        ;; For each duplicate at index i (mov r0, IMM) + i+1 (exit):
-        ;; Replace i with "ja TARGET" and mark i+1 for deletion
-        (let ((to-delete (make-hash-table)))
-          (dolist (pair to-replace)
-            (let ((dup-idx (car pair))
-                  (target-idx (cdr pair)))
-              ;; Replace the mov with a jump to the first occurrence
-              (let ((insn (aref vec dup-idx)))
-                (setf (whistler/bpf:bpf-insn-code insn) #x05) ; JA
-                (setf (whistler/bpf:bpf-insn-dst insn) 0)
-                (setf (whistler/bpf:bpf-insn-src insn) 0)
-                (setf (whistler/bpf:bpf-insn-off insn)
-                      (- target-idx dup-idx 1))
-                (setf (whistler/bpf:bpf-insn-imm insn) 0))
-              ;; Mark the exit for deletion
-              (setf (gethash (1+ dup-idx) to-delete) t)))
-          (reindex-after-deletion vec to-delete))
-        insns)))
+               (push i (gethash imm all-exits))
+               (setf (gethash imm last-exit) i)))
+    ;; Build replacement list: all occurrences except the last jump to the last
+    (let ((to-replace '()))
+      (maphash (lambda (imm indices)
+                 (let ((keep (gethash imm last-exit)))
+                   (dolist (idx indices)
+                     (unless (= idx keep)
+                       (push (cons idx keep) to-replace)))))
+               all-exits)
+      (if to-replace
+          ;; Pass 2: replace earlier duplicates with forward jumps to the last
+          (let ((to-delete (make-hash-table)))
+            (dolist (pair to-replace)
+              (let ((dup-idx (car pair))
+                    (target-idx (cdr pair)))
+                ;; Replace the mov with a jump to the last occurrence
+                (let ((insn (aref vec dup-idx)))
+                  (setf (whistler/bpf:bpf-insn-code insn) #x05) ; JA
+                  (setf (whistler/bpf:bpf-insn-dst insn) 0)
+                  (setf (whistler/bpf:bpf-insn-src insn) 0)
+                  (setf (whistler/bpf:bpf-insn-off insn)
+                        (- target-idx dup-idx 1))
+                  (setf (whistler/bpf:bpf-insn-imm insn) 0))
+                ;; Mark the exit for deletion
+                (setf (gethash (1+ dup-idx) to-delete) t)))
+            (reindex-after-deletion vec to-delete))
+          insns))))
 
 ;;; ========== Dead code after exit ==========
 
@@ -879,15 +899,15 @@
                (cond
                  ;; AND rX, MASK — check if redundant, then update width
                  ((or (bpf-and32-imm-p insn) (bpf-and64-imm-p insn))
-                  (let ((known-w (aref widths dst))
-                        (mask-w (cond ((<= imm #xff) 8)
-                                      ((<= imm #xffff) 16)
-                                      ((<= imm #xffffffff) 32)
-                                      (t 64))))
-                    ;; If register width <= mask width, AND is a no-op
-                    (if (and known-w (<= known-w mask-w))
+                  (let* ((known-w (aref widths dst))
+                         ;; Compute effective mask width as bit-length of the mask.
+                         ;; 0x0f→4, 0xff→8, 0xffff→16, 0xffffffff→32
+                         (mask-w (if (zerop imm) 0 (integer-length imm))))
+                    ;; AND is a no-op only if register width < mask width
+                    ;; (all possible values already fit within the mask)
+                    (if (and known-w (< known-w mask-w))
                         (setf (gethash i to-delete) t)
-                        ;; Update width to min of current and mask
+                        ;; Update width: AND narrows to mask width
                         (setf (aref widths dst) mask-w))))
 
                  ;; RSH rX, N — narrows the value
