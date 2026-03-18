@@ -27,8 +27,11 @@
   (struct-offsets (make-hash-table))   ; vreg → R10-relative offset (for struct base elim)
   (const-values (make-hash-table))    ; vreg → integer constant value
   (map-fd-cache (make-hash-table))    ; map-name → callee-saved register number
+  (map-fd-cache-block (make-hash-table)) ; map-name → block-label where cached
   (free-callee-regs '())             ; callee-saved regs not used by regalloc
   (map-ref-counts (make-hash-table)) ; map-name → reference count
+  (dom-map nil)                      ; dominator map for control-flow-aware caching
+  (current-block-label nil)          ; label of the block currently being emitted
   (core-relocs '())                  ; (bpf-insn-object struct-name field-name) for CO-RE
   (ptr-cache (make-hash-table))     ; R10-relative offset → stack slot holding cached ptr
   (struct-ptr-uses (make-hash-table))) ; struct vreg → count of map-ptr uses
@@ -294,12 +297,14 @@
            (free-callee (find-free-callee-regs alloc-map))
            (map-refs (count-map-fd-refs prog))
            (struct-uses (count-struct-ptr-uses prog))
+           (dom-map (compute-dominators prog))
            (ctx (make-emit-ctx :ir-prog prog :vreg-map alloc-map
                                :stack-offset regalloc-stack
                                :vreg-types (build-vreg-type-map prog)
                                :free-callee-regs free-callee
                                :map-ref-counts map-refs
-                               :struct-ptr-uses struct-uses))
+                               :struct-ptr-uses struct-uses
+                               :dom-map dom-map))
            (blocks (order-blocks prog))
            (block-positions (make-hash-table)))
 
@@ -321,6 +326,7 @@
 
     ;; Emit each block
     (dolist (block blocks)
+      (setf (emit-ctx-current-block-label ctx) (basic-block-label block))
       (setf (gethash (basic-block-label block) block-positions)
             (ectx-current-idx ctx))
       (dolist (insn (basic-block-insns block))
@@ -739,19 +745,38 @@
 ;;; ========== Map operations emission ==========
 
 (defun emit-map-fd (ctx map-name dst-reg)
-  "Emit map fd load with relocation.
-   NOTE: Map FD caching in callee-saved registers is disabled because it
-   doesn't account for control flow — a cached register may not be
-   initialized on all paths that reach a cache-hit site."
-  (let* ((name-str (symbol-name map-name))
-         (map (find name-str (ir-program-maps (emit-ctx-ir-prog ctx))
-                    :key (lambda (m) (symbol-name (whistler/compiler:bpf-map-name m)))
-                    :test #'string=)))
-    (unless map (error "Unknown map: ~a" map-name))
-    (let ((byte-offset (* (ectx-current-idx ctx) 8)))
-      (push (list byte-offset (whistler/compiler:bpf-map-index map))
-            (emit-ctx-map-relocs ctx)))
-    (ectx-emit ctx (whistler/bpf:emit-ld-map-fd dst-reg 0))))
+  "Emit map fd load with relocation.  Caches the fd in a free callee-saved
+   register when available, replacing subsequent ld_pseudo (2 insns) with
+   mov (1 insn).  Uses dominator analysis to ensure the cached register is
+   only reused when the caching block dominates the current block."
+  (let ((cached-reg (gethash map-name (emit-ctx-map-fd-cache ctx)))
+        (cached-block (gethash map-name (emit-ctx-map-fd-cache-block ctx)))
+        (cur-block (emit-ctx-current-block-label ctx))
+        (dom-map (emit-ctx-dom-map ctx)))
+    (if (and cached-reg cached-block dom-map
+             (dominates-p dom-map cached-block cur-block))
+        ;; Cache hit — the block where we cached dominates here,
+        ;; so the register is guaranteed to be initialized.
+        (ectx-emit ctx (whistler/bpf:emit-mov64-reg dst-reg cached-reg))
+        ;; Cache miss or not dominated — emit fresh ld_pseudo
+        (let* ((name-str (symbol-name map-name))
+               (map (find name-str (ir-program-maps (emit-ctx-ir-prog ctx))
+                          :key (lambda (m) (symbol-name (whistler/compiler:bpf-map-name m)))
+                          :test #'string=)))
+          (unless map (error "Unknown map: ~a" map-name))
+          (let ((byte-offset (* (ectx-current-idx ctx) 8)))
+            (push (list byte-offset (whistler/compiler:bpf-map-index map))
+                  (emit-ctx-map-relocs ctx)))
+          (ectx-emit ctx (whistler/bpf:emit-ld-map-fd dst-reg 0))
+          ;; Cache in a free callee-saved register when profitable (3+ refs)
+          (when (and (not cached-reg)
+                     (emit-ctx-free-callee-regs ctx)
+                     (>= (gethash map-name (emit-ctx-map-ref-counts ctx) 0) 3))
+            (let ((cache-reg (pop (emit-ctx-free-callee-regs ctx))))
+              (ectx-emit ctx (whistler/bpf:emit-mov64-reg cache-reg dst-reg))
+              (setf (gethash map-name (emit-ctx-map-fd-cache ctx)) cache-reg)
+              (setf (gethash map-name (emit-ctx-map-fd-cache-block ctx))
+                    cur-block)))))))
 
 (defun key-cache-key (ctx key-arg byte-size)
   "Build a stable cache key for stack-stored map keys.
