@@ -141,29 +141,53 @@ Multiple `defprog` forms compile into a single ELF with separate sections.
 (defstruct name
   (field1 type1)
   (field2 type2)
+  (field3 (array elem-type count))
   ...)
 ```
 
 Defines a BPF struct with C-compatible layout (natural alignment, padding).
+Field types can be scalar (`u8`, `u16`, `u32`, `u64`) or fixed-size arrays
+(`(array type count)`).
+
 Generates:
 
 - `(make-NAME)` — Allocates the struct on the stack, returns a pointer.
-- `(NAME-FIELD ptr)` — Reads a field. Emits CO-RE relocations.
-- `(setf (NAME-FIELD ptr) val)` — Writes a field. Emits CO-RE relocations.
+- `(NAME-FIELD ptr)` — Reads a scalar field. Emits CO-RE relocations.
+- `(setf (NAME-FIELD ptr) val)` — Writes a scalar field. Emits CO-RE relocations.
+- `(NAME-FIELD ptr idx)` — Reads an array element. Constant indices fold to
+  fixed offsets; runtime indices compute the offset dynamically.
+- `(setf (NAME-FIELD ptr idx) val)` — Writes an array element.
+- `(NAME-FIELD-PTR ptr)` — Returns a pointer to the array field start.
+  Useful for passing to BPF helpers.
 
 Example:
 
 ```lisp
-(defstruct ct-key
-  (src-addr u32)
-  (dst-addr u32)
-  (proto    u8)
-  (pad      u8))
+(defstruct my-event
+  (pid       u32)
+  (comm      (array u8 16))
+  (data      (array u8 32)))
 
-(let ((key (make-ct-key)))
-  (setf (ct-key-src-addr key) src-ip)
-  (setf (ct-key-proto key) 6)
-  (ct-key-dst-addr key))   ; read
+(let ((evt (make-my-event)))
+  (setf (my-event-pid evt) (cast u32 (get-current-pid-tgid)))
+  ;; Pass array pointer to helper
+  (get-current-comm (my-event-comm-ptr evt) 16)
+  ;; Indexed array access
+  (setf (my-event-data evt 0) 42))
+```
+
+### sizeof
+
+```lisp
+(sizeof struct-name)
+```
+
+Returns the byte size of a struct at compile time. Replaces magic numbers
+in `probe-read-user`, `ringbuf-reserve`, etc.
+
+```lisp
+(probe-read-user buf (sizeof my-struct) ptr)
+(ringbuf-reserve events (sizeof my-event) 0)
 ```
 
 ## Forms
@@ -325,6 +349,42 @@ Returns 1 if true, 0 if false. When used as the test in `if` / `when` /
 ```
 
 `type` is one of: `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`.
+
+### Memory operations
+
+```lisp
+(memset ptr offset value nbytes)
+```
+
+Fill NBYTES bytes at PTR+OFFSET with VALUE. OFFSET and NBYTES must be
+compile-time constants. When VALUE is a compile-time integer, the macro uses
+widened stores for efficiency (e.g., 16 bytes of `#xFF` becomes 2 u64 stores
+instead of 16 u8 stores). Values like `#xFF` (widened to -1) use `mov`
+instead of `ld_imm64` for optimal codegen.
+
+```lisp
+(memcpy dst dst-offset src src-offset nbytes)
+```
+
+Copy NBYTES bytes from SRC+SRC-OFFSET to DST+DST-OFFSET. All offsets and
+NBYTES must be compile-time constants. Uses the widest possible loads/stores.
+
+### pt_regs access (x86-64)
+
+Portable access to function arguments in uprobe/kprobe programs:
+
+```lisp
+(pt-regs-parm1)   ; first function arg (rdi, offset 112)
+(pt-regs-parm2)   ; second function arg (rsi, offset 104)
+(pt-regs-parm3)   ; third function arg (rdx, offset 96)
+(pt-regs-parm4)   ; fourth function arg (rcx, offset 88)
+(pt-regs-parm5)   ; fifth function arg (r8, offset 72)
+(pt-regs-parm6)   ; sixth function arg (r9, offset 64)
+(pt-regs-ret)     ; return value (rax, offset 80)
+```
+
+These match the C macros `PT_REGS_PARM1()` etc. from `bpf_tracing.h`,
+using x86-64 System V ABI register offsets into `struct pt_regs`.
 
 ### Type operations
 
@@ -637,10 +697,12 @@ whistler compile prog.lisp --gen lisp       # → prog_types.lisp
 whistler compile prog.lisp --gen all        # → all of the above
 ```
 
-Generated headers contain struct definitions and `defconstant` values from
-the source file, translated to the target language's idiom. Struct layouts
-are guaranteed to match the BPF side because they are derived from the same
-`defstruct` definitions.
+Generated headers contain struct definitions (including array fields) and
+`defconstant` values from the source file, translated to the target
+language's idiom. Array fields map to native array syntax in each language:
+`uint8_t field[16]` (C), `[16]uint8` (Go), `[u8; 16]` (Rust),
+`ctypes.c_uint8 * 16` (Python). Struct layouts are guaranteed to match the
+BPF side because they are derived from the same `defstruct` definitions.
 
 ## CLI reference
 

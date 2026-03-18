@@ -278,7 +278,7 @@ ALU operations to 32-bit when safe.
 ### Structs and CO-RE
 
 Define structs with C-compatible layout. `defstruct` generates CL-style
-accessor functions and `setf` expanders. All field accesses emit CO-RE
+accessor functions and `setf` expanders. Scalar field accesses emit CO-RE
 relocations, enabling cross-kernel portability.
 
 ```lisp
@@ -295,6 +295,58 @@ relocations, enabling cross-kernel portability.
   (setf (ct-key-dst-addr key) dst-ip)
   ;; Read a field
   (ct-key-src-port key))
+```
+
+#### Array fields
+
+Structs support fixed-size array fields with indexed access:
+
+```lisp
+(defstruct my-event
+  (pid     u32)
+  (data    (array u8 16)))
+
+;; Indexed read/write — constant indices fold to fixed offsets
+(my-event-data evt 5)                         ; read element 5
+(setf (my-event-data evt 5) (cast u8 val))    ; write element 5
+
+;; Pointer accessor — for passing array field addresses to BPF helpers
+(get-current-comm (my-event-data-ptr evt) 16)
+```
+
+#### sizeof
+
+```lisp
+(sizeof my-event)                             ; → struct byte size (constant)
+(probe-read-user buf (sizeof ffi-cif) ptr)    ; no more magic numbers
+(ringbuf-reserve events (sizeof my-event) 0)
+```
+
+### Memory operations
+
+```lisp
+;; Fill memory (widened stores: 16 bytes of 0xFF = 2 u64 stores, not 16 u8)
+(memset ptr offset value nbytes)
+
+;; Copy memory (wide load/store pairs)
+(memcpy dst dst-offset src src-offset nbytes)
+```
+
+All offsets and sizes must be compile-time constants.
+
+### pt_regs access (x86-64)
+
+Portable access to function arguments in uprobe/kprobe programs, matching
+C's `PT_REGS_PARM1()` etc.:
+
+```lisp
+(pt-regs-parm1)    ; first arg (rdi)
+(pt-regs-parm2)    ; second arg (rsi)
+(pt-regs-parm3)    ; third arg (rdx)
+(pt-regs-parm4)    ; fourth arg (rcx)
+(pt-regs-parm5)    ; fifth arg (r8)
+(pt-regs-parm6)    ; sixth arg (r9)
+(pt-regs-ret)      ; return value (rax)
 ```
 
 XDP context accessors (`xdp-data`, `xdp-data-end`) also emit CO-RE relocations

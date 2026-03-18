@@ -61,7 +61,7 @@
         (when (and (logand flags +tcp-syn+)
                    (not (logand flags +tcp-ack+)))
           ;; Reserve space in ring buffer
-          (let ((event (ringbuf-reserve events 12 0)))
+          (let ((event (ringbuf-reserve events (sizeof conn-event) 0)))
             (if event
                 ;; Fill event struct and submit
                 (progn

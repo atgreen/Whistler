@@ -61,9 +61,11 @@ Programs are defined with `defprog`, maps with `defmap`, structs with `defstruct
 
 Use `(declare (type ...))` for narrowing when inference can't determine the type (integer literals, arithmetic results).
 
-Key forms: `let`, `if`, `when`, `when-let`, `if-let`, `return`, `load`, `store`, `logand`, `logxor`, `>>`, `cast`, `map-lookup`, `map-update`, `map-delete`, `map-lookup-ptr`, `struct-alloc`, `stack-addr`, `tail-call`, `get-prandom-u32`, protocol accessors.
+Key forms: `let`, `if`, `when`, `unless`, `when-let`, `if-let`, `return`, `load`, `store`, `logand`, `logxor`, `>>`, `cast`, `map-lookup`, `map-update`, `map-delete`, `map-lookup-ptr`, `struct-alloc`, `stack-addr`, `tail-call`, `get-prandom-u32`, `sizeof`, `memset`, `memcpy`, `pt-regs-parm1`..`parm6`, `pt-regs-ret`, protocol accessors.
 
-`defstruct` generates CL-style accessors `(name-field ptr)` and `setf` expanders `(setf (name-field ptr) val)`. Maps support `(getmap m k)` / `(setf (getmap m k) v)` / `(remmap m k)` — matching CL's gethash/remhash pattern.
+`defstruct` generates CL-style accessors `(name-field ptr)` and `setf` expanders `(setf (name-field ptr) val)`. Array fields `(field (array u8 16))` generate indexed accessors `(name-field ptr idx)` with `setf`, and pointer accessors `(name-field-ptr ptr)` for passing to helpers. `(sizeof name)` returns compile-time struct size. Maps support `(getmap m k)` / `(setf (getmap m k) v)` / `(remmap m k)` — matching CL's gethash/remhash pattern.
+
+Memory ops: `(memset ptr off val n)` with widened stores, `(memcpy dst doff src soff n)` with wide load/store pairs. `(pt-regs-parm1)` through `(pt-regs-parm6)` and `(pt-regs-ret)` for x86-64 uprobe/kprobe context access.
 
 Types: `u8`, `u16`, `u32`, `u64`. The `whistler` package shadows `case` and `defstruct` from CL.
 
