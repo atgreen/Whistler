@@ -361,16 +361,23 @@
                           ;; Found a load from the same stack slot
                           ((and (bpf-stack-load-p insn)
                                 (= (whistler/bpf:bpf-insn-off insn) store-off))
-                           (let ((load-dst (whistler/bpf:bpf-insn-dst insn)))
-                             ;; Replace ldx rY, [r10+off] → mov rY, rX
-                             (setf (whistler/bpf:bpf-insn-code insn)
-                                   (logior whistler/bpf:+bpf-alu64+
-                                           whistler/bpf:+bpf-mov+
-                                           whistler/bpf:+bpf-x+))
-                             (setf (whistler/bpf:bpf-insn-src insn) store-src)
-                             (setf (whistler/bpf:bpf-insn-dst insn) load-dst)
-                             (setf (whistler/bpf:bpf-insn-off insn) 0)
-                             (setf (whistler/bpf:bpf-insn-imm insn) 0))
+                           ;; Only forward if store-src register was not modified
+                           ;; between the store and this load
+                           (let ((src-clobbered nil))
+                             (loop for k from (1+ i) below j
+                                   when (bpf-reg-written-p (aref vec k) store-src)
+                                   do (setf src-clobbered t) (return))
+                             (unless src-clobbered
+                               (let ((load-dst (whistler/bpf:bpf-insn-dst insn)))
+                                 ;; Replace ldx rY, [r10+off] → mov rY, rX
+                                 (setf (whistler/bpf:bpf-insn-code insn)
+                                       (logior whistler/bpf:+bpf-alu64+
+                                               whistler/bpf:+bpf-mov+
+                                               whistler/bpf:+bpf-x+))
+                                 (setf (whistler/bpf:bpf-insn-src insn) store-src)
+                                 (setf (whistler/bpf:bpf-insn-dst insn) load-dst)
+                                 (setf (whistler/bpf:bpf-insn-off insn) 0)
+                                 (setf (whistler/bpf:bpf-insn-imm insn) 0))))
                            (return))
                           ;; Another store to the same slot invalidates
                           ((and (bpf-stack-store-p insn)
