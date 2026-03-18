@@ -88,8 +88,8 @@
   entsize        ; entry size
   file-offset)   ; computed during layout
 
-;;; Map definition structure for the "maps" section
-;;; Each map entry is 32 bytes: type(4) key_size(4) value_size(4) max_entries(4) flags(4) + padding(12)
+;;; Map definition structure for the ".maps" section (BTF-defined maps)
+;;; Each map entry is 32 bytes of zeros — actual configuration comes from BTF.
 
 (defun encode-map-def (map-type key-size value-size max-entries &optional (flags 0))
   (let ((data (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -194,7 +194,7 @@
 
         ;; -- Maps section (if any maps) --
         (when maps
-          (let* ((name-off (strtab-add shstrtab "maps"))
+          (let* ((name-off (strtab-add shstrtab ".maps"))
                  (map-data (make-array (* 32 (length maps))
                                        :element-type '(unsigned-byte 8))))
             (next-sec-idx)
@@ -209,7 +209,7 @@
                   for entry = (encode-map-def mtype ksize vsize maxent mflags)
                   do (replace map-data entry :start1 (* i 32)))
             (push (make-elf-section
-                   :name "maps"
+                   :name ".maps"
                    :name-offset name-off
                    :type +sht-progbits+
                    :flags +shf-alloc+

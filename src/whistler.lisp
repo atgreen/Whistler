@@ -184,7 +184,7 @@
              (all-core-relocs (mapcar #'fourth prog-sections)))
         ;; Generate BTF and BTF.ext for all programs
         (multiple-value-bind (btf btf-ext)
-            (generate-btf-and-ext *struct-defs* section-names all-core-relocs)
+            (generate-btf-and-ext *struct-defs* section-names all-core-relocs map-specs)
           (write-bpf-elf output-path
                          :prog-sections prog-sections
                          :maps map-specs

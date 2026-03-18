@@ -17,10 +17,14 @@
 (defconstant +btf-header-size+ 24)
 
 ;; BTF type kinds (stored in bits 24-28 of info field)
-(defconstant +btf-kind-int+       1)
-(defconstant +btf-kind-struct+    4)
+(defconstant +btf-kind-int+        1)
+(defconstant +btf-kind-ptr+        2)
+(defconstant +btf-kind-array+      3)
+(defconstant +btf-kind-struct+     4)
+(defconstant +btf-kind-var+       14)
+(defconstant +btf-kind-datasec+   15)
 (defconstant +btf-kind-func-proto+ 13)
-(defconstant +btf-kind-func+     12)
+(defconstant +btf-kind-func+      12)
 
 ;; BTF_INT encoding bits
 (defconstant +btf-int-signed+ (ash 1 0))
@@ -145,6 +149,57 @@
     (btf-emit-u32 types proto-type-id)
     id))
 
+(defun btf-add-ptr (ctx target-type-id)
+  "Add a BTF_KIND_PTR type. Returns the type ID."
+  (let* ((id (btf-alloc-id ctx))
+         (types (btf-ctx-types ctx)))
+    (btf-emit-u32 types 0)  ; name_off = 0 (anonymous)
+    (btf-emit-u32 types (btf-info-field +btf-kind-ptr+ 0))
+    (btf-emit-u32 types target-type-id)
+    id))
+
+(defun btf-add-array (ctx elem-type-id index-type-id nelems)
+  "Add a BTF_KIND_ARRAY type. Returns the type ID."
+  (let* ((id (btf-alloc-id ctx))
+         (types (btf-ctx-types ctx)))
+    (btf-emit-u32 types 0)  ; name_off = 0
+    (btf-emit-u32 types (btf-info-field +btf-kind-array+ 0))
+    (btf-emit-u32 types 0)  ; size = 0
+    ;; Array data: type(4) index_type(4) nelems(4)
+    (btf-emit-u32 types elem-type-id)
+    (btf-emit-u32 types index-type-id)
+    (btf-emit-u32 types nelems)
+    id))
+
+(defun btf-add-var (ctx name type-id &optional (linkage 1))
+  "Add a BTF_KIND_VAR type. LINKAGE: 0=static, 1=global. Returns the type ID."
+  (let* ((id (btf-alloc-id ctx))
+         (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
+         (types (btf-ctx-types ctx)))
+    (btf-emit-u32 types name-off)
+    (btf-emit-u32 types (btf-info-field +btf-kind-var+ 0))
+    (btf-emit-u32 types type-id)
+    ;; Linkage
+    (btf-emit-u32 types linkage)
+    id))
+
+(defun btf-add-datasec (ctx name vars)
+  "Add a BTF_KIND_DATASEC type.
+   VARS is a list of (var-type-id offset size). Returns the type ID."
+  (let* ((id (btf-alloc-id ctx))
+         (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
+         (types (btf-ctx-types ctx)))
+    (btf-emit-u32 types name-off)
+    (btf-emit-u32 types (btf-info-field +btf-kind-datasec+ (length vars)))
+    (btf-emit-u32 types 0)  ; size = 0 (resolved by loader)
+    ;; Variable entries: type_id(4) offset(4) size(4)
+    (dolist (var vars)
+      (destructuring-bind (var-type-id offset size) var
+        (btf-emit-u32 types var-type-id)
+        (btf-emit-u32 types offset)
+        (btf-emit-u32 types size)))
+    id))
+
 ;;; Encoding
 
 (defun btf-encode (ctx)
@@ -188,9 +243,57 @@
 
 ;;; Top-level entry points
 
-(defun build-btf-ctx (struct-defs section-names)
-  "Build a BTF context with base types, struct defs, and function info.
+(defun btf-add-map-def (ctx map-name map-type key-size value-size max-entries map-flags)
+  "Add BTF types for a BTF-defined map.
+   Creates: struct type with type/key_size/value_size/max_entries fields,
+   and a VAR referencing it. Returns the VAR type ID."
+  (let* ((int-id (gethash "u32" (btf-ctx-type-cache ctx)))
+         ;; __uint(type, N) → int (*type)[N]  (ptr to array of N ints)
+         (type-arr-id (btf-add-array ctx int-id int-id map-type))
+         (type-ptr-id (btf-add-ptr ctx type-arr-id))
+         ;; key_size and value_size as __uint
+         (key-arr-id (btf-add-array ctx int-id int-id key-size))
+         (key-ptr-id (btf-add-ptr ctx key-arr-id))
+         (val-arr-id (btf-add-array ctx int-id int-id value-size))
+         (val-ptr-id (btf-add-ptr ctx val-arr-id))
+         (max-arr-id (btf-add-array ctx int-id int-id max-entries))
+         (max-ptr-id (btf-add-ptr ctx max-arr-id))
+         ;; Build the map struct: { type, key_size, value_size, max_entries [, map_flags] }
+         (fields (list (list "type" type-ptr-id 0)
+                       (list "key_size" key-ptr-id 64)
+                       (list "value_size" val-ptr-id 128)
+                       (list "max_entries" max-ptr-id 192))))
+    ;; Add map_flags field if non-zero
+    (when (and map-flags (> map-flags 0))
+      (let* ((flags-arr-id (btf-add-array ctx int-id int-id map-flags))
+             (flags-ptr-id (btf-add-ptr ctx flags-arr-id)))
+        (setf fields (append fields
+                             (list (list "map_flags" flags-ptr-id 256))))))
+    ;; Create the struct type
+    (let* ((struct-id (btf-alloc-id ctx))
+           (types (btf-ctx-types ctx))
+           (nfields (length fields))
+           (struct-size (* 8 nfields)))  ; 8 bytes per ptr field
+      ;; Type header
+      (btf-emit-u32 types 0)  ; anonymous struct
+      (btf-emit-u32 types (btf-info-field +btf-kind-struct+ nfields))
+      (btf-emit-u32 types struct-size)
+      ;; Members
+      (dolist (field fields)
+        (destructuring-bind (fname ftype-id fbits-offset) field
+          (let ((fname-off (btf-strtab-add (btf-ctx-strtab ctx) fname)))
+            (btf-emit-u32 types fname-off)
+            (btf-emit-u32 types ftype-id)
+            (btf-emit-u32 types fbits-offset))))
+      ;; Create VAR for the map
+      (let ((var-id (btf-add-var ctx (string-downcase (string map-name))
+                                 struct-id 1)))  ; linkage=global
+        (values var-id struct-size)))))
+
+(defun build-btf-ctx (struct-defs section-names &optional map-specs)
+  "Build a BTF context with base types, struct defs, map defs, and function info.
    SECTION-NAMES is a string or list of strings (one per program).
+   MAP-SPECS is a list of (name type key-size value-size max-entries flags).
    Returns (values ctx func-type-ids) where func-type-ids is a list of FUNC type IDs."
   (let ((ctx (make-btf-ctx))
         (names (if (listp section-names) section-names (list section-names))))
@@ -216,7 +319,18 @@
                         (ingress_ifindex u32 12 4)
                         (rx_queue_index u32 16 4))))
 
-    ;; 4. Add FUNC_PROTO (ret=u32, param ctx=u64) + FUNC for each program
+    ;; 4. Add BTF-defined map types + .maps DATASEC
+    (when map-specs
+      (let ((map-vars '()))
+        (loop for (name type key-size value-size max-entries flags) in map-specs
+              for offset from 0 by 32  ; 32 bytes per map entry in .maps
+              do (multiple-value-bind (var-id struct-size)
+                     (btf-add-map-def ctx name type key-size value-size
+                                      max-entries (or flags 0))
+                   (push (list var-id offset struct-size) map-vars)))
+        (btf-add-datasec ctx ".maps" (nreverse map-vars))))
+
+    ;; 5. Add FUNC_PROTO (ret=u32, param ctx=u64) + FUNC for each program
     (let* ((u32-id (gethash "u32" (btf-ctx-type-cache ctx)))
            (u64-id (gethash "u64" (btf-ctx-type-cache ctx)))
            (proto-id (btf-add-func-proto ctx u32-id (list (list "ctx" u64-id))))
@@ -364,19 +478,20 @@
             (replace out core-relo :start1 (+ +btf-ext-header-size+ core-relo-off)))
           out)))))
 
-(defun generate-btf-and-ext (struct-defs section-names per-section-core-relocs)
+(defun generate-btf-and-ext (struct-defs section-names per-section-core-relocs
+                             &optional map-specs)
   "Generate both .BTF and .BTF.ext section bytes for one or more programs.
    STRUCT-DEFS: hash table of name -> (total-size . fields).
    SECTION-NAMES: string or list of section name strings.
-   PER-SECTION-CORE-RELOCS: list of core-reloc lists (one per program),
-     or a single flat list (for backward compat with single-program callers).
+   PER-SECTION-CORE-RELOCS: list of core-reloc lists (one per program).
+   MAP-SPECS: list of (name type key-size value-size max-entries flags).
    Returns (values btf-bytes btf-ext-bytes)."
   (let ((names (if (listp section-names) section-names (list section-names)))
         (relocs-per-section (if (and (listp section-names)
                                      (listp per-section-core-relocs))
                                 per-section-core-relocs
                                 (list per-section-core-relocs))))
-    (multiple-value-bind (ctx func-ids) (build-btf-ctx struct-defs names)
+    (multiple-value-bind (ctx func-ids) (build-btf-ctx struct-defs names map-specs)
       ;; Encode BTF.ext BEFORE btf-encode, so access strings get into the
       ;; shared string table before it's serialized.
       (let ((btf-ext (btf-ext-encode ctx names func-ids
