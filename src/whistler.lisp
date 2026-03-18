@@ -44,23 +44,42 @@
           ((string= name "U64") 'u64)
           (t (error "Unknown struct field type: ~a" type)))))
 
+(defun parse-field-type (ftype)
+  "Parse a field type spec. Returns (values elem-type count is-array).
+   For scalar types like U32: (values U32 1 nil).
+   For array types like (ARRAY U8 16): (values U8 16 t)."
+  (if (and (consp ftype)
+           (string= (string (car ftype)) "ARRAY"))
+      (values (second ftype) (third ftype) t)
+      (values ftype 1 nil)))
+
 (defmacro defstruct (name &body fields)
   "Define a BPF struct with C-compatible layout.
    Generates:
    - (make-NAME) constructor macro
-   - (NAME-FIELD ptr) accessor macros for each field
-   - (setf (NAME-FIELD ptr) val) writer expanders for each field"
+   - (NAME-FIELD ptr) accessor macros for each scalar field
+   - (NAME-FIELD ptr idx) indexed accessor macros for each array field
+   - (setf ...) writer expanders for each field
+
+   Field syntax:
+     (field-name type)             — scalar field (u8, u16, u32, u64)
+     (field-name (array type n))   — array of n elements"
   (let ((field-list '())
         (offset 0)
         (max-align 1))
     (dolist (field-spec fields)
       (cl:destructuring-bind (fname ftype) field-spec
-        (let* ((size (struct-type-byte-size ftype))
-               (align size)
-               (aligned-off (logand (+ offset (1- align)) (- align))))
-          (push (list fname ftype aligned-off size) field-list)
-          (setf offset (+ aligned-off size))
-          (setf max-align (max max-align align)))))
+        (multiple-value-bind (elem-type count is-array) (parse-field-type ftype)
+          (let* ((elem-size (struct-type-byte-size elem-type))
+                 (align elem-size)
+                 (field-size (if is-array (* count elem-size) elem-size))
+                 (aligned-off (logand (+ offset (1- align)) (- align)))
+                 (stored-type (if is-array
+                                  (list :array elem-type count)
+                                  ftype)))
+            (push (list fname stored-type aligned-off field-size) field-list)
+            (setf offset (+ aligned-off field-size))
+            (setf max-align (max max-align align))))))
     (let* ((total (logand (+ offset (1- max-align)) (- max-align)))
            (fields-rev (nreverse field-list))
            (make-name (intern (format nil "MAKE-~a" (symbol-name name))
@@ -72,21 +91,67 @@
           (declare (ignore fsize))
           (let ((accessor-name (intern (format nil "~a-~a" (symbol-name name)
                                                (symbol-name fname))
-                                       (symbol-package name)))
-                (store-type (struct-type-to-store-type ftype)))
-            ;; Reader: (name-field ptr) → (core-load TYPE ptr OFFSET NAME FIELD)
-            (push `(cl:defmacro ,accessor-name (ptr)
-                     (list 'core-load ',store-type ptr ,foffset ',name ',fname))
-                  accessor-forms)
-            ;; Writer macro: (set-name-field! ptr val) for setf expansion
-            (let ((writer-name (intern (format nil "SET-~a-~a!" (symbol-name name)
-                                               (symbol-name fname))
                                        (symbol-package name))))
-              (push `(cl:defmacro ,writer-name (ptr val)
-                       (list 'core-store ',store-type ptr ,foffset val ',name ',fname))
-                    accessor-forms)
-              (push `(cl:defsetf ,accessor-name ,writer-name)
-                    accessor-forms)))))
+            (if (and (consp ftype) (eq (car ftype) :array))
+                ;; Array field: generate indexed accessor and writer
+                (let* ((elem-type (second ftype))
+                       (elem-size (struct-type-byte-size elem-type))
+                       (store-type (struct-type-to-store-type elem-type))
+                       (writer-name (intern (format nil "SET-~a-~a!" (symbol-name name)
+                                                    (symbol-name fname))
+                                            (symbol-package name))))
+                  ;; Reader: (name-field ptr idx)
+                  ;; Constant idx → fixed offset; runtime idx → computed offset
+                  (push `(cl:defmacro ,accessor-name (ptr idx)
+                           (if (integerp idx)
+                               (list 'load ',store-type ptr
+                                     (+ ,foffset (* idx ,elem-size)))
+                               (list 'load ',store-type
+                                     (list '+ ptr
+                                           ,(if (= elem-size 1)
+                                                `(list '+ ,foffset idx)
+                                                `(list '+ ,foffset
+                                                       (list '* idx ,elem-size))))
+                                     0)))
+                        accessor-forms)
+                  ;; Writer: (set-name-field! ptr idx val)
+                  (push `(cl:defmacro ,writer-name (ptr idx val)
+                           (if (integerp idx)
+                               (list 'store ',store-type ptr
+                                     (+ ,foffset (* idx ,elem-size)) val)
+                               (list 'store ',store-type
+                                     (list '+ ptr
+                                           ,(if (= elem-size 1)
+                                                `(list '+ ,foffset idx)
+                                                `(list '+ ,foffset
+                                                       (list '* idx ,elem-size))))
+                                     0 val)))
+                        accessor-forms)
+                  (push `(cl:defsetf ,accessor-name ,writer-name)
+                        accessor-forms)
+                  ;; Pointer accessor: (name-field-ptr ptr) → (+ ptr offset)
+                  ;; For passing array field addresses to helpers
+                  (let ((ptr-name (intern (format nil "~a-~a-PTR" (symbol-name name)
+                                                  (symbol-name fname))
+                                          (symbol-package name))))
+                    (push `(cl:defmacro ,ptr-name (ptr)
+                             (list '+ ptr ,foffset))
+                          accessor-forms)))
+                ;; Scalar field: existing behavior
+                (let ((store-type (struct-type-to-store-type ftype)))
+                  ;; Reader: (name-field ptr) → (core-load TYPE ptr OFFSET NAME FIELD)
+                  (push `(cl:defmacro ,accessor-name (ptr)
+                           (list 'core-load ',store-type ptr ,foffset ',name ',fname))
+                        accessor-forms)
+                  ;; Writer macro: (set-name-field! ptr val) for setf expansion
+                  (let ((writer-name (intern (format nil "SET-~a-~a!" (symbol-name name)
+                                                     (symbol-name fname))
+                                             (symbol-package name))))
+                    (push `(cl:defmacro ,writer-name (ptr val)
+                             (list 'core-store ',store-type ptr ,foffset val ',name ',fname))
+                          accessor-forms)
+                    (push `(cl:defsetf ,accessor-name ,writer-name)
+                          accessor-forms)))))))
       `(progn
          (setf (gethash ,(string name) *struct-defs*)
                (cons ,total ',fields-rev))
@@ -115,6 +180,102 @@
   (multiple-value-bind (ftype foffset) (lookup-struct-field struct-name field-name)
     `(core-load ,(struct-type-to-store-type ftype) ,var ,foffset
                 ,struct-name ,field-name)))
+
+;;; Struct introspection
+
+(defmacro sizeof (struct-name)
+  "Return the byte size of a struct defined with defstruct.
+   Expands to an integer constant at compile time."
+  (let ((def (gethash (string struct-name) *struct-defs*)))
+    (unless def (error "sizeof: unknown struct ~a" struct-name))
+    (car def)))
+
+;;; Memory operations
+
+(defun widen-byte-value (byte-val width)
+  "Replicate an 8-bit value across WIDTH bytes. WIDTH must be 1, 2, 4, or 8.
+   Returns a signed representation when it fits in s32, so the BPF emitter
+   can use mov (1 insn) instead of ld_imm64 (2 insns)."
+  (let* ((v (logand byte-val #xFF))
+         (unsigned (ecase width
+                     (1 v)
+                     (2 (logior v (ash v 8)))
+                     (4 (logior v (ash v 8) (ash v 16) (ash v 24)))
+                     (8 (logior v (ash v 8) (ash v 16) (ash v 24)
+                                (ash v 32) (ash v 40) (ash v 48) (ash v 56)))))
+         (bits (* width 8)))
+    ;; If the value has its sign bit set, convert to signed.
+    ;; This lets the emitter use mov r,-1 instead of ld_imm64 for 0xFF fill.
+    (if (logbitp (1- bits) unsigned)
+        (let ((signed (- unsigned (ash 1 bits))))
+          (if (<= -2147483648 signed 2147483647)
+              signed
+              unsigned))
+        unsigned)))
+
+(defmacro memset (ptr offset value nbytes)
+  "Fill NBYTES bytes at PTR+OFFSET with VALUE (a byte).
+   OFFSET and NBYTES must be compile-time constants.
+   When VALUE is a compile-time integer, uses widened stores for efficiency."
+  (check-type offset integer)
+  (check-type nbytes (integer 0))
+  (let ((forms '())
+        (pos offset)
+        (end (+ offset nbytes)))
+    (if (integerp value)
+        ;; Compile-time constant: widen and use the largest stores possible
+        (let ((v64 (widen-byte-value value 8))
+              (v32 (widen-byte-value value 4))
+              (v16 (widen-byte-value value 2))
+              (v8  (widen-byte-value value 1)))
+          (loop while (<= (+ pos 8) end)
+                do (push `(store u64 ,ptr ,pos ,v64) forms)
+                   (cl:incf pos 8))
+          (loop while (<= (+ pos 4) end)
+                do (push `(store u32 ,ptr ,pos ,v32) forms)
+                   (cl:incf pos 4))
+          (loop while (<= (+ pos 2) end)
+                do (push `(store u16 ,ptr ,pos ,v16) forms)
+                   (cl:incf pos 2))
+          (loop while (< pos end)
+                do (push `(store u8 ,ptr ,pos ,v8) forms)
+                   (cl:incf pos 1)))
+        ;; Runtime value: use u8 stores
+        (loop while (< pos end)
+              do (push `(store u8 ,ptr ,pos ,value) forms)
+                 (cl:incf pos 1)))
+    `(progn ,@(nreverse forms))))
+
+(defmacro memcpy (dst dst-offset src src-offset nbytes)
+  "Copy NBYTES bytes from SRC+SRC-OFFSET to DST+DST-OFFSET.
+   All offsets and NBYTES must be compile-time constants.
+   Uses the widest possible loads/stores for efficiency."
+  (check-type dst-offset integer)
+  (check-type src-offset integer)
+  (check-type nbytes (integer 0))
+  (let ((forms '())
+        (pos 0))
+    (loop while (<= (+ pos 8) nbytes)
+          do (push `(store u64 ,dst ,(+ dst-offset pos)
+                          (load u64 ,src ,(+ src-offset pos)))
+                   forms)
+             (cl:incf pos 8))
+    (loop while (<= (+ pos 4) nbytes)
+          do (push `(store u32 ,dst ,(+ dst-offset pos)
+                          (load u32 ,src ,(+ src-offset pos)))
+                   forms)
+             (cl:incf pos 4))
+    (loop while (<= (+ pos 2) nbytes)
+          do (push `(store u16 ,dst ,(+ dst-offset pos)
+                          (load u16 ,src ,(+ src-offset pos)))
+                   forms)
+             (cl:incf pos 2))
+    (loop while (< pos nbytes)
+          do (push `(store u8 ,dst ,(+ dst-offset pos)
+                          (load u8 ,src ,(+ src-offset pos)))
+                   forms)
+             (cl:incf pos 1))
+    `(progn ,@(nreverse forms))))
 
 ;;; User-facing macros for defining maps and programs
 

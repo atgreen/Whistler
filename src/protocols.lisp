@@ -14,6 +14,19 @@
 ;;; BPF-shaped details behind Lisp-idiomatic forms. They all expand
 ;;; to primitive Whistler forms at compile time — zero runtime cost.
 
+;;; ---- pt_regs access (x86-64) ----
+;;;
+;;; These match the C macros PT_REGS_PARM1() etc. from bpf_tracing.h.
+;;; x86-64 System V ABI: rdi, rsi, rdx, rcx, r8, r9
+
+(defmacro pt-regs-parm1 () "First function arg (rdi)."  '(ctx-load u64 112))
+(defmacro pt-regs-parm2 () "Second function arg (rsi)." '(ctx-load u64 104))
+(defmacro pt-regs-parm3 () "Third function arg (rdx)."  '(ctx-load u64 96))
+(defmacro pt-regs-parm4 () "Fourth function arg (rcx)." '(ctx-load u64 88))
+(defmacro pt-regs-parm5 () "Fifth function arg (r8)."   '(ctx-load u64 72))
+(defmacro pt-regs-parm6 () "Sixth function arg (r9)."   '(ctx-load u64 64))
+(defmacro pt-regs-ret ()   "Return value (rax)."        '(ctx-load u64 80))
+
 ;;; ---- Control flow ----
 
 (defmacro when-let (bindings &body body)

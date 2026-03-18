@@ -144,7 +144,13 @@
                  (dolist (field fields)
                    (cl:destructuring-bind (fname ftype foffset fsize) field
                      (declare (ignore foffset fsize))
-                     (format out "    ~a ~a;~%" (c-type-for ftype) (lisp-to-c-ident fname))))
+                     (if (and (consp ftype) (eq (car ftype) :array))
+                         (format out "    ~a ~a[~d];~%"
+                                 (c-type-for (second ftype))
+                                 (lisp-to-c-ident fname)
+                                 (third ftype))
+                         (format out "    ~a ~a;~%"
+                                 (c-type-for ftype) (lisp-to-c-ident fname)))))
                  (format out "};~%~%")))
              *struct-defs*)
 
@@ -172,7 +178,13 @@
                  (dolist (field fields)
                    (cl:destructuring-bind (fname ftype foffset fsize) field
                      (declare (ignore foffset fsize))
-                     (format out "~a~a ~a~%" #\Tab (lisp-to-pascal fname) (go-type-for ftype))))
+                     (if (and (consp ftype) (eq (car ftype) :array))
+                         (format out "~a~a [~d]~a~%" #\Tab
+                                 (lisp-to-pascal fname)
+                                 (third ftype)
+                                 (go-type-for (second ftype)))
+                         (format out "~a~a ~a~%" #\Tab
+                                 (lisp-to-pascal fname) (go-type-for ftype)))))
                  (format out "}~%~%")))
              *struct-defs*)
 
@@ -200,8 +212,13 @@
                  (dolist (field fields)
                    (cl:destructuring-bind (fname ftype foffset fsize) field
                      (declare (ignore foffset fsize))
-                     (format out "    pub ~a: ~a,~%"
-                             (lisp-to-c-ident fname) (rust-type-for ftype))))
+                     (if (and (consp ftype) (eq (car ftype) :array))
+                         (format out "    pub ~a: [~a; ~d],~%"
+                                 (lisp-to-c-ident fname)
+                                 (rust-type-for (second ftype))
+                                 (third ftype))
+                         (format out "    pub ~a: ~a,~%"
+                                 (lisp-to-c-ident fname) (rust-type-for ftype)))))
                  (format out "}~%~%")
                  ;; Pod safety
                  (format out "unsafe impl aya::Pod for ~a {}~%~%"
@@ -256,8 +273,13 @@
          (dolist (field fields)
            (cl:destructuring-bind (fname ftype foffset fsize) field
              (declare (ignore foffset fsize))
-             (format out "  (~a 0 :type ~a)~%"
-                     (lisp-to-c-ident fname) (cl-type-for ftype))))
+             (if (and (consp ftype) (eq (car ftype) :array))
+                 (format out "  (~a (make-array ~d :element-type '~a :initial-element 0) :type (simple-array ~a (~d)))~%"
+                         (lisp-to-c-ident fname) (third ftype)
+                         (cl-type-for (second ftype))
+                         (cl-type-for (second ftype)) (third ftype))
+                 (format out "  (~a 0 :type ~a)~%"
+                         (lisp-to-c-ident fname) (cl-type-for ftype)))))
          (format out ")~%~%")
 
          ;; read-from-bytes
@@ -267,15 +289,30 @@
          (dolist (field fields)
            (cl:destructuring-bind (fname ftype foffset fsize) field
              (declare (ignore fsize))
-             (let ((bsize (cl-byte-size ftype))
-                   (fn (lisp-to-c-ident fname)))
-               (format out "   :~a (logior~%" fn)
-               (dotimes (i bsize)
-                 (if (= i (1- bsize))
-                     (format out "          (ash (aref buf (+ offset ~d)) ~d))~%"
-                             (+ foffset i) (* i 8))
-                     (format out "          (ash (aref buf (+ offset ~d)) ~d)~%"
-                             (+ foffset i) (* i 8)))))))
+             (let ((fn (lisp-to-c-ident fname)))
+               (if (and (consp ftype) (eq (car ftype) :array))
+                   ;; Array field: read element by element
+                   (let ((elem-type (second ftype))
+                         (count (third ftype)))
+                     (let ((bsize (cl-byte-size elem-type)))
+                       (format out "   :~a (let ((arr (make-array ~d :element-type '~a)))~%"
+                               fn count (cl-type-for elem-type))
+                       (dotimes (i count)
+                         (format out "           (setf (aref arr ~d) (logior" i)
+                         (dotimes (j bsize)
+                           (format out " (ash (aref buf (+ offset ~d)) ~d)"
+                                   (+ foffset (* i bsize) j) (* j 8)))
+                         (format out "))~%"))
+                       (format out "           arr)~%")))
+                   ;; Scalar field
+                   (let ((bsize (cl-byte-size ftype)))
+                     (format out "   :~a (logior~%" fn)
+                     (dotimes (i bsize)
+                       (if (= i (1- bsize))
+                           (format out "          (ash (aref buf (+ offset ~d)) ~d))~%"
+                                   (+ foffset i) (* i 8))
+                           (format out "          (ash (aref buf (+ offset ~d)) ~d)~%"
+                                   (+ foffset i) (* i 8)))))))))
          (format out "  ))~%~%")
 
          ;; write-to-bytes
@@ -285,14 +322,27 @@
          (dolist (field fields)
            (cl:destructuring-bind (fname ftype foffset fsize) field
              (declare (ignore fsize))
-             (let ((bsize (cl-byte-size ftype))
-                   (fn (lisp-to-c-ident fname))
-                   (accessor (format nil "~a-~a" cl-name (lisp-to-c-ident fname))))
-               (format out "  (let ((v (~a obj)))~%" accessor)
-               (dotimes (i bsize)
-                 (format out "    (setf (aref buf (+ offset ~d)) (logand (ash v ~d) #xff))~%"
-                         (+ foffset i) (- (* i 8))))
-               (format out "  )~%"))))
+             (let ((accessor (format nil "~a-~a" cl-name (lisp-to-c-ident fname))))
+               (if (and (consp ftype) (eq (car ftype) :array))
+                   ;; Array field: write element by element
+                   (let ((elem-type (second ftype))
+                         (count (third ftype)))
+                     (let ((bsize (cl-byte-size elem-type)))
+                       (format out "  (let ((arr (~a obj)))~%" accessor)
+                       (dotimes (i count)
+                         (format out "    (let ((v (aref arr ~d)))~%" i)
+                         (dotimes (j bsize)
+                           (format out "      (setf (aref buf (+ offset ~d)) (logand (ash v ~d) #xff))~%"
+                                   (+ foffset (* i bsize) j) (- (* j 8))))
+                         (format out "    )~%"))
+                       (format out "  )~%")))
+                   ;; Scalar field
+                   (let ((bsize (cl-byte-size ftype)))
+                     (format out "  (let ((v (~a obj)))~%" accessor)
+                     (dotimes (i bsize)
+                       (format out "    (setf (aref buf (+ offset ~d)) (logand (ash v ~d) #xff))~%"
+                               (+ foffset i) (- (* i 8))))
+                     (format out "  )~%"))))))
          (format out "  buf)~%~%")))
      *struct-defs*)
 
@@ -336,10 +386,16 @@
                  for i from 0
                  do (cl:destructuring-bind (fname ftype foffset fsize) field
                       (declare (ignore foffset fsize))
-                      (format out "        (~s, ~a)~a~%"
-                              (lisp-to-c-ident fname)
-                              (python-type-for ftype)
-                              (if (< i (1- (length field-list))) "," "")))))
+                      (if (and (consp ftype) (eq (car ftype) :array))
+                          (format out "        (~s, ~a * ~d)~a~%"
+                                  (lisp-to-c-ident fname)
+                                  (python-type-for (second ftype))
+                                  (third ftype)
+                                  (if (< i (1- (length field-list))) "," ""))
+                          (format out "        (~s, ~a)~a~%"
+                                  (lisp-to-c-ident fname)
+                                  (python-type-for ftype)
+                                  (if (< i (1- (length field-list))) "," ""))))))
          (format out "    ]~%~%")
          (format out "    def __repr__(self):~%")
          (format out "        fields = {f[0]: getattr(self, f[0]) for f in self._fields_}~%")

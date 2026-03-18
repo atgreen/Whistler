@@ -90,9 +90,34 @@
     (setf (gethash name (btf-ctx-type-cache ctx)) id)
     id))
 
+(defun btf-resolve-field-type (ctx ftype fname)
+  "Resolve a field type to a BTF type ID. Handles both scalar types
+   and (:array elem-type count) array types."
+  (if (and (consp ftype) (eq (car ftype) :array))
+      ;; Array field: create BTF array type on demand
+      (let* ((elem-type (second ftype))
+             (count (third ftype))
+             (cache-key (format nil "~a[~d]" (string-downcase (string elem-type)) count))
+             (cached (gethash cache-key (btf-ctx-type-cache ctx))))
+        (or cached
+            (let* ((elem-type-id (or (gethash (string-downcase (string elem-type))
+                                              (btf-ctx-type-cache ctx))
+                                     (error "Unknown BTF type for array element ~a in field ~a"
+                                            elem-type fname)))
+                   (index-type-id (or (gethash "u32" (btf-ctx-type-cache ctx))
+                                      (error "BTF u32 type not found for array index")))
+                   (arr-id (btf-add-array ctx elem-type-id index-type-id count)))
+              (setf (gethash cache-key (btf-ctx-type-cache ctx)) arr-id)
+              arr-id)))
+      ;; Scalar field
+      (let ((type-name (string-downcase (string ftype))))
+        (or (gethash type-name (btf-ctx-type-cache ctx))
+            (error "Unknown BTF type for field ~a: ~a" fname ftype)))))
+
 (defun btf-add-struct (ctx name fields)
   "Add a BTF_KIND_STRUCT type.
    FIELDS is a list of (field-name type offset size) as from *struct-defs*.
+   Type may be a symbol (scalar) or (:array elem-type count).
    Returns the type ID."
   (let* ((id (btf-alloc-id ctx))
          (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
@@ -109,9 +134,7 @@
         (declare (ignore fsize))
         (let* ((fname-off (btf-strtab-add (btf-ctx-strtab ctx)
                                           (string-downcase (string fname))))
-               (type-name (string-downcase (string ftype)))
-               (type-id (or (gethash type-name (btf-ctx-type-cache ctx))
-                            (error "Unknown BTF type for field ~a: ~a" fname ftype))))
+               (type-id (btf-resolve-field-type ctx ftype fname)))
           (btf-emit-u32 types fname-off)
           (btf-emit-u32 types type-id)
           ;; Offset in bits
