@@ -135,10 +135,8 @@
     (let ((path "/tmp/whistler-test.bpf.o"))
       (let ((insn-bytes (whistler/bpf:insn-bytes (cu-insns cu))))
         (whistler/elf:write-bpf-elf path
-                                    :prog-section-name "xdp"
-                                    :prog-bytes insn-bytes
+                                    :prog-sections (list (list "xdp" insn-bytes nil nil))
                                     :maps nil
-                                    :relocations nil
                                     :license "GPL"))
       ;; Check file exists and has ELF magic
       (with-open-file (in path :element-type '(unsigned-byte 8))
@@ -166,10 +164,8 @@
                                            (bpf-map-max-entries m))))
             (relocs (reverse (cu-map-relocs cu))))
         (whistler/elf:write-bpf-elf path
-                                    :prog-section-name "xdp"
-                                    :prog-bytes insn-bytes
+                                    :prog-sections (list (list "xdp" insn-bytes relocs nil))
                                     :maps map-specs
-                                    :relocations relocs
                                     :license "GPL"))
       ;; Verify with readelf if available
       (let ((output (with-output-to-string (s)
