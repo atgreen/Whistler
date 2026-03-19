@@ -119,28 +119,35 @@
    FIELDS is a list of (field-name type offset size) as from *struct-defs*.
    Type may be a symbol (scalar) or (:array elem-type count).
    Returns the type ID."
-  (let* ((id (btf-alloc-id ctx))
-         (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
-         (types (btf-ctx-types ctx))
-         (total-size (loop for (nil nil off sz) in fields
-                           maximize (+ off sz))))
-    ;; Type header
-    (btf-emit-u32 types name-off)
-    (btf-emit-u32 types (btf-info-field +btf-kind-struct+ (length fields)))
-    (btf-emit-u32 types total-size)
-    ;; Member entries: name_off(4), type(4), offset(4) = 12 bytes each
-    (dolist (field fields)
-      (destructuring-bind (fname ftype foffset fsize) field
-        (declare (ignore fsize))
-        (let* ((fname-off (btf-strtab-add (btf-ctx-strtab ctx)
-                                          (string-downcase (string fname))))
-               (type-id (btf-resolve-field-type ctx ftype fname)))
-          (btf-emit-u32 types fname-off)
-          (btf-emit-u32 types type-id)
-          ;; Offset in bits
-          (btf-emit-u32 types (* foffset 8)))))
-    (setf (gethash name (btf-ctx-type-cache ctx)) id)
-    id))
+  ;; Resolve all field types FIRST — array fields append BTF_KIND_ARRAY
+  ;; records to the types vector, so this must complete before we start
+  ;; emitting the contiguous struct type + member entries.
+  (let ((resolved (mapcar (lambda (field)
+                            (destructuring-bind (fname ftype foffset fsize) field
+                              (list fname ftype foffset fsize
+                                    (btf-resolve-field-type ctx ftype fname))))
+                          fields)))
+    (let* ((id (btf-alloc-id ctx))
+           (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
+           (types (btf-ctx-types ctx))
+           (total-size (loop for (nil nil off sz) in fields
+                             maximize (+ off sz))))
+      ;; Type header
+      (btf-emit-u32 types name-off)
+      (btf-emit-u32 types (btf-info-field +btf-kind-struct+ (length fields)))
+      (btf-emit-u32 types total-size)
+      ;; Member entries: name_off(4), type(4), offset(4) = 12 bytes each
+      (dolist (field resolved)
+        (destructuring-bind (fname ftype foffset fsize type-id) field
+          (declare (ignore ftype fsize))
+          (let ((fname-off (btf-strtab-add (btf-ctx-strtab ctx)
+                                           (string-downcase (string fname)))))
+            (btf-emit-u32 types fname-off)
+            (btf-emit-u32 types type-id)
+            ;; Offset in bits
+            (btf-emit-u32 types (* foffset 8)))))
+      (setf (gethash name (btf-ctx-type-cache ctx)) id)
+      id)))
 
 (defun btf-add-func-proto (ctx ret-type-id params)
   "Add a BTF_KIND_FUNC_PROTO type.
