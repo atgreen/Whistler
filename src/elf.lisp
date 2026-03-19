@@ -24,6 +24,7 @@
 (defconstant +shf-alloc+    #x2)
 (defconstant +shf-execinstr+ #x4)
 (defconstant +stt-notype+   0)
+(defconstant +stt-object+   1)
 (defconstant +stt-section+  3)
 (defconstant +stt-func+     18)   ; STT_FUNC = 2, but encoded in st_info
 (defconstant +stb-local+    0)
@@ -290,8 +291,8 @@
                   for name-off = (strtab-add strtab
                                   (substitute #\_ #\- (string-downcase (string name))))
                   do (push (encode-sym name-off
-                                       (st-info +stb-global+ +stt-notype+) 0
-                                       maps-sec-idx (* i 32) 0)
+                                       (st-info +stb-global+ +stt-object+) 0
+                                       maps-sec-idx (* i 32) 32)
                            syms)))
 
           ;; Program function symbols (global, one per program)
