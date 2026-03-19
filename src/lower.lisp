@@ -216,6 +216,17 @@
          (ctx-emit ctx :ret nil (list val))
          nil))
 
+      ;; CL ash: (ash value count) — left shift if count > 0, right if < 0
+      ((sym= head 'ash)
+       (let ((count (second args)))
+         (unless (integerp count)
+           (error "ash requires a constant shift count in BPF, got: ~a" count))
+         (cond
+           ((>= count 0)
+            (lower-alu ctx '<< (list (first args) count)))
+           (t
+            (lower-alu ctx '>> (list (first args) (- count)))))))
+
       ((ir-alu-op head)
        (lower-alu ctx head args))
 
