@@ -299,8 +299,9 @@
           (dolist (prog-entry prog-sections)
             (let* ((sec-name (first prog-entry))
                    (prog-bytes (second prog-entry))
+                   (prog-name (or (fifth prog-entry) sec-name))
                    (sec-idx (cdr (assoc sec-name prog-sec-indices :test #'string=)))
-                   (func-name-off (strtab-add strtab sec-name)))
+                   (func-name-off (strtab-add strtab prog-name)))
               (push (encode-sym func-name-off
                                 (st-info +stb-global+ 2) 0  ; STT_FUNC=2
                                 sec-idx 0 (length prog-bytes))

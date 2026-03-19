@@ -319,8 +319,11 @@
     (let ((compiled-units
            (mapcar (lambda (prog-spec)
                      (destructuring-bind (name &key section license body) prog-spec
-                       (declare (ignore name))
-                       (compile-program section license maps body)))
+                       (let ((cu (compile-program section license maps body)))
+                         (setf (cu-name cu)
+                               (substitute #\_ #\-
+                                           (string-downcase (symbol-name name))))
+                         cu)))
                    progs)))
       ;; Verify all programs declare the same license
       (let ((licenses (mapcar #'cu-license compiled-units)))
@@ -343,13 +346,16 @@
                         (list (cu-section cu)
                               (insn-bytes (cu-insns cu))
                               (reverse (cu-map-relocs cu))
-                              (cu-core-relocs cu)))
+                              (cu-core-relocs cu)
+                              (cu-name cu)))
                       compiled-units))
              (section-names (mapcar #'first prog-sections))
+             (prog-names (mapcar #'fifth prog-sections))
              (all-core-relocs (mapcar #'fourth prog-sections)))
         ;; Generate BTF and BTF.ext for all programs
         (multiple-value-bind (btf btf-ext)
-            (generate-btf-and-ext *struct-defs* section-names all-core-relocs map-specs)
+            (generate-btf-and-ext *struct-defs* section-names all-core-relocs
+                                  map-specs :prog-names prog-names)
           (write-bpf-elf output-path
                          :prog-sections prog-sections
                          :maps map-specs

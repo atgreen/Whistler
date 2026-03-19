@@ -71,7 +71,7 @@
 (defpackage #:whistler/compiler
   (:use #:cl #:whistler/bpf)
   (:export #:make-compilation-unit #:cu-insns #:cu-maps
-           #:cu-section #:cu-license #:cu-map-relocs #:cu-core-relocs
+           #:cu-section #:cu-name #:cu-license #:cu-map-relocs #:cu-core-relocs
            #:whistler-macroexpand #:constant-fold-sexpr #:resolve-map-type
            #:bpf-map #:bpf-map-name #:bpf-map-type #:bpf-map-key-size
            #:bpf-map-value-size #:bpf-map-max-entries #:bpf-map-flags #:bpf-map-index

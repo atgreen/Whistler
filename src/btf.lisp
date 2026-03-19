@@ -321,10 +321,11 @@
                                  struct-id 1)))  ; linkage=global
         (values var-id struct-size)))))
 
-(defun build-btf-ctx (struct-defs section-names &optional map-specs)
+(defun build-btf-ctx (struct-defs section-names &optional map-specs prog-names)
   "Build a BTF context with base types, struct defs, map defs, and function info.
    SECTION-NAMES is a string or list of strings (one per program).
    MAP-SPECS is a list of (name type key-size value-size max-entries flags).
+   PROG-NAMES is a list of defprog name strings (used for BTF FUNC names).
    Returns (values ctx func-type-ids) where func-type-ids is a list of FUNC type IDs."
   (let ((ctx (make-btf-ctx))
         (names (if (listp section-names) section-names (list section-names))))
@@ -365,14 +366,18 @@
     (let* ((u32-id (gethash "u32" (btf-ctx-type-cache ctx)))
            (u64-id (gethash "u64" (btf-ctx-type-cache ctx)))
            (proto-id (btf-add-func-proto ctx u32-id (list (list "ctx" u64-id))))
-           (func-ids (mapcar (lambda (name)
-                               ;; BTF FUNC names must be valid C identifiers.
-                               ;; Section names like "tracepoint/sock/foo"
-                               ;; need sanitizing — use last component.
-                               (let ((func-name (let ((pos (position #\/ name :from-end t)))
-                                                  (if pos (subseq name (1+ pos)) name))))
+           (func-ids (mapcar (lambda (sec-name prog-name)
+                               ;; Use defprog name when available; fall back to
+                               ;; sanitized section name for backward compat.
+                               (let ((func-name (or prog-name
+                                                    (let ((pos (position #\/ sec-name
+                                                                         :from-end t)))
+                                                      (if pos (subseq sec-name (1+ pos))
+                                                          sec-name)))))
                                  (btf-add-func ctx func-name proto-id)))
-                             names)))
+                             names
+                             (or prog-names
+                                 (make-list (length names) :initial-element nil)))))
       (values ctx func-ids))))
 
 (defun generate-btf (struct-defs section-names)
@@ -539,19 +544,21 @@
           out))))))
 
 (defun generate-btf-and-ext (struct-defs section-names per-section-core-relocs
-                             &optional map-specs)
+                             &optional map-specs &key prog-names)
   "Generate both .BTF and .BTF.ext section bytes for one or more programs.
    STRUCT-DEFS: hash table of name -> (total-size . fields).
    SECTION-NAMES: string or list of section name strings.
    PER-SECTION-CORE-RELOCS: list of core-reloc lists (one per program).
    MAP-SPECS: list of (name type key-size value-size max-entries flags).
+   PROG-NAMES: list of defprog name strings (used for BTF FUNC names).
    Returns (values btf-bytes btf-ext-bytes)."
   (let ((names (if (listp section-names) section-names (list section-names)))
         (relocs-per-section (if (and (listp section-names)
                                      (listp per-section-core-relocs))
                                 per-section-core-relocs
                                 (list per-section-core-relocs))))
-    (multiple-value-bind (ctx func-ids) (build-btf-ctx struct-defs names map-specs)
+    (multiple-value-bind (ctx func-ids)
+        (build-btf-ctx struct-defs names map-specs prog-names)
       ;; Encode BTF.ext BEFORE btf-encode, so access strings get into the
       ;; shared string table before it's serialized.
       (let ((btf-ext (btf-ext-encode ctx names func-ids

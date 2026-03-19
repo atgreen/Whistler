@@ -83,6 +83,7 @@
   (map-relocs '())      ; list of (insn-index map-index) for relocation
   (core-relocs '())     ; list of (byte-offset struct-name field-name) for CO-RE
   (section "xdp")       ; ELF section name
+  (name nil)            ; defprog name (symbol or string) for FUNC symbol
   (license "GPL"))      ; license string
 
 ;;; Shared utility functions
