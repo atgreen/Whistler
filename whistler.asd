@@ -1,6 +1,6 @@
 (defsystem "whistler"
   :description "A Lisp that compiles to eBPF"
-  :version "0.5.1"
+  :version "0.5.2"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ("version-string")
