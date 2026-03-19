@@ -137,18 +137,18 @@
                     (push `(cl:defmacro ,ptr-name (ptr)
                              (list '+ ptr ,foffset))
                           accessor-forms)))
-                ;; Scalar field: existing behavior
+                ;; Scalar field: direct load/store with fixed offsets
                 (let ((store-type (struct-type-to-store-type ftype)))
-                  ;; Reader: (name-field ptr) → (core-load TYPE ptr OFFSET NAME FIELD)
+                  ;; Reader: (name-field ptr) → (load TYPE ptr OFFSET)
                   (push `(cl:defmacro ,accessor-name (ptr)
-                           (list 'core-load ',store-type ptr ,foffset ',name ',fname))
+                           (list 'load ',store-type ptr ,foffset))
                         accessor-forms)
                   ;; Writer macro: (set-name-field! ptr val) for setf expansion
                   (let ((writer-name (intern (format nil "SET-~a-~a!" (symbol-name name)
                                                      (symbol-name fname))
                                              (symbol-package name))))
                     (push `(cl:defmacro ,writer-name (ptr val)
-                             (list 'core-store ',store-type ptr ,foffset val ',name ',fname))
+                             (list 'store ',store-type ptr ,foffset val))
                           accessor-forms)
                     (push `(cl:defsetf ,accessor-name ,writer-name)
                           accessor-forms)))))))
@@ -170,16 +170,14 @@
       (values (second field) (third field) (fourth field)))))
 
 (defmacro struct-set (struct-name var field-name value)
-  "Set a field in a struct. Expands to (core-store TYPE ptr OFFSET val STRUCT FIELD)."
+  "Set a field in a struct. Expands to (store TYPE ptr OFFSET val)."
   (multiple-value-bind (ftype foffset) (lookup-struct-field struct-name field-name)
-    `(core-store ,(struct-type-to-store-type ftype) ,var ,foffset ,value
-                 ,struct-name ,field-name)))
+    `(store ,(struct-type-to-store-type ftype) ,var ,foffset ,value)))
 
 (defmacro struct-ref (struct-name var field-name)
-  "Read a field from a struct. Expands to (core-load TYPE ptr OFFSET STRUCT FIELD)."
+  "Read a field from a struct. Expands to (load TYPE ptr OFFSET)."
   (multiple-value-bind (ftype foffset) (lookup-struct-field struct-name field-name)
-    `(core-load ,(struct-type-to-store-type ftype) ,var ,foffset
-                ,struct-name ,field-name)))
+    `(load ,(struct-type-to-store-type ftype) ,var ,foffset)))
 
 ;;; Struct introspection
 
