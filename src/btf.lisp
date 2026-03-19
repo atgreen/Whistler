@@ -141,7 +141,8 @@
         (destructuring-bind (fname ftype foffset fsize type-id) field
           (declare (ignore ftype fsize))
           (let ((fname-off (btf-strtab-add (btf-ctx-strtab ctx)
-                                           (string-downcase (string fname)))))
+                                           (substitute #\_ #\-
+                                                       (string-downcase (string fname))))))
             (btf-emit-u32 types fname-off)
             (btf-emit-u32 types type-id)
             ;; Offset in bits
