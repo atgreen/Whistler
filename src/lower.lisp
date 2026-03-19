@@ -648,8 +648,9 @@
 (defun lower-atomic-add (ctx args)
   (let ((ptr (lower-expr ctx (first args)))
         (off (or (second args) 0))
-        (val (lower-expr ctx (third args))))
-    (ctx-emit ctx :atomic-add nil (list ptr `(:imm ,off) val))
+        (val (lower-expr ctx (third args)))
+        (type-kw (or (fourth args) 'u64)))
+    (ctx-emit ctx :atomic-add nil (list ptr `(:imm ,off) val `(:type ,type-kw)))
     nil))
 
 ;;; ========== Map operations ==========

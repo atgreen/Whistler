@@ -718,14 +718,16 @@
          (struct-base (and (integerp ptr-vreg)
                            (gethash ptr-vreg (emit-ctx-struct-offsets ctx))))
          (off (imm-arg-value (second args)))
-         (val-reg (vreg-to-physical ctx (third args) whistler/bpf:+bpf-reg-2+)))
+         (val-reg (vreg-to-physical ctx (third args) whistler/bpf:+bpf-reg-2+))
+         (type-kw (if (fourth args) (type-arg-name (fourth args)) 'u64))
+         (bpf-size (ir-type-to-bpf-size type-kw)))
     (if struct-base
         (ectx-emit ctx (whistler/bpf:emit-stx-atomic
-                         whistler/bpf:+bpf-dw+ whistler/bpf:+bpf-reg-10+
+                         bpf-size whistler/bpf:+bpf-reg-10+
                          val-reg (+ struct-base off) whistler/bpf:+bpf-add+))
         (let ((ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-1+)))
           (ectx-emit ctx (whistler/bpf:emit-stx-atomic
-                           whistler/bpf:+bpf-dw+ ptr-reg
+                           bpf-size ptr-reg
                            val-reg off whistler/bpf:+bpf-add+))))))
 
 ;;; ========== Stack-addr emission ==========

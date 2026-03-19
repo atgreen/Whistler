@@ -324,6 +324,12 @@
                        (declare (ignore name))
                        (compile-program section license maps body)))
                    progs)))
+      ;; Verify all programs declare the same license
+      (let ((licenses (mapcar #'cu-license compiled-units)))
+        (unless (every (lambda (l) (string= l (first licenses))) (rest licenses))
+          (error "Conflicting licenses across programs: ~{~S~^, ~}. ~
+                  All programs in a single ELF must share the same license."
+                 licenses)))
       ;; Maps are shared — take from first CU (all have the same map list)
       (let* ((first-cu (first compiled-units))
              (map-specs (loop for m in (cu-maps first-cu)

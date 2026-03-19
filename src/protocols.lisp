@@ -100,55 +100,76 @@
 
 ;;; ---- Map operations ----
 
+(defun map-spec-for (map-name)
+  "Look up the map spec for MAP-NAME in the current compilation."
+  (find (symbol-name map-name) *maps*
+        :key (lambda (s) (symbol-name (first s)))
+        :test #'string=))
+
 (defun array-map-p (map-name)
   "Check if MAP-NAME refers to an array-type map in the current compilation."
-  (let ((spec (find (symbol-name map-name) *maps*
-                    :key (lambda (s) (symbol-name (first s)))
-                    :test #'string=)))
+  (let ((spec (map-spec-for map-name)))
     (and spec
          (member (getf (rest spec) :type) '(:array :percpu-array)))))
+
+(defun map-value-type (map-name)
+  "Return the appropriate type symbol (u8, u16, u32, u64) for the map's value-size.
+   Defaults to u64 if the map is not found."
+  (let ((spec (map-spec-for map-name)))
+    (if spec
+        (let ((vs (getf (rest spec) :value-size)))
+          (cl:case vs
+            (1 'u8)
+            (2 'u16)
+            (4 'u32)
+            (t 'u64)))
+        'u64)))
 
 (defmacro incf-map (map key-form &optional (delta 1))
   "Atomically increment a map value. For array maps where the key always exists,
    this is just a lookup + atomic-add. For hash maps, initializes to DELTA if
    the key is new."
-  (if (array-map-p map)
-      ;; Array maps: entries are pre-allocated, lookup always succeeds
-      (let ((k (gensym "K"))
-            (p (gensym "P")))
-        `(let ((,k u32 ,key-form))
-           (when-let ((,p u64 (map-lookup ,map ,k)))
-             (atomic-add ,p 0 ,delta))))
-      ;; Hash maps: create entry if not found
-      (let ((k (gensym "K"))
-            (p (gensym "P"))
-            (init (gensym "INIT")))
-        `(let ((,k u32 ,key-form)
-               (,p u64 (map-lookup ,map ,k)))
-           (if ,p
-               (atomic-add ,p 0 ,delta)
-               (let ((,init u64 ,delta))
-                 (map-update ,map ,k ,init 0)))))))
+  (let ((vtype (map-value-type map)))
+    (if (array-map-p map)
+        ;; Array maps: entries are pre-allocated, lookup always succeeds
+        (let ((k (gensym "K"))
+              (p (gensym "P")))
+          `(let ((,k u32 ,key-form))
+             (when-let ((,p u64 (map-lookup ,map ,k)))
+               (atomic-add ,p 0 ,delta ,vtype))))
+        ;; Hash maps: create entry if not found
+        (let ((k (gensym "K"))
+              (p (gensym "P"))
+              (init (gensym "INIT")))
+          `(let ((,k u32 ,key-form)
+                 (,p u64 (map-lookup ,map ,k)))
+             (if ,p
+                 (atomic-add ,p 0 ,delta ,vtype)
+                 (let ((,init ,vtype ,delta))
+                   (map-update ,map ,k ,init 0))))))))
 
 (defmacro getmap (map key-form)
-  "Look up a map value and dereference the pointer. Returns the u64 value,
-   or 0 if the key is not found."
-  (let ((p (gensym "P")))
+  "Look up a map value and dereference the pointer. Returns the value
+   using the map's value-size type, or 0 if the key is not found."
+  (let ((p (gensym "P"))
+        (vtype (map-value-type map)))
     `(let ((,p u64 (map-lookup ,map ,key-form)))
-       (if ,p (load u64 ,p 0) 0))))
+       (if ,p (load ,vtype ,p 0) 0))))
 
 (defmacro set-getmap! (map key-form val-form)
   "Writer macro for (setf (getmap map key) val)."
-  (let ((v (gensym "V")))
-    `(let ((,v u64 ,val-form))
+  (let ((v (gensym "V"))
+        (vtype (map-value-type map)))
+    `(let ((,v ,vtype ,val-form))
        (map-update ,map ,key-form ,v 0))))
 
 (cl:defsetf getmap set-getmap!)
 
 (defmacro setmap (map key-form val-form &optional (flags 0))
   "Update a map entry. Prefer (setf (getmap ...) ...) for the common case."
-  (let ((v (gensym "V")))
-    `(let ((,v u64 ,val-form))
+  (let ((v (gensym "V"))
+        (vtype (map-value-type map)))
+    `(let ((,v ,vtype ,val-form))
        (map-update ,map ,key-form ,v ,flags))))
 
 (defmacro remmap (map key-form)
