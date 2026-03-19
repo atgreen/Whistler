@@ -23,3 +23,16 @@
                (:file "whistler")
                (:file "protocols")
                (:file "codegen")))
+
+(defsystem "whistler/tests"
+  :description "Whistler test suite"
+  :depends-on ("whistler" "fiveam")
+  :serial t
+  :pathname "tests/"
+  :components ((:file "package")
+               (:file "suite")
+               (:file "test-memory")
+               (:file "test-atomics")
+               (:file "test-alu")
+               (:file "test-branch")
+               (:file "test-compile")))

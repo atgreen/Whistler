@@ -1,7 +1,7 @@
 SBCL ?= sbcl
 SBCL_FLAGS = --noinform --non-interactive
 
-.PHONY: all test clean examples repl
+.PHONY: all test test-5am clean examples repl
 
 all: whistler
 
@@ -23,6 +23,14 @@ test:
 		--eval '(push #p"./" asdf:*central-registry*)' \
 		--eval '(asdf:load-system "whistler")' \
 		--load tests/test.lisp
+
+# Run FiveAM test suite
+test-5am:
+	$(SBCL) $(SBCL_FLAGS) \
+		--eval '(require :asdf)' \
+		--eval '(push #p"./" asdf:*central-registry*)' \
+		--eval '(asdf:load-system "whistler/tests")' \
+		--eval '(unless (whistler/tests:run-tests) (uiop:quit 1))'
 
 # Interactive REPL with whistler loaded
 repl:
