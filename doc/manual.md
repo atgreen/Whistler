@@ -443,6 +443,11 @@ These mirror CL's `gethash` / `(setf (gethash ...))` / `remhash` pattern.
 `incf` on a getmap place uses `map-lookup` + `atomic-add` for existing
 entries, and `map-update` to initialize new entries in hash maps.
 
+**Struct keys:** When a map's `:key-size` exceeds 8 bytes, all high-level
+macros (`getmap`, `setmap`, `incf`, `remmap`, `delmap`) automatically use the
+`-ptr` variants at compile time — no source changes needed. The key expression
+should be a struct pointer (from `make-*`).
+
 #### Ring buffer operations
 
 ```lisp
@@ -523,6 +528,45 @@ Iterates `count` times with `var` bound as a `u32` counting from 0 to
 `count - 1`. The count MUST be a compile-time constant (integer literal or
 `defconstant` value) — this is required for the BPF verifier to prove
 termination.
+
+### User-space iteration
+
+```lisp
+(do-user-ptrs (ptr-var base-ptr count max-count [:index i]) body...)
+```
+
+Iterate over a user-space array of pointers (e.g. `ffi_type **`). For each
+non-null pointer within `count` elements (up to the compile-time constant
+`max-count`), binds `ptr-var` to the pointer value and executes `body`.
+Supply `:index name` to bind the loop index.
+
+Expands to a bounded `dotimes` with `probe-read-user` for each 8-byte
+pointer, a runtime count guard, and a null check.
+
+```lisp
+(do-user-ptrs (atype-ptr arg-types-ptr nargs +max-args+ :index i)
+  (probe-read-user buf (sizeof ffi-type) atype-ptr)
+  (setf (my-key-field key i) (cast u8 (ffi-type-code buf))))
+```
+
+```lisp
+(do-user-array (var type base-ptr count max-count [:index i]) body...)
+```
+
+Iterate over a user-space array of `type` elements, where `type` is a scalar
+(`u8`, `u16`, `u32`, `u64`) or a struct name. For scalar types, `var` is
+bound to the loaded value. For struct types, `var` is bound to a stack buffer
+pointer that is overwritten each iteration.
+
+```lisp
+;; Array of structs
+(do-user-array (entry my-struct entries-ptr count +max+ :index i)
+  (my-struct-field entry))
+
+;; Array of scalars
+(do-user-array (val u32 array-ptr count +max+)
+  (when (> val threshold) ...))
+```
 
 ### Inline assembly
 

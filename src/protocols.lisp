@@ -82,6 +82,52 @@
                          (t `((= ,key-var ,test) ,@body)))))
                    clauses)))))
 
+;;; ---- User-space iteration ----
+
+(defmacro do-user-ptrs ((ptr-var base-ptr count max-count
+                         &key (index (gensym "I"))) &body body)
+  "Iterate over a user-space array of pointers (e.g. ffi_type **).
+   For each non-null pointer within COUNT elements (up to the compile-time
+   constant MAX-COUNT), binds PTR-VAR to the pointer value and executes BODY.
+   The loop index is bound to INDEX (default: gensym, supply a name to use it)."
+  (let ((buf (gensym "BUF")))
+    `(let ((,buf (struct-alloc 8)))
+       (dotimes (,index ,max-count)
+         (when (> ,count ,index)
+           (probe-read-user ,buf 8 (+ ,base-ptr (* ,index 8)))
+           (when-let ((,ptr-var (load u64 ,buf 0)))
+             ,@body))))))
+
+(defmacro do-user-array ((var type base-ptr count max-count
+                          &key (index (gensym "I"))) &body body)
+  "Iterate over a user-space array of TYPE elements.
+   TYPE is a scalar type (u8, u16, u32, u64) or a struct name.
+   For each element within COUNT (up to compile-time MAX-COUNT), reads it
+   from user-space and binds VAR to the value (scalar) or buffer pointer (struct).
+   The loop index is bound to INDEX (default: gensym, supply a name to use it)."
+  (let* ((struct-def (gethash (string type) *struct-defs*))
+         (elem-size (if struct-def
+                        (car struct-def)
+                        (cl:case type (u8 1) (u16 2) (u32 4) (u64 8)
+                          (t (error "do-user-array: unknown type ~a" type))))))
+    (if struct-def
+        ;; Struct elements: VAR is a reusable stack buffer
+        `(let ((,var (struct-alloc ,elem-size)))
+           (dotimes (,index ,max-count)
+             (when (> ,count ,index)
+               (probe-read-user ,var ,elem-size
+                                (+ ,base-ptr (* ,index ,elem-size)))
+               ,@body)))
+        ;; Scalar elements: VAR is the loaded value
+        (let ((buf (gensym "BUF")))
+          `(let ((,buf (struct-alloc ,elem-size)))
+             (dotimes (,index ,max-count)
+               (when (> ,count ,index)
+                 (probe-read-user ,buf ,elem-size
+                                  (+ ,base-ptr (* ,index ,elem-size)))
+                 (let ((,var (load ,type ,buf 0)))
+                   ,@body))))))))
+
 ;;; ---- incf / decf ----
 
 (defmacro incf (place &optional (delta 1))
@@ -112,6 +158,11 @@
     (and spec
          (member (getf (rest spec) :type) '(:array :percpu-array)))))
 
+(defun struct-key-map-p (map-name)
+  "Check if MAP-NAME has a struct key (key-size > 8) requiring -ptr map operations."
+  (let ((spec (map-spec-for map-name)))
+    (and spec (> (getf (rest spec) :key-size) 8))))
+
 (defun map-value-type (map-name)
   "Return the appropriate type symbol (u8, u16, u32, u64) for the map's value-size.
    Defaults to u64 if the map is not found."
@@ -125,10 +176,15 @@
             (t 'u64)))
         'u64)))
 
+(defun map-value-size-bytes (map-name)
+  "Return the value-size in bytes for MAP-NAME. Defaults to 8."
+  (let ((spec (map-spec-for map-name)))
+    (if spec (getf (rest spec) :value-size) 8)))
+
 (defmacro incf-map (map key-form &optional (delta 1))
   "Atomically increment a map value. For array maps where the key always exists,
    this is just a lookup + atomic-add. For hash maps, initializes to DELTA if
-   the key is new."
+   the key is new. Automatically uses -ptr operations for struct key maps."
   (let ((vtype (map-value-type map)))
     (if (array-map-p map)
         ;; Array maps: entries are pre-allocated, lookup always succeeds
@@ -138,47 +194,73 @@
              (when-let ((,p u64 (map-lookup ,map ,k)))
                (atomic-add ,p 0 ,delta ,vtype))))
         ;; Hash maps: create entry if not found
-        (let ((k (gensym "K"))
-              (p (gensym "P"))
-              (init (gensym "INIT")))
-          `(let ((,k u32 ,key-form)
-                 (,p u64 (map-lookup ,map ,k)))
-             (if ,p
-                 (atomic-add ,p 0 ,delta ,vtype)
-                 (let ((,init ,vtype ,delta))
-                   (map-update ,map ,k ,init 0))))))))
+        (if (struct-key-map-p map)
+            ;; Struct key: use -ptr variants
+            (let ((p (gensym "P"))
+                  (init (gensym "INIT")))
+              `(let ((,p u64 (map-lookup-ptr ,map ,key-form)))
+                 (if ,p
+                     (atomic-add ,p 0 ,delta ,vtype)
+                     (let ((,init (struct-alloc ,(map-value-size-bytes map))))
+                       (store ,vtype ,init 0 ,delta)
+                       (map-update-ptr ,map ,key-form ,init 0)))))
+            ;; Scalar key
+            (let ((k (gensym "K"))
+                  (p (gensym "P"))
+                  (init (gensym "INIT")))
+              `(let ((,k u32 ,key-form)
+                     (,p u64 (map-lookup ,map ,k)))
+                 (if ,p
+                     (atomic-add ,p 0 ,delta ,vtype)
+                     (let ((,init ,vtype ,delta))
+                       (map-update ,map ,k ,init 0)))))))))
 
 (defmacro getmap (map key-form)
   "Look up a map value and dereference the pointer. Returns the value
-   using the map's value-size type, or 0 if the key is not found."
+   using the map's value-size type, or 0 if the key is not found.
+   Automatically uses -ptr operations for struct key maps."
   (let ((p (gensym "P"))
-        (vtype (map-value-type map)))
-    `(let ((,p u64 (map-lookup ,map ,key-form)))
+        (vtype (map-value-type map))
+        (lookup (if (struct-key-map-p map) 'map-lookup-ptr 'map-lookup)))
+    `(let ((,p u64 (,lookup ,map ,key-form)))
        (if ,p (load ,vtype ,p 0) 0))))
 
 (defmacro set-getmap! (map key-form val-form)
   "Writer macro for (setf (getmap map key) val)."
   (let ((v (gensym "V"))
         (vtype (map-value-type map)))
-    `(let ((,v ,vtype ,val-form))
-       (map-update ,map ,key-form ,v 0))))
+    (if (struct-key-map-p map)
+        `(let ((,v (struct-alloc ,(map-value-size-bytes map))))
+           (store ,vtype ,v 0 ,val-form)
+           (map-update-ptr ,map ,key-form ,v 0))
+        `(let ((,v ,vtype ,val-form))
+           (map-update ,map ,key-form ,v 0)))))
 
 (cl:defsetf getmap set-getmap!)
 
 (defmacro setmap (map key-form val-form &optional (flags 0))
-  "Update a map entry. Prefer (setf (getmap ...) ...) for the common case."
+  "Update a map entry. Prefer (setf (getmap ...) ...) for the common case.
+   Automatically uses -ptr operations for struct key maps."
   (let ((v (gensym "V"))
         (vtype (map-value-type map)))
-    `(let ((,v ,vtype ,val-form))
-       (map-update ,map ,key-form ,v ,flags))))
+    (if (struct-key-map-p map)
+        `(let ((,v (struct-alloc ,(map-value-size-bytes map))))
+           (store ,vtype ,v 0 ,val-form)
+           (map-update-ptr ,map ,key-form ,v ,flags))
+        `(let ((,v ,vtype ,val-form))
+           (map-update ,map ,key-form ,v ,flags)))))
 
 (defmacro remmap (map key-form)
   "Delete a map entry. CL-style name (cf. remhash)."
-  `(map-delete ,map ,key-form))
+  (if (struct-key-map-p map)
+      `(map-delete-ptr ,map ,key-form)
+      `(map-delete ,map ,key-form)))
 
 (defmacro delmap (map key-form)
   "Delete a map entry. Alias for remmap."
-  `(map-delete ,map ,key-form))
+  (if (struct-key-map-p map)
+      `(map-delete-ptr ,map ,key-form)
+      `(map-delete ,map ,key-form)))
 
 ;;; ================================================================
 ;;; Protocol header definitions

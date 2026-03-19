@@ -34,7 +34,8 @@
   (current-block-label nil)          ; label of the block currently being emitted
   (core-relocs '())                  ; (bpf-insn-object struct-name field-name) for CO-RE
   (ptr-cache (make-hash-table))     ; R10-relative offset → stack slot holding cached ptr
-  (struct-ptr-uses (make-hash-table))) ; struct vreg → count of map-ptr uses
+  (struct-ptr-uses (make-hash-table)) ; struct vreg → count of map-ptr uses
+  (phi-moves (make-hash-table :test 'equal))) ; (src-label . tgt-label) → ((phi-dst . src-vreg) ...)
 
 (defun ectx-emit (ctx insn-list)
   (dolist (insn insn-list)
@@ -318,6 +319,22 @@
           (setf (gethash (ir-insn-dst insn) (emit-ctx-const-values ctx))
                 (second (first (ir-insn-args insn)))))))
 
+    ;; Build phi resolution table: for each phi in a block, record the moves
+    ;; needed at each predecessor's branch to that block.
+    (dolist (block blocks)
+      (dolist (insn (basic-block-insns block))
+        (when (and (eq (ir-insn-op insn) :phi) (ir-insn-dst insn))
+          (let ((phi-dst (ir-insn-dst insn))
+                (tgt-label (basic-block-label block)))
+            (dolist (arg (ir-insn-args insn))
+              (when (and (consp arg) (integerp (first arg))
+                         (consp (second arg)) (eq (car (second arg)) :label))
+                (let* ((src-vreg (first arg))
+                       (src-label (cadr (second arg)))
+                       (key (cons src-label tgt-label)))
+                  (push (cons phi-dst src-vreg)
+                        (gethash key (emit-ctx-phi-moves ctx))))))))))
+
     ;; Emit ctx save only if ctx-loads happen after calls (need R6)
     (let ((ctx-vreg (find-ctx-vreg prog)))
       (when (and ctx-vreg (vreg-used-p prog ctx-vreg) (not ctx-early))
@@ -449,14 +466,28 @@
       (emit-bswap-insn ctx op dst args))
 
      ((eq op :phi)
-      (when dst
-        (let ((first-arg (first args)))
-          (when (and first-arg (integerp (first first-arg)))
-            (let ((src-reg (vreg-to-physical ctx (first first-arg) whistler/bpf:+bpf-reg-1+)))
-              (store-to-vreg ctx dst src-reg))))))
+      ;; Phi resolution moves are emitted at predecessor branches, not here.
+      nil)
 
      ((eq op :br)
       (let ((target (label-arg-name (first args))))
+        ;; Emit phi resolution moves before the jump
+        (let ((moves (gethash (cons (emit-ctx-current-block-label ctx) target)
+                              (emit-ctx-phi-moves ctx))))
+          (dolist (move moves)
+            (let* ((phi-dst (car move))
+                   (src-vreg (cdr move))
+                   (src-reg (vreg-to-physical ctx src-vreg whistler/bpf:+bpf-reg-0+))
+                   (dst-loc (gethash phi-dst (emit-ctx-vreg-map ctx))))
+              (when dst-loc
+                (cond
+                  ((and (eq (car dst-loc) :reg)
+                        (/= (cadr dst-loc) src-reg))
+                   (ectx-emit ctx (whistler/bpf:emit-mov64-reg (cadr dst-loc) src-reg)))
+                  ((eq (car dst-loc) :stack)
+                   (ectx-emit ctx (whistler/bpf:emit-stx-mem
+                                    whistler/bpf:+bpf-dw+
+                                    whistler/bpf:+bpf-reg-10+ src-reg (cadr dst-loc)))))))))
         (push (list (ectx-current-idx ctx) target) (emit-ctx-fixups ctx))
         (ectx-emit ctx (whistler/bpf:emit-jmp-a 0))))
 

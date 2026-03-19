@@ -133,6 +133,8 @@
            #:defstruct #:struct-set #:struct-ref #:sizeof
            ;; Memory operations
            #:memset #:memcpy
+           ;; User-space iteration
+           #:do-user-ptrs #:do-user-array
            ;; pt_regs access (x86-64)
            #:pt-regs-parm1 #:pt-regs-parm2 #:pt-regs-parm3
            #:pt-regs-parm4 #:pt-regs-parm5 #:pt-regs-parm6

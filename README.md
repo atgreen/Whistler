@@ -334,6 +334,28 @@ Structs support fixed-size array fields with indexed access:
 
 All offsets and sizes must be compile-time constants.
 
+### User-Space Iteration
+
+Iterate over user-space arrays without manual pointer arithmetic:
+
+```lisp
+;; Array of pointers (e.g. ffi_type **): null-checked, each ptr bound
+(do-user-ptrs (atype-ptr arg-types-ptr nargs +max-args+ :index i)
+  (probe-read-user buf (sizeof ffi-type) atype-ptr)
+  (use-field buf i))
+
+;; Array of structs (e.g. struct event[]): each element read into buffer
+(do-user-array (entry my-struct entries-ptr count +max-entries+ :index i)
+  (my-struct-field entry))
+
+;; Array of scalars (e.g. u32[]): each value bound directly
+(do-user-array (val u32 array-ptr count +max-count+)
+  (when (> val threshold) ...))
+```
+
+Both require a compile-time `max-count` for the BPF verifier and a runtime
+`count` for the actual bound. Supply `:index name` to use the loop index.
+
 ### pt_regs access (x86-64)
 
 Portable access to function arguments in uprobe/kprobe programs, matching
