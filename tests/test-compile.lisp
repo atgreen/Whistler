@@ -20,6 +20,18 @@
   "Let binding with constant should fold away"
   (is (= 2 (w-count "(let ((x u32 42)) (return x))"))))
 
+(test cfg-constant-branch-folded
+  "If with constant operands should fold to the taken branch"
+  (is (= 2 (w-count "(let ((x u32 10))
+                        (if (> x 5) (return 2) (return 1)))"))))
+
+(test cfg-constant-branch-false-path
+  "If with false constant condition should take else branch"
+  (let ((bytes (w-body "(let ((x u32 3))
+                          (if (> x 5) (return 99) (return 42)))")))
+    (is (= 42 (nth-insn-imm bytes 0))
+        "Should return 42 (else branch)")))
+
 (test map-lookup-has-relocs
   "Program with map-lookup should produce map relocations"
   (let ((cu (compile-single

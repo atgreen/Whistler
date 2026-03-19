@@ -89,12 +89,14 @@
     (assert-eq 2 (length (cu-insns cu)))))
 
 (deftest compile-if-cmp
+  ;; Both operands are constants, so the branch is folded → (return 2)
+  ;; After CFG simplification: mov r0,2 ; exit = 2 instructions
   (let ((cu (compile-program "xdp" "GPL" nil
               '((let ((x u32 10))
                   (if (> x 5)
                       (return 2)
                       (return 1)))))))
-    (assert-true (> (length (cu-insns cu)) 4))))
+    (assert-eq 2 (length (cu-insns cu)))))
 
 (deftest compile-log2-intrinsic
   ;; log2 intrinsic emits unrolled binary search: 15 instructions

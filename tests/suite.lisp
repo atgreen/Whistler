@@ -25,6 +25,30 @@
   :description "End-to-end compilation and error handling"
   :in whistler-suite)
 
+(def-suite byteswap-suite
+  :description "Byte swap (endian conversion) operations"
+  :in whistler-suite)
+
+(def-suite controlflow-suite
+  :description "Advanced control flow: loops, casts, logical ops"
+  :in whistler-suite)
+
+(def-suite protocol-suite
+  :description "Protocol header parsing and packet access"
+  :in whistler-suite)
+
+(def-suite optimization-suite
+  :description "SSA optimization and peephole pass correctness"
+  :in whistler-suite)
+
+(def-suite maps-suite
+  :description "Map operations: lookup, update, delete"
+  :in whistler-suite)
+
+(def-suite programs-suite
+  :description "Multi-program, tail calls, ring buffers, examples"
+  :in whistler-suite)
+
 ;;; ========== Test helpers ==========
 
 (defun read-whistler-forms (string)

@@ -1451,6 +1451,327 @@
       (dead-code-elimination prog))
     prog))
 
+;;; ========== CFG simplification ==========
+;;;
+;;; Generic control-flow graph simplification: fold constant branches,
+;;; merge jump-only blocks, merge linear chains. Unlocks more DCE and
+;;; eliminates phis that constant/copy propagation cannot reach.
+
+(defun compute-cfg-edges (prog)
+  "Recompute basic-block succs/preds from branch instructions."
+  (dolist (block (ir-program-blocks prog))
+    (setf (basic-block-succs block) nil)
+    (setf (basic-block-preds block) nil))
+  (dolist (block (ir-program-blocks prog))
+    (let ((last-insn (car (last (basic-block-insns block)))))
+      (when last-insn
+        (dolist (arg (ir-insn-args last-insn))
+          (when (and (consp arg) (eq (car arg) :label))
+            (pushnew (cadr arg) (basic-block-succs block))))))
+    (dolist (succ-label (basic-block-succs block))
+      (let ((succ (ir-find-block prog succ-label)))
+        (when succ
+          (pushnew (basic-block-label block)
+                   (basic-block-preds succ)))))))
+
+(defun evaluate-cmp (op lhs rhs)
+  "Evaluate BPF comparison OP on integer values LHS and RHS."
+  (let ((sl (if (logbitp 63 lhs) (- lhs (ash 1 64)) lhs))
+        (sr (if (logbitp 63 rhs) (- rhs (ash 1 64)) rhs)))
+    (ecase op
+      (:jeq  (= lhs rhs))
+      (:jne  (/= lhs rhs))
+      (:jgt  (> lhs rhs))
+      (:jge  (>= lhs rhs))
+      (:jlt  (< lhs rhs))
+      (:jle  (<= lhs rhs))
+      (:jsgt (> sl sr))
+      (:jsge (>= sl sr))
+      (:jslt (< sl sr))
+      (:jsle (<= sl sr)))))
+
+(defun resolve-const (val const-map)
+  "If VAL is (:imm N), return N. If VAL is a vreg in CONST-MAP, return its value. Else nil."
+  (cond
+    ((and (consp val) (eq (car val) :imm)) (second val))
+    ((and (integerp val) (gethash val const-map)) (gethash val const-map))
+    (t nil)))
+
+(defun simplify-cfg (prog)
+  "Simplify CFG: fold constant branches, merge jump-only blocks, merge linear chains."
+  (let ((const-map (make-hash-table)))
+    (let ((changed t)
+          (any-change nil))
+      (loop while changed do
+        (setf changed nil)
+
+        ;; Rebuild const-map each iteration (blocks may have changed)
+        (clrhash const-map)
+        (dolist (block (ir-program-blocks prog))
+          (dolist (insn (basic-block-insns block))
+            (when (and (eq (ir-insn-op insn) :mov)
+                       (ir-insn-dst insn)
+                       (let ((arg (first (ir-insn-args insn))))
+                         (and (consp arg) (eq (car arg) :imm))))
+              (setf (gethash (ir-insn-dst insn) const-map)
+                    (second (first (ir-insn-args insn)))))))
+
+        (compute-cfg-edges prog)
+
+        ;; Sub-pass A: Fold constant branches
+        (dolist (block (ir-program-blocks prog))
+          (let ((term (car (last (basic-block-insns block)))))
+            (when (and term (eq (ir-insn-op term) :br-cond))
+              (let* ((args (ir-insn-args term))
+                     (cmp-op (second (first args)))
+                     (lhs-val (resolve-const (second args) const-map))
+                     (rhs-val (resolve-const (third args) const-map))
+                     (then-label (fourth args))
+                     (else-label (fifth args)))
+                (when (and lhs-val rhs-val cmp-op then-label else-label)
+                  (let ((target (if (evaluate-cmp cmp-op lhs-val rhs-val)
+                                    then-label else-label)))
+                    (setf (ir-insn-op term) :br)
+                    (setf (ir-insn-args term) (list target))
+                    (setf changed t)))))))
+
+        ;; Sub-pass B: Merge jump-only blocks
+        ;; A block with only a :br (no other instructions) can be bypassed
+        (dolist (block (ir-program-blocks prog))
+          (let ((insns (basic-block-insns block)))
+            (when (and (= 1 (length insns))
+                       (eq (ir-insn-op (first insns)) :br)
+                       ;; Don't remove entry block
+                       (not (eq (basic-block-label block)
+                                (ir-program-entry prog))))
+              (let* ((target-label (second (first (ir-insn-args (first insns)))))
+                     (target-block (ir-find-block prog target-label))
+                     (block-label (basic-block-label block)))
+                (when target-block
+                  ;; Redirect all predecessors to target
+                  (dolist (pred-label (basic-block-preds block))
+                    (let ((pred (ir-find-block prog pred-label)))
+                      (when pred
+                        (let ((pred-term (car (last (basic-block-insns pred)))))
+                          (when pred-term
+                            (setf (ir-insn-args pred-term)
+                                  (mapcar (lambda (arg)
+                                            (if (and (consp arg) (eq (car arg) :label)
+                                                     (eq (second arg) block-label))
+                                                (list :label target-label)
+                                                arg))
+                                          (ir-insn-args pred-term))))))))
+                  ;; Update PHIs in target: replace (:label block) with pred labels
+                  (dolist (insn (basic-block-insns target-block))
+                    (when (eq (ir-insn-op insn) :phi)
+                      (let ((new-args '()))
+                        (dolist (phi-arg (ir-insn-args insn))
+                          (if (and (consp phi-arg)
+                                   (consp (second phi-arg))
+                                   (eq (car (second phi-arg)) :label)
+                                   (eq (second (second phi-arg)) block-label))
+                              ;; Expand to one entry per predecessor
+                              (dolist (pred-label (basic-block-preds block))
+                                (push (list (first phi-arg) (list :label pred-label))
+                                      new-args))
+                              (push phi-arg new-args)))
+                        (setf (ir-insn-args insn) (nreverse new-args)))))
+                  (setf changed t))))))
+
+        ;; Sub-pass C: Merge linear chains
+        ;; If A's only successor is B (via :br), and B's only predecessor is A
+        (compute-cfg-edges prog)
+        (dolist (block (ir-program-blocks prog))
+          (when (and (= 1 (length (basic-block-succs block)))
+                     (let ((term (car (last (basic-block-insns block)))))
+                       (and term (eq (ir-insn-op term) :br))))
+            (let* ((succ-label (first (basic-block-succs block)))
+                   (succ (ir-find-block prog succ-label)))
+              (when (and succ
+                         (= 1 (length (basic-block-preds succ)))
+                         ;; Don't merge entry into nothing
+                         (not (eq succ block)))
+                ;; Build substitution map from trivial PHIs
+                (let ((subst-map (make-hash-table)))
+                  (dolist (insn (basic-block-insns succ))
+                    (when (and (eq (ir-insn-op insn) :phi)
+                               (= 1 (length (ir-insn-args insn))))
+                      (let ((incoming-vreg (first (first (ir-insn-args insn)))))
+                        (setf (gethash (ir-insn-dst insn) subst-map) incoming-vreg))))
+                  ;; Remove A's terminator :br
+                  (setf (basic-block-insns block)
+                        (butlast (basic-block-insns block)))
+                  ;; Append B's non-phi instructions to A, substituting PHI values
+                  (dolist (insn (basic-block-insns succ))
+                    (unless (eq (ir-insn-op insn) :phi)
+                      (when (> (hash-table-count subst-map) 0)
+                        (setf (ir-insn-args insn)
+                              (subst-vreg-args (ir-insn-args insn) subst-map))
+                        (when (and (ir-insn-dst insn)
+                                   (gethash (ir-insn-dst insn) subst-map))
+                          ;; Should not happen but be safe
+                          (remhash (ir-insn-dst insn) subst-map)))
+                      (setf (basic-block-insns block)
+                            (append (basic-block-insns block) (list insn)))))
+                  ;; Apply PHI substitutions across all blocks
+                  (when (> (hash-table-count subst-map) 0)
+                    (dolist (b (ir-program-blocks prog))
+                      (dolist (insn (basic-block-insns b))
+                        (setf (ir-insn-args insn)
+                              (subst-vreg-args (ir-insn-args insn) subst-map)))))
+                  ;; Remove B from program
+                  (setf (ir-program-blocks prog)
+                        (remove succ (ir-program-blocks prog)))
+                  (setf changed t))))))
+
+        ;; Sub-pass D: Remove unreachable blocks
+        (when changed
+          (eliminate-unreachable-blocks prog)
+          (setf any-change t)))
+
+      (when any-change
+        (dead-code-elimination prog))))
+  prog)
+
+;;; ========== Common subexpression elimination ==========
+;;;
+;;; Intra-block CSE: eliminate redundant pure computations by replacing
+;;; duplicate instructions with references to the first occurrence.
+
+(defun cse-pure-op-p (op)
+  "Is OP a pure operation eligible for CSE?"
+  (member op '(:mov :add :sub :mul :div :mod
+               :and :or :xor :lsh :rsh :arsh :neg
+               :bswap16 :bswap32 :bswap64 :cast)))
+
+(defun cse-memory-op-p (op)
+  "Is OP a memory-reading operation that can be CSE'd but must be
+   invalidated on stores/calls?"
+  (member op '(:load :ctx-load)))
+
+(defun cse-key (insn)
+  "Return a CSE key for INSN, or NIL if not CSE-able."
+  (let ((op (ir-insn-op insn)))
+    (when (or (cse-pure-op-p op) (cse-memory-op-p op))
+      (list* op (ir-insn-type insn) (ir-insn-args insn)))))
+
+(defun eliminate-common-subexpressions (prog)
+  "Eliminate redundant pure computations within basic blocks."
+  (let ((subst-map (make-hash-table))
+        (any-change nil))
+    (dolist (block (ir-program-blocks prog))
+      (let ((table (make-hash-table :test #'equal))
+            (new-insns '()))
+        (dolist (insn (basic-block-insns block))
+          (let ((key (cse-key insn)))
+            (cond
+              ;; CSE-able instruction with a known equivalent
+              ((and key (ir-insn-dst insn) (gethash key table))
+               (setf (gethash (ir-insn-dst insn) subst-map) (gethash key table))
+               (setf any-change t))
+              ;; CSE-able instruction, first occurrence
+              ((and key (ir-insn-dst insn))
+               (setf (gethash key table) (ir-insn-dst insn))
+               (push insn new-insns))
+              (t
+               ;; Side-effect or call-like → invalidate memory CSE entries
+               (when (or (ir-insn-side-effect-p insn) (call-like-op-p (ir-insn-op insn)))
+                 ;; Remove memory-sensitive entries from the table
+                 (let ((to-remove '()))
+                   (maphash (lambda (k v)
+                              (declare (ignore v))
+                              (when (cse-memory-op-p (car k))
+                                (push k to-remove)))
+                            table)
+                   (dolist (k to-remove)
+                     (remhash k table))))
+               (push insn new-insns)))))
+        (setf (basic-block-insns block) (nreverse new-insns))))
+    ;; Apply substitutions globally
+    (when any-change
+      (dolist (block (ir-program-blocks prog))
+        (dolist (insn (basic-block-insns block))
+          (setf (ir-insn-args insn)
+                (subst-vreg-args (ir-insn-args insn) subst-map))))
+      (dead-code-elimination prog)))
+  prog)
+
+;;; ========== Store-to-load forwarding ==========
+;;;
+;;; Intra-block: when a store to (ptr, offset, type) is followed by a load
+;;; from the same location with the same type and no intervening aliasing
+;;; store or call, replace the load with the stored value.
+
+(defun forward-stores-to-loads (prog)
+  "Forward stored values to subsequent loads from the same location."
+  (let ((any-change nil))
+    (dolist (block (ir-program-blocks prog))
+      ;; pending: (ptr-vreg . offset) → (val-vreg . type-kw)
+      (let ((pending (make-hash-table :test #'equal)))
+        (dolist (insn (basic-block-insns block))
+          (let ((op (ir-insn-op insn)))
+            (cond
+              ;; Store: record and invalidate same-ptr entries
+              ((eq op :store)
+               (let* ((args (ir-insn-args insn))
+                      (ptr (first args))
+                      (off (and (consp (second args)) (eq (car (second args)) :imm)
+                                (second (second args))))
+                      (val (third args))
+                      (type-arg (fourth args))
+                      (type-kw (and (consp type-arg) (eq (car type-arg) :type)
+                                    (second type-arg))))
+                 (when (and (integerp ptr) off (integerp val) type-kw)
+                   ;; Invalidate all entries for this ptr
+                   (let ((to-remove '()))
+                     (maphash (lambda (k v)
+                                (declare (ignore v))
+                                (when (eql (car k) ptr)
+                                  (push k to-remove)))
+                              pending)
+                     (dolist (k to-remove)
+                       (remhash k pending)))
+                   ;; Record this store
+                   (setf (gethash (cons ptr off) pending) (cons val type-kw)))))
+
+              ;; Load: check for forwarding opportunity
+              ((eq op :load)
+               (let* ((args (ir-insn-args insn))
+                      (ptr (first args))
+                      (off (and (consp (second args)) (eq (car (second args)) :imm)
+                                (second (second args))))
+                      (type-arg (third args))
+                      (type-kw (and (consp type-arg) (eq (car type-arg) :type)
+                                    (second type-arg))))
+                 (when (and (integerp ptr) off type-kw)
+                   (let ((entry (gethash (cons ptr off) pending)))
+                     (when (and entry
+                                (eq type-kw (cdr entry)))
+                       ;; Forward: replace load with mov from stored value
+                       (setf (ir-insn-op insn) :mov)
+                       (setf (ir-insn-args insn) (list (car entry)))
+                       (setf any-change t))))))
+
+              ;; Call-like ops: invalidate all pending stores
+              ((call-like-op-p op)
+               (clrhash pending))
+
+              ;; Atomic-add: invalidate entries for this ptr
+              ((eq op :atomic-add)
+               (let ((ptr (first (ir-insn-args insn))))
+                 (when (integerp ptr)
+                   (let ((to-remove '()))
+                     (maphash (lambda (k v)
+                                (declare (ignore v))
+                                (when (eql (car k) ptr)
+                                  (push k to-remove)))
+                              pending)
+                     (dolist (k to-remove)
+                       (remhash k pending)))))))))))
+    (when any-change
+      (dead-code-elimination prog)))
+  prog)
+
 ;;; ========== Run all SSA optimizations ==========
 
 (defun optimize-ir (prog)
@@ -1459,7 +1780,10 @@
   (constant-propagation prog)
   (fold-bswap-comparisons prog)
   (fold-constant-offsets prog)
+  (simplify-cfg prog)
   (elide-tracepoint-return prog)
+  (eliminate-common-subexpressions prog)
+  (forward-stores-to-loads prog)
   (dead-code-elimination prog)
   (dead-destination-elimination prog)
   (dead-store-elimination prog)

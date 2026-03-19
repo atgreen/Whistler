@@ -1,7 +1,7 @@
 SBCL ?= sbcl
 SBCL_FLAGS = --noinform --non-interactive
 
-.PHONY: all test test-5am clean examples repl
+.PHONY: all test check clean examples repl
 
 all: whistler
 
@@ -16,21 +16,15 @@ whistler: whistler.asd $(wildcard src/*.lisp)
 examples: all
 	./whistler compile examples/count-xdp.lisp -o examples/count-xdp.bpf.o
 
-# Run tests
+# Run all tests
 test:
-	$(SBCL) $(SBCL_FLAGS) \
-		--eval '(require :asdf)' \
-		--eval '(push #p"./" asdf:*central-registry*)' \
-		--eval '(asdf:load-system "whistler")' \
-		--load tests/test.lisp
-
-# Run FiveAM test suite
-test-5am:
 	$(SBCL) $(SBCL_FLAGS) \
 		--eval '(require :asdf)' \
 		--eval '(push #p"./" asdf:*central-registry*)' \
 		--eval '(asdf:load-system "whistler/tests")' \
 		--eval '(unless (whistler/tests:run-tests) (uiop:quit 1))'
+
+check: test
 
 # Interactive REPL with whistler loaded
 repl:
