@@ -8,36 +8,41 @@
 
 (test add-imm
   "Addition with immediate should emit alu64 add imm"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (+ x 42)))")))
     (is (has-opcode-p bytes +alu64-add-imm+)
         "Expected alu64 add imm (0x07)")))
 
 (test add-reg
   "Addition of two registers should emit alu64 add reg"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0))
-                              (y u64 (ctx-load u64 8)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0))
+                              (y (ctx-load u64 8)))
+                          (declare (type u64 x) (type u64 y))
                           (return (+ x y)))")))
     (is (has-opcode-p bytes +alu64-add-reg+)
         "Expected alu64 add reg (0x0f)")))
 
 (test sub-imm
   "Subtraction with immediate should emit alu64 sub imm"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (- x 10)))")))
     (is (has-opcode-p bytes +alu64-sub-imm+)
         "Expected alu64 sub imm (0x17)")))
 
 (test mul-imm
   "Multiplication with immediate should emit alu64 mul imm"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (* x 3)))")))
     (is (has-opcode-p bytes +alu64-mul-imm+)
         "Expected alu64 mul imm (0x27)")))
 
 (test div-imm
   "Division with immediate should emit alu64 div imm or rsh"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (/ x 4)))")))
     ;; Division by power of 2 might optimize to right shift
     (is (or (has-opcode-p bytes +alu64-div-imm+)
@@ -46,7 +51,8 @@
 
 (test mod-imm
   "Modulo with immediate should emit alu64 mod imm"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (mod x 7)))")))
     (is (has-opcode-p bytes +alu64-mod-imm+)
         "Expected alu64 mod imm (0x97)")))
@@ -55,7 +61,8 @@
 
 (test logand-imm
   "Bitwise AND with immediate should emit alu and imm (32 or 64 bit)"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (logand x #xff)))")))
     ;; Compiler may narrow to alu32 (0x54) when mask fits 32 bits
     (is (or (has-opcode-p bytes +alu64-and-imm+)
@@ -64,7 +71,8 @@
 
 (test logior-imm
   "Bitwise OR with immediate should emit alu or imm (32 or 64 bit)"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (logior x #x80)))")))
     (is (or (has-opcode-p bytes +alu64-or-imm+)
             (has-opcode-p bytes #x44))
@@ -72,7 +80,8 @@
 
 (test logxor-imm
   "Bitwise XOR with immediate should emit alu xor imm (32 or 64 bit)"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (logxor x #xaa)))")))
     (is (or (has-opcode-p bytes +alu64-xor-imm+)
             (has-opcode-p bytes #xa4))
@@ -84,7 +93,8 @@
 
 (test lshift-imm
   "Left shift with immediate should emit alu lsh imm"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (<< x 4)))")))
     (is (or (has-opcode-p bytes +alu64-lsh-imm+)
             (has-opcode-p bytes #x64))
@@ -92,7 +102,8 @@
 
 (test rshift-imm
   "Right shift with immediate should emit alu rsh imm"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (>> x 4)))")))
     (is (or (has-opcode-p bytes +alu64-rsh-imm+)
             (has-opcode-p bytes #x74))
@@ -100,7 +111,8 @@
 
 (test arshift-imm
   "Arithmetic right shift with immediate should emit alu arsh imm"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return (>>> x 4)))")))
     (is (or (has-opcode-p bytes +alu64-arsh-imm+)
             (has-opcode-p bytes #xc4))

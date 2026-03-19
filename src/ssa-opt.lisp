@@ -1772,25 +1772,289 @@
       (dead-code-elimination prog)))
   prog)
 
+;;; ========== Loop-invariant code motion ==========
+;;;
+;;; Detect natural loops, identify loop-invariant instructions, and hoist
+;;; them to the loop preheader. This targets the dotimes lowering pattern
+;;; (src/lower.lisp:840) and any similar CFG loops with back-edges.
+
+(defun find-natural-loops (prog dom-map)
+  "Find natural loops in PROG. Returns a list of plists:
+   (:header LABEL :blocks (labels...) :preheader LABEL)."
+  ;; Collect back-edges: (B → H) where H dominates B
+  (let ((back-edges (make-hash-table)))  ; header → list of back-edge sources
+    (dolist (block (ir-program-blocks prog))
+      (dolist (succ-label (basic-block-succs block))
+        (when (dominates-p dom-map succ-label (basic-block-label block))
+          (push (basic-block-label block) (gethash succ-label back-edges)))))
+
+    ;; Build a loop for each header with back-edges
+    (let ((loops '()))
+      (maphash
+       (lambda (header sources)
+         ;; Compute loop body via reverse DFS from back-edge sources to header
+         (let ((body (make-hash-table)))
+           (setf (gethash header body) t)
+           (let ((worklist (copy-list sources)))
+             (dolist (s sources) (setf (gethash s body) t))
+             (loop while worklist do
+               (let ((n (pop worklist)))
+                 (dolist (pred-label (basic-block-preds
+                                      (ir-find-block prog n)))
+                   (unless (gethash pred-label body)
+                     (setf (gethash pred-label body) t)
+                     (push pred-label worklist))))))
+           ;; Find preheader: unique predecessor of header NOT in loop
+           (let ((header-block (ir-find-block prog header))
+                 (preheader nil))
+             (dolist (pred-label (basic-block-preds header-block))
+               (unless (gethash pred-label body)
+                 (if preheader
+                     (setf preheader :multiple)  ; more than one non-loop pred
+                     (setf preheader pred-label))))
+             ;; Only process loops with a unique preheader
+             (when (and preheader (not (eq preheader :multiple)))
+               (let ((block-labels '()))
+                 (maphash (lambda (k v) (declare (ignore v)) (push k block-labels)) body)
+                 (push (list :header header :blocks block-labels :preheader preheader)
+                       loops))))))
+       back-edges)
+      loops)))
+
+(defun licm-hoistable-p (insn)
+  "Can this instruction type be hoisted out of a loop?"
+  (let ((op (ir-insn-op insn)))
+    (and (ir-insn-dst insn)                 ; must produce a value
+         (not (ir-insn-side-effect-p insn))
+         (not (call-like-op-p op))
+         (not (eq op :phi))
+         ;; Whitelist of hoistable ops
+         (member op '(:mov :add :sub :mul :div :mod
+                      :and :or :xor :lsh :rsh :arsh :neg
+                      :bswap16 :bswap32 :bswap64 :cast
+                      :ctx-load :map-fd)))))
+
+(defun find-loop-invariant-insns (prog loop-info)
+  "Find instructions in LOOP-INFO that are loop-invariant.
+   Returns an ordered list of ir-insn objects safe to hoist."
+  (let* ((loop-blocks (getf loop-info :blocks))
+         (loop-block-set (make-hash-table))
+         (loop-defs (make-hash-table))    ; vreg → t if defined in loop
+         (invariant (make-hash-table :test #'eq))  ; insn → t
+         ;; Check if any call in the loop invalidates pointers
+         (has-invalidating-call nil))
+
+    ;; Build loop block set
+    (dolist (lbl loop-blocks) (setf (gethash lbl loop-block-set) t))
+
+    ;; Collect all defs in loop and check for invalidating calls
+    (dolist (lbl loop-blocks)
+      (let ((block (ir-find-block prog lbl)))
+        (when block
+          (dolist (insn (basic-block-insns block))
+            (when (ir-insn-dst insn)
+              (setf (gethash (ir-insn-dst insn) loop-defs) t))
+            (when (and (call-like-op-p (ir-insn-op insn))
+                       (or (helper-invalidates-p insn :invalidates-packet-ptrs)
+                           (helper-invalidates-p insn :invalidates-map-value-ptrs)))
+              (setf has-invalidating-call t))))))
+
+    ;; Fixed-point: mark invariant instructions
+    (let ((changed t))
+      (loop while changed do
+        (setf changed nil)
+        (dolist (lbl loop-blocks)
+          (let ((block (ir-find-block prog lbl)))
+            (when block
+              (dolist (insn (basic-block-insns block))
+                (when (and (not (gethash insn invariant))
+                           (licm-hoistable-p insn)
+                           ;; Don't hoist ctx-load if calls invalidate pointers
+                           (not (and (eq (ir-insn-op insn) :ctx-load)
+                                     has-invalidating-call)))
+                  ;; Check all vreg operands are defined outside loop or invariant
+                  (let ((all-ok t))
+                    (dolist (arg (ir-insn-args insn))
+                      (when (and (integerp arg)           ; vreg reference
+                                 (gethash arg loop-defs)  ; defined in loop
+                                 ;; Check if defined by an invariant insn
+                                 (not (let ((def-ok nil))
+                                        (dolist (lbl2 loop-blocks)
+                                          (let ((b2 (ir-find-block prog lbl2)))
+                                            (when b2
+                                              (dolist (i2 (basic-block-insns b2))
+                                                (when (and (eql (ir-insn-dst i2) arg)
+                                                           (gethash i2 invariant))
+                                                  (setf def-ok t))))))
+                                        def-ok)))
+                        (setf all-ok nil)))
+                    (when all-ok
+                      (setf (gethash insn invariant) t)
+                      (setf changed t))))))))))
+
+    ;; Collect invariant insns in program order (preserves data deps)
+    (let ((result '()))
+      (dolist (lbl loop-blocks)
+        (let ((block (ir-find-block prog lbl)))
+          (when block
+            (dolist (insn (basic-block-insns block))
+              (when (gethash insn invariant)
+                (push insn result))))))
+      (nreverse result))))
+
+(defun hoist-to-preheader (prog preheader-label insns-to-hoist)
+  "Move INSNS-TO-HOIST into the preheader block, just before its terminator."
+  (let ((preheader (ir-find-block prog preheader-label)))
+    (when (and preheader insns-to-hoist)
+      ;; Remove hoisted instructions from their original blocks
+      (let ((hoist-set (make-hash-table :test #'eq)))
+        (dolist (insn insns-to-hoist) (setf (gethash insn hoist-set) t))
+        (dolist (block (ir-program-blocks prog))
+          (setf (basic-block-insns block)
+                (remove-if (lambda (i) (gethash i hoist-set))
+                           (basic-block-insns block)))))
+      ;; Insert before the terminator of the preheader
+      (let ((insns (basic-block-insns preheader)))
+        (if (null insns)
+            (setf (basic-block-insns preheader) (copy-list insns-to-hoist))
+            (let ((before-term (butlast insns))
+                  (term (last insns)))
+              (setf (basic-block-insns preheader)
+                    (append before-term insns-to-hoist term))))))))
+
+(defun loop-invariant-code-motion (prog)
+  "Hoist loop-invariant instructions to loop preheaders."
+  (compute-cfg-edges prog)
+  (let ((dom-map (compute-dominators prog)))
+    (let ((loops (find-natural-loops prog dom-map)))
+      (dolist (loop-info loops)
+        (let ((invariants (find-loop-invariant-insns prog loop-info)))
+          (when invariants
+            (hoist-to-preheader prog (getf loop-info :preheader) invariants))))))
+  prog)
+
+;;; ========== Trivial phi elimination ==========
+;;;
+;;; After CFG simplification removes edges and merges blocks, some PHI nodes
+;;; become trivial: all inputs are the same vreg, or only one predecessor
+;;; remains. Replace them with a simple substitution.
+
+(defun eliminate-trivial-phis (prog)
+  "Replace trivial PHI nodes (all inputs same, or single predecessor) with substitutions."
+  (let ((subst-map (make-hash-table))
+        (any-change nil))
+    ;; Find trivial phis
+    (dolist (block (ir-program-blocks prog))
+      (dolist (insn (basic-block-insns block))
+        (when (and (eq (ir-insn-op insn) :phi) (ir-insn-dst insn))
+          (let ((args (ir-insn-args insn)))
+            (when args
+              ;; Extract the vreg from each phi arg: (vreg (:label from))
+              (let* ((first-vreg (first (first args)))
+                     (all-same (every (lambda (a) (eql (first a) first-vreg)) (rest args))))
+                (when (or all-same (= 1 (length args)))
+                  ;; All inputs are the same vreg — phi is trivial
+                  (setf (gethash (ir-insn-dst insn) subst-map) first-vreg)
+                  (setf any-change t))))))))
+    ;; Apply substitutions and remove trivial phis
+    (when any-change
+      ;; Resolve chains: if A→B and B→C, resolve A→C
+      (let ((changed t))
+        (loop while changed do
+          (setf changed nil)
+          (maphash (lambda (k v)
+                     (let ((target (gethash v subst-map)))
+                       (when (and target (not (eql target v)))
+                         (setf (gethash k subst-map) target)
+                         (setf changed t))))
+                   subst-map)))
+      ;; Substitute all uses
+      (dolist (block (ir-program-blocks prog))
+        (dolist (insn (basic-block-insns block))
+          (setf (ir-insn-args insn)
+                (subst-vreg-args (ir-insn-args insn) subst-map))))
+      ;; Remove the trivial phi instructions
+      (dolist (block (ir-program-blocks prog))
+        (setf (basic-block-insns block)
+              (remove-if (lambda (insn)
+                           (and (eq (ir-insn-op insn) :phi)
+                                (ir-insn-dst insn)
+                                (gethash (ir-insn-dst insn) subst-map)))
+                         (basic-block-insns block)))))
+  prog))
+
+;;; ========== Redundant branch cleanup ==========
+;;;
+;;; After optimizations, br-cond may have both targets equal, or br may
+;;; jump to the immediately next block. Clean these up so DCE can remove
+;;; dead comparison operands.
+
+(defun cleanup-redundant-branches (prog)
+  "Replace br-cond with identical targets with unconditional br."
+  (let ((any-change nil))
+    (dolist (block (ir-program-blocks prog))
+      (let ((term (car (last (basic-block-insns block)))))
+        (when (and term (eq (ir-insn-op term) :br-cond))
+          (let* ((args (ir-insn-args term))
+                 (then-label (fourth args))
+                 (else-label (fifth args)))
+            ;; Both targets the same → unconditional branch
+            (when (equal then-label else-label)
+              (setf (ir-insn-op term) :br)
+              (setf (ir-insn-args term) (list then-label))
+              (setf any-change t))))))
+    (when any-change
+      (dead-code-elimination prog)))
+  prog)
+
 ;;; ========== Run all SSA optimizations ==========
+
+(defun canonicalize-ir (prog)
+  "Run cheap canonicalization passes to fixed point."
+  (let ((prev-insn-count -1))
+    (loop for iteration below 5  ; safety bound
+          for insn-count = (loop for b in (ir-program-blocks prog)
+                                 sum (length (basic-block-insns b)))
+          while (/= insn-count prev-insn-count)
+          do (setf prev-insn-count insn-count)
+             (copy-propagation prog)
+             (constant-propagation prog)
+             (eliminate-trivial-phis prog)
+             (simplify-cfg prog)
+             (dead-code-elimination prog)))
+  prog)
 
 (defun optimize-ir (prog)
   "Run all SSA optimization passes on PROG. Returns modified prog."
-  (copy-propagation prog)
-  (constant-propagation prog)
+  ;; Phase 1: Canonicalize to fixed point
+  (canonicalize-ir prog)
+
+  ;; Phase 2: Domain-specific folds (run once)
   (fold-bswap-comparisons prog)
   (fold-constant-offsets prog)
-  (simplify-cfg prog)
   (elide-tracepoint-return prog)
+
+  ;; Phase 3: Loop and memory optimizations
+  (loop-invariant-code-motion prog)
   (eliminate-common-subexpressions prog)
   (forward-stores-to-loads prog)
+
+  ;; Phase 4: Clean up after transformations
   (dead-code-elimination prog)
   (dead-destination-elimination prog)
   (dead-store-elimination prog)
+
+  ;; Phase 5: Cross-block fusions and rewrites
   (lookup-delete-fusion prog)
   (hoist-loads-before-calls prog)
   (phi-branch-threading prog)
   (bitmask-check-fusion prog)
+  (cleanup-redundant-branches prog)
+
+  ;; Phase 6: Final canonicalization after fusions
+  (canonicalize-ir prog)
+
+  ;; Phase 7: Backend preparation
   (narrow-alu-types prog)
   (split-live-ranges prog)
   prog)

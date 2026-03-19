@@ -18,16 +18,18 @@
 
 (test let-constant-folded
   "Let binding with constant should fold away"
-  (is (= 2 (w-count "(let ((x u32 42)) (return x))"))))
+  (is (= 2 (w-count "(let ((x 42)) (declare (type u32 x)) (return x))"))))
 
 (test cfg-constant-branch-folded
   "If with constant operands should fold to the taken branch"
-  (is (= 2 (w-count "(let ((x u32 10))
+  (is (= 2 (w-count "(let ((x 10))
+                        (declare (type u32 x))
                         (if (> x 5) (return 2) (return 1)))"))))
 
 (test cfg-constant-branch-false-path
   "If with false constant condition should take else branch"
-  (let ((bytes (w-body "(let ((x u32 3))
+  (let ((bytes (w-body "(let ((x 3))
+                          (declare (type u32 x))
                           (if (> x 5) (return 99) (return 42)))")))
     (is (= 42 (nth-insn-imm bytes 0))
         "Should return 42 (else branch)")))
@@ -36,8 +38,10 @@
   "Program with map-lookup should produce map relocations"
   (let ((cu (compile-single
              (read-whistler-forms
-              "(let ((key u32 0))
-                 (let ((val u64 (map-lookup m key)))
+              "(let ((key 0))
+                 (declare (type u32 key))
+                 (let ((val (map-lookup m key)))
+                   (declare (type u64 val))
                    (if val (return 1) (return 0))))")
              :maps '((m :type :array :key-size 4
                         :value-size 8 :max-entries 1)))))
@@ -114,11 +118,14 @@
   "The count-xdp pattern should compile to a valid program"
   (let ((cu (compile-single
              (read-whistler-forms
-              "(let ((key u32 0))
-                 (let ((val u64 (map-lookup pkt-count key)))
+              "(let ((key 0))
+                 (declare (type u32 key))
+                 (let ((val (map-lookup pkt-count key)))
+                   (declare (type u64 val))
                    (if val
                        (atomic-add val 0 1)
-                       (let ((init u64 1))
+                       (let ((init 1))
+                         (declare (type u64 init))
                          (map-update pkt-count key init 0)))))
                (return 2)")
              :maps '((pkt-count :type :array :key-size 4

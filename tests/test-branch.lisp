@@ -10,7 +10,8 @@
 
 (test branch-eq-imm
   "(= x 0) should emit jeq or jne (branch may be inverted)"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (= x 0) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jeq-imm+)
             (has-opcode-p bytes +jmp-jne-imm+))
@@ -18,7 +19,8 @@
 
 (test branch-neq-imm
   "(/= x 0) should emit jne or jeq (branch may be inverted)"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (/= x 0) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jne-imm+)
             (has-opcode-p bytes +jmp-jeq-imm+))
@@ -26,7 +28,8 @@
 
 (test branch-gt-unsigned
   "(> x 10) should emit unsigned jgt or jle"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (> x 10) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jgt-imm+)
             (has-opcode-p bytes +jmp-jle-imm+))
@@ -34,7 +37,8 @@
 
 (test branch-ge-unsigned
   "(>= x 10) should emit unsigned jge or jlt"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (>= x 10) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jge-imm+)
             (has-opcode-p bytes +jmp-jlt-imm+))
@@ -42,7 +46,8 @@
 
 (test branch-lt-unsigned
   "(< x 10) should emit unsigned jlt or jge"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (< x 10) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jlt-imm+)
             (has-opcode-p bytes +jmp-jge-imm+))
@@ -50,7 +55,8 @@
 
 (test branch-le-unsigned
   "(<= x 10) should emit unsigned jle or jgt"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (<= x 10) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jle-imm+)
             (has-opcode-p bytes +jmp-jgt-imm+))
@@ -60,7 +66,8 @@
 
 (test branch-sgt
   "(s> x 10) should emit signed jsgt or jsle"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (s> x 10) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jsgt-imm+)
             (has-opcode-p bytes +jmp-jsle-imm+))
@@ -68,7 +75,8 @@
 
 (test branch-sge
   "(s>= x 10) should emit signed jsge or jslt"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (s>= x 10) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jsge-imm+)
             (has-opcode-p bytes +jmp-jslt-imm+))
@@ -76,7 +84,8 @@
 
 (test branch-slt
   "(s< x 10) should emit signed jslt or jsge"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (s< x 10) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jslt-imm+)
             (has-opcode-p bytes +jmp-jsge-imm+))
@@ -84,7 +93,8 @@
 
 (test branch-sle
   "(s<= x 10) should emit signed jsle or jsgt"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (if (s<= x 10) (return 1) (return 0)))")))
     (is (or (has-opcode-p bytes +jmp-jsle-imm+)
             (has-opcode-p bytes +jmp-jsgt-imm+))
@@ -94,7 +104,8 @@
 
 (test when-compiles
   "(when cond body) should compile without error"
-  (let ((n (w-count "(let ((x u64 (ctx-load u64 0)))
+  (let ((n (w-count "(let ((x (ctx-load u64 0)))
+                       (declare (type u64 x))
                        (when (> x 0)
                          (return 1)))
                      (return 0)")))
@@ -102,7 +113,8 @@
 
 (test unless-compiles
   "(unless cond body) should compile without error"
-  (let ((n (w-count "(let ((x u64 (ctx-load u64 0)))
+  (let ((n (w-count "(let ((x (ctx-load u64 0)))
+                       (declare (type u64 x))
                        (unless (= x 0)
                          (return 1)))
                      (return 0)")))
@@ -110,7 +122,8 @@
 
 (test nested-if
   "Nested if/else should compile without error"
-  (let ((n (w-count "(let ((x u64 (ctx-load u64 0)))
+  (let ((n (w-count "(let ((x (ctx-load u64 0)))
+                       (declare (type u64 x))
                        (if (> x 100)
                            (if (> x 200)
                                (return 3)
@@ -124,8 +137,10 @@
 
 (test helper-call-emits-call-insn
   "map-lookup should emit a BPF call instruction"
-  (let ((bytes (w-body "(let ((key u32 0))
-                          (let ((val u64 (map-lookup m key)))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((val (map-lookup m key)))
+                            (declare (type u64 val))
                             (if val (return 1) (return 0))))"
                        :maps '((m :type :array :key-size 4
                                    :value-size 8 :max-entries 1)))))

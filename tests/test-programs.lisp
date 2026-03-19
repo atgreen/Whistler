@@ -29,7 +29,8 @@
 
 (test ringbuf-reserve-compiles
   "ringbuf-reserve should compile"
-  (let ((n (w-count "(let ((ptr u64 (ringbuf-reserve rb 64 0)))
+  (let ((n (w-count "(let ((ptr (ringbuf-reserve rb 64 0)))
+                       (declare (type u64 ptr))
                        (if ptr (return 1) (return 0)))"
                     :maps '((rb :type :ringbuf :key-size 0
                                 :value-size 0 :max-entries 4096)))))
@@ -110,8 +111,10 @@
   "ELF with maps should have a maps section"
   (let* ((cu (compile-single
               (read-whistler-forms
-               "(let ((key u32 0))
-                  (let ((val u64 (map-lookup m key)))
+               "(let ((key 0))
+                  (declare (type u32 key))
+                  (let ((val (map-lookup m key)))
+                    (declare (type u64 val))
                     (if val (return 1) (return 0))))")
               :maps '((m :type :array :key-size 4
                          :value-size 8 :max-entries 1))))

@@ -10,35 +10,40 @@
 
 (test load-u8-emits-ldxb
   "Loading u8 should emit ldxb (opcode 0x71)"
-  (let ((bytes (w-body "(let ((x u8 (ctx-load u8 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u8 0)))
+                          (declare (type u8 x))
                           (return x))")))
     (is (has-opcode-p bytes +ldxb+)
         "Expected ldxb (0x71) for u8 load")))
 
 (test load-u16-emits-ldxh
   "Loading u16 should emit ldxh (opcode 0x69)"
-  (let ((bytes (w-body "(let ((x u16 (ctx-load u16 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u16 0)))
+                          (declare (type u16 x))
                           (return x))")))
     (is (has-opcode-p bytes +ldxh+)
         "Expected ldxh (0x69) for u16 load")))
 
 (test load-u32-emits-ldxw
   "Loading u32 should emit ldxw (opcode 0x61)"
-  (let ((bytes (w-body "(let ((x u32 (ctx-load u32 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u32 0)))
+                          (declare (type u32 x))
                           (return x))")))
     (is (has-opcode-p bytes +ldxw+)
         "Expected ldxw (0x61) for u32 load")))
 
 (test load-u64-emits-ldxdw
   "Loading u64 should emit ldxdw (opcode 0x79)"
-  (let ((bytes (w-body "(let ((x u64 (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+                          (declare (type u64 x))
                           (return x))")))
     (is (has-opcode-p bytes +ldxdw+)
         "Expected ldxdw (0x79) for u64 load")))
 
 (test load-with-offset
   "Loading with non-zero offset encodes the offset correctly"
-  (let ((bytes (w-body "(let ((x u32 (ctx-load u32 16)))
+  (let ((bytes (w-body "(let ((x (ctx-load u32 16)))
+                          (declare (type u32 x))
                           (return x))")))
     (let ((idx (find-opcode bytes +ldxw+)))
       (is (not (null idx)) "Expected ldxw instruction")
@@ -53,8 +58,10 @@
 
 (test store-u32-emits-stw
   "Storing u32 should emit stxw (0x63) or stw (0x62)"
-  (let ((bytes (w-body "(let ((key u32 0))
-                          (let ((p u64 (map-lookup my-map key)))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((p (map-lookup my-map key)))
+                            (declare (type u64 p))
                             (when p
                               (store u32 p 0 12345)))
                           (return 0))"
@@ -66,8 +73,10 @@
 
 (test store-u64-emits-stdw
   "Storing u64 should emit stxdw (0x7b) or stdw (0x7a)"
-  (let ((bytes (w-body "(let ((key u32 0))
-                          (let ((p u64 (map-lookup my-map key)))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((p (map-lookup my-map key)))
+                            (declare (type u64 p))
                             (when p
                               (store u64 p 0 99)))
                           (return 0))"

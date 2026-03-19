@@ -9,7 +9,8 @@
 
 (test atomic-add-u64-emits-dw
   "atomic-add on a u64 value should emit 64-bit atomic (opcode 0xdb)"
-  (let ((bytes (w-body "(let ((key u32 0))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
                           (when-let ((p u64 (map-lookup cnt key)))
                             (atomic-add p 0 1))
                           (return 0))"
@@ -20,7 +21,8 @@
 
 (test atomic-add-u32-emits-w
   "atomic-add with u32 type should emit 32-bit atomic (opcode 0xc3)"
-  (let ((bytes (w-body "(let ((key u32 0))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
                           (when-let ((p u64 (map-lookup cnt key)))
                             (atomic-add p 0 1 u32))
                           (return 0))"
@@ -31,7 +33,8 @@
 
 (test atomic-add-default-is-u64
   "atomic-add without explicit type should default to 64-bit"
-  (let ((bytes (w-body "(let ((key u32 0))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
                           (when-let ((p u64 (map-lookup cnt key)))
                             (atomic-add p 0 1))
                           (return 0))"

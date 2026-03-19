@@ -6,8 +6,10 @@
 
 (test map-lookup-array
   "Array map lookup should emit map_lookup_elem helper call"
-  (let ((bytes (w-body "(let ((key u32 0))
-                          (let ((val u64 (map-lookup m key)))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((val (map-lookup m key)))
+                            (declare (type u64 val))
                             (if val (return 1) (return 0))))"
                        :maps '((m :type :array :key-size 4
                                    :value-size 8 :max-entries 1)))))
@@ -19,8 +21,10 @@
 
 (test map-lookup-hash
   "Hash map lookup should also emit map_lookup_elem"
-  (let ((bytes (w-body "(let ((key u32 0))
-                          (let ((val u64 (map-lookup m key)))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((val (map-lookup m key)))
+                            (declare (type u64 val))
                             (if val (return 1) (return 0))))"
                        :maps '((m :type :hash :key-size 4
                                    :value-size 8 :max-entries 256)))))
@@ -30,8 +34,9 @@
 
 (test map-update-emits-helper-2
   "map-update should emit map_update_elem (helper 2)"
-  (let ((bytes (w-body "(let ((key u32 0)
-                              (val u64 42))
+  (let ((bytes (w-body "(let ((key 0)
+                              (val 42))
+                          (declare (type u32 key) (type u64 val))
                           (map-update m key val 0)
                           (return 0))"
                        :maps '((m :type :hash :key-size 4
@@ -50,7 +55,8 @@
 
 (test map-delete-emits-helper-3
   "map-delete should emit map_delete_elem (helper 3)"
-  (let ((bytes (w-body "(let ((key u32 0))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
                           (map-delete m key)
                           (return 0))"
                        :maps '((m :type :hash :key-size 4
@@ -88,8 +94,10 @@
 
 (test percpu-array-compiles
   "percpu-array map should compile"
-  (let ((bytes (w-body "(let ((key u32 0))
-                          (let ((val u64 (map-lookup m key)))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((val (map-lookup m key)))
+                            (declare (type u64 val))
                             (if val (return 1) (return 0))))"
                        :maps '((m :type :percpu-array :key-size 4
                                    :value-size 8 :max-entries 4)))))
@@ -97,8 +105,10 @@
 
 (test percpu-hash-compiles
   "percpu-hash map should compile"
-  (let ((bytes (w-body "(let ((key u32 0))
-                          (let ((val u64 (map-lookup m key)))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((val (map-lookup m key)))
+                            (declare (type u64 val))
                             (if val (return 1) (return 0))))"
                        :maps '((m :type :percpu-hash :key-size 4
                                    :value-size 8 :max-entries 256)))))
