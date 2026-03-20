@@ -202,7 +202,7 @@
          (dolist (expr args) (setf result (lower-expr ctx expr)))
          result))
 
-      ((sym= head 'let)
+      ((or (sym= head 'let) (sym= head 'let*))
        (lower-let ctx (first args) (rest args)))
 
       ((sym= head 'if)

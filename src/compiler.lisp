@@ -109,7 +109,7 @@
 ;;; Builtin form recognition
 
 (defparameter *whistler-builtins*
-  '("PROGN" "LET" "IF" "RETURN" "LOAD" "STORE" "ATOMIC-ADD"
+  '("PROGN" "LET" "LET*" "IF" "RETURN" "LOAD" "STORE" "ATOMIC-ADD"
     "MAP-LOOKUP" "MAP-UPDATE" "MAP-DELETE" "CTX-LOAD"
     "CORE-LOAD" "CORE-STORE" "CORE-CTX-LOAD"
     "MAP-UPDATE-PTR" "MAP-DELETE-PTR"
@@ -123,7 +123,7 @@
 ;; macro expansion of forms like (+ a b) and (= a b))
 (defparameter *alu-op-names*
   '("+" "-" "*" "/" "MOD" "LOGIOR" "LOGAND" "LOGXOR"
-    "BIT-OR" "BIT-AND" "BIT-XOR" "ASH-LEFT" "ASH-RIGHT" "ASH-RIGHT-SIGNED"
+    "BIT-OR" "BIT-AND" "BIT-XOR" "ASH" "ASH-LEFT" "ASH-RIGHT" "ASH-RIGHT-SIGNED"
     "<<" ">>" ">>>"))
 
 (defparameter *jmp-op-names*
@@ -158,8 +158,8 @@
            ;; Known Whistler form — don't macroexpand it, just recurse into subforms
            (let ((head (car form)))
              (cond
-               ;; (let ((var [type] init) ...) body...) — expand inits and body
-               ((sym= head 'let)
+               ;; (let/let* ((var [type] init) ...) body...) — expand inits and body
+               ((or (sym= head 'let) (sym= head 'let*))
                 (let ((bindings (mapcar (lambda (b)
                                          (cond
                                            ;; 3-element: (var type init) — typed
