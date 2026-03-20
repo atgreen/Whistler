@@ -91,7 +91,15 @@
 
 (defun peephole-eliminate-redundant-movs (insns)
   "Remove mov rX, rX instructions."
-  (remove-if #'bpf-self-mov-p insns))
+  (let* ((vec (coerce insns 'vector))
+         (len (length vec))
+         (to-delete (make-hash-table)))
+    (loop for i from 0 below len
+          when (bpf-self-mov-p (aref vec i))
+          do (setf (gethash i to-delete) t))
+    (if (plusp (hash-table-count to-delete))
+        (reindex-after-deletion vec to-delete)
+        insns)))
 
 ;;; ========== Branch inversion ==========
 ;;; Pattern: jCC rX, Y, +1; ja +N → j!CC rX, Y, +N
