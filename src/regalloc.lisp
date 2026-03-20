@@ -272,10 +272,14 @@
           (setf (gethash ctx-vreg result) '(:reg 6))))
 
     ;; Add the ctx interval to the appropriate active set so it blocks
-    ;; other intervals from being assigned the same register
+    ;; other intervals from being assigned the same register.
+    ;; When ctx is saved to R6, extend the interval to cover the entire
+    ;; program so R6 is never freed — the emitter uses R6 for all ctx-loads.
     (when (and ctx-vreg ctx-used)
       (let ((ctx-interval (find ctx-vreg intervals :key #'live-interval-vreg)))
         (when ctx-interval
+          (when ctx-needs-save
+            (setf (live-interval-end ctx-interval) most-positive-fixnum))
           (setf (live-interval-phys ctx-interval)
                 (if ctx-early '(:reg 1) '(:reg 6)))
           (if (or ctx-needs-save (live-interval-spans-call-p ctx-interval))
@@ -420,18 +424,23 @@
   "Find the best interval to spill from ACTIVE.
    Prefer spilling cheap values (rematerializable, helper-setup) over
    expensive ones (packet pointers, hot scalars).  Among equal cost,
-   pick the one whose end is farthest away."
+   pick the one whose end is farthest away.
+   Never spill intervals with infinite end (ctx saved to R6)."
   (declare (ignore new-interval))
-  (when active
-    (reduce (lambda (a b)
-              (let ((ca (spill-cost a))
-                    (cb (spill-cost b)))
-                (cond ((< ca cb) a)       ; a is cheaper to spill
-                      ((> ca cb) b)       ; b is cheaper to spill
-                      (t                  ; same cost — farthest end
-                       (if (> (live-interval-end a) (live-interval-end b))
-                           a b)))))
-            active)))
+  ;; Filter out non-spillable intervals (ctx with infinite lifetime)
+  (let ((candidates (remove-if (lambda (i)
+                                 (= (live-interval-end i) most-positive-fixnum))
+                               active)))
+    (when candidates
+      (reduce (lambda (a b)
+                (let ((ca (spill-cost a))
+                      (cb (spill-cost b)))
+                  (cond ((< ca cb) a)       ; a is cheaper to spill
+                        ((> ca cb) b)       ; b is cheaper to spill
+                        (t                  ; same cost — farthest end
+                         (if (> (live-interval-end a) (live-interval-end b))
+                             a b)))))
+              candidates))))
 
 (defun alloc-spill-slot (current-offset)
   "Allocate 8 bytes on the stack. CURRENT-OFFSET is a negative offset (or 0).
