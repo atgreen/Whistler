@@ -1447,6 +1447,9 @@
                (when (and safe end-j)
                  (loop for j from (1+ i) to end-j
                        for next = (aref vec j)
+                       ;; Skip JA instructions — they don't use register fields
+                       ;; and the BPF verifier rejects non-zero reserved fields.
+                       unless (bpf-unconditional-jmp-p next)
                        do (when (= (whistler/bpf:bpf-insn-dst next) ra)
                             (setf (whistler/bpf:bpf-insn-dst next) rb))
                           (when (= (whistler/bpf:bpf-insn-src next) ra)
