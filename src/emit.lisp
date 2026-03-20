@@ -681,7 +681,13 @@
                        whistler/bpf:+bpf-reg-10+ dst-reg (cadr dst-loc))))))
 
 (defun emit-ctx-load-insn (ctx dst args)
-  (let* ((ctx-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+))
+  ;; When ctx was saved to R6 (not early), use R6 directly instead of
+  ;; looking up the ctx vreg's allocation — which may be a stack spill
+  ;; that hasn't been initialized.
+  (let* ((ctx-early (ctx-loads-early-p (emit-ctx-ir-prog ctx)))
+         (ctx-reg (if ctx-early
+                      (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+)
+                      whistler/bpf:+bpf-reg-6+))
          (off (imm-arg-value (second args)))
          (type-kw (type-arg-name (third args)))
          (bpf-size (ir-type-to-bpf-size type-kw))
