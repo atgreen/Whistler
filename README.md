@@ -189,10 +189,15 @@ is specified:
 ### Variable bindings
 
 ```lisp
-;; Standard CL let bindings — types default to u64.
-(let ((x 42)
-      (y (+ x 1))
-      (ptr (map-lookup my-map x)))
+;; let evaluates all inits before binding (standard CL semantics).
+(let ((x (load u32 ptr 0))
+      (y (load u32 ptr 4)))
+  body...)
+
+;; let* binds sequentially — each init can reference prior bindings.
+(let* ((x 42)
+       (y (+ x 1))
+       (ptr (map-lookup my-map x)))
   body...)
 
 ;; Use (declare (type ...)) for sub-64-bit narrowing, just like CL.
