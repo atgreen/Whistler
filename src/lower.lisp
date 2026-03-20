@@ -202,8 +202,11 @@
          (dolist (expr args) (setf result (lower-expr ctx expr)))
          result))
 
-      ((or (sym= head 'let) (sym= head 'let*))
+      ((sym= head 'let)
        (lower-let ctx (first args) (rest args)))
+
+      ((sym= head 'let*)
+       (lower-let* ctx (first args) (rest args)))
 
       ((sym= head 'if)
        (lower-if ctx (first args) (second args) (third args)))
@@ -416,28 +419,54 @@
              (setf remaining (rest remaining)))
     (values type-alist remaining)))
 
+(defun lower-one-binding (ctx var parsed-type declared-type init)
+  "Lower a single let/let* binding. Returns (var type vreg)."
+  (let ((type (or parsed-type declared-type 'u64)))
+    (if init
+        (if (integerp init)
+            (let ((vreg (ctx-fresh-vreg ctx)))
+              (ctx-emit ctx :mov vreg (list `(:imm ,init)) type)
+              (list var type vreg))
+            (let ((vreg (lower-expr ctx init)))
+              (list var type vreg)))
+        (let ((vreg (ctx-fresh-vreg ctx)))
+          (ctx-emit ctx :mov vreg (list '(:imm 0)) type)
+          (list var type vreg)))))
+
 (defun lower-let (ctx bindings body)
-  ;; Extract (declare (type ...)) forms from the start of body
+  "Lower CL-style let: evaluate all inits before binding any variables."
+  (multiple-value-bind (type-decls actual-body) (extract-type-declarations body)
+    (let ((saved-env (lower-ctx-env ctx)))
+      ;; Phase 1: lower all init expressions in the CURRENT environment
+      (let ((lowered (mapcar (lambda (binding)
+                               (multiple-value-bind (var parsed-type init)
+                                   (parse-let-binding binding)
+                                 (let ((declared (cdr (assoc (symbol-name var) type-decls
+                                                             :key #'symbol-name
+                                                             :test #'string=))))
+                                   (lower-one-binding ctx var parsed-type declared init))))
+                             bindings)))
+        ;; Phase 2: bind all variables at once
+        (dolist (entry lowered)
+          (destructuring-bind (var type vreg) entry
+            (ctx-bind-var ctx var type vreg))))
+      (let ((result nil))
+        (dolist (form actual-body)
+          (setf result (lower-expr ctx form)))
+        (setf (lower-ctx-env ctx) saved-env)
+        result))))
+
+(defun lower-let* (ctx bindings body)
+  "Lower CL-style let*: evaluate and bind each variable sequentially."
   (multiple-value-bind (type-decls actual-body) (extract-type-declarations body)
     (let ((saved-env (lower-ctx-env ctx)))
       (dolist (binding bindings)
         (multiple-value-bind (var parsed-type init) (parse-let-binding binding)
-          ;; Priority: inline type > declare type > inferred type > u64
-          (let* ((declared (cdr (assoc (symbol-name var) type-decls
-                                       :key #'symbol-name :test #'string=)))
-                 (type (or parsed-type declared 'u64)))
-            (if init
-                ;; Use declared type for integer literals so stack allocation
-                ;; uses the right size (e.g., u32 gets 4 bytes, not 8)
-                (if (integerp init)
-                    (let ((vreg (ctx-fresh-vreg ctx)))
-                      (ctx-emit ctx :mov vreg (list `(:imm ,init)) type)
-                      (ctx-bind-var ctx var type vreg))
-                    (let ((vreg (lower-expr ctx init)))
-                      (ctx-bind-var ctx var type vreg)))
-                (let ((vreg (ctx-fresh-vreg ctx)))
-                  (ctx-emit ctx :mov vreg (list '(:imm 0)) type)
-                  (ctx-bind-var ctx var type vreg))))))
+          (let ((declared (cdr (assoc (symbol-name var) type-decls
+                                       :key #'symbol-name :test #'string=))))
+            (destructuring-bind (v type vreg)
+                (lower-one-binding ctx var parsed-type declared init)
+              (ctx-bind-var ctx v type vreg)))))
       (let ((result nil))
         (dolist (form actual-body)
           (setf result (lower-expr ctx form)))

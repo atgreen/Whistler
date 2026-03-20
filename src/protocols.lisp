@@ -208,8 +208,8 @@
             (let ((k (gensym "K"))
                   (p (gensym "P"))
                   (init (gensym "INIT")))
-              `(let ((,k u32 ,key-form)
-                     (,p u64 (map-lookup ,map ,k)))
+              `(let* ((,k u32 ,key-form)
+                      (,p u64 (map-lookup ,map ,k)))
                  (if ,p
                      (atomic-add ,p 0 ,delta ,vtype)
                      (let ((,init ,vtype ,delta))

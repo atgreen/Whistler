@@ -222,8 +222,9 @@ Types are inferred from initializers when possible: `(load u32 ...)` → u32,
 to u64. Use `(declare (type TYPE var ...))` at the start of the let body
 when the type cannot be inferred (integer literals, arithmetic results).
 
-Bindings are sequential — each initializer can reference prior bindings
-in the same `let` (like CL `let*`).
+`let` evaluates all init forms before binding any variables (standard CL
+semantics). Use `let*` when each initializer needs to reference prior
+bindings in the same form.
 
 ### Mutation
 
