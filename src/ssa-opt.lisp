@@ -372,16 +372,11 @@
 ;;; DCE can eliminate dead return-value setup code.
 
 (defun elide-tracepoint-return (prog)
-  "For tracepoint programs, clear ret value operands."
-  (let ((section (ir-program-section prog)))
-    (when (and (stringp section)
-               (or (search "tracepoint" section)
-                   (search "kprobe" section)
-                   (search "raw_tp" section)))
-      (dolist (block (ir-program-blocks prog))
-        (dolist (insn (basic-block-insns block))
-          (when (eq (ir-insn-op insn) :ret)
-            (setf (ir-insn-args insn) '()))))))
+  "For tracepoint/kprobe programs, the kernel ignores the return value.
+   However, the BPF verifier still requires R0 to be set before exit.
+   Keep ret args intact so the emitter generates mov r0, val; exit."
+  ;; No-op: previously cleared ret args, but that caused verifier
+  ;; failures (R0 !read_ok) when helper calls clobbered R0 before exit.
   prog)
 
 ;;; ========== Context load analysis ==========
