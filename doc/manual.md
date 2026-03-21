@@ -103,7 +103,7 @@ The kernel's BPF verifier enforces:
 ### defmap
 
 ```lisp
-(defmap name :type TYPE :key-size N :value-size N :max-entries N
+(defmap name :type TYPE [:key-size N] [:value-size N] :max-entries N
         [:map-flags FLAGS])
 ```
 
@@ -112,10 +112,15 @@ Declares a BPF map. Emitted as a map definition in the ELF `maps` section.
 **Parameters:**
 - `:type` — One of `:hash`, `:array`, `:percpu-hash`, `:percpu-array`,
   `:ringbuf`, `:prog-array`, `:lpm-trie`
-- `:key-size` — Key size in bytes
-- `:value-size` — Value size in bytes
+- `:key-size` — Key size in bytes (default 0, omit for ringbuf)
+- `:value-size` — Value size in bytes (default 0, omit for ringbuf)
 - `:max-entries` — Maximum number of entries
 - `:map-flags` — Optional flags (e.g., `1` for `BPF_F_NO_PREALLOC` with LPM trie)
+
+Ring buffer maps only need type and max-entries:
+```lisp
+(defmap events :type :ringbuf :max-entries 262144)
+```
 
 ### defprog
 
@@ -230,9 +235,16 @@ bindings in the same form.
 
 ```lisp
 (setf var expr)
+(setf place1 val1 place2 val2 ...)   ; multi-pair, like CL
 ```
 
-Updates a bound variable. Works for both register and stack variables.
+Updates bound variables or struct fields. Multi-pair `setf` evaluates and
+assigns each pair left to right. Works with accessor places:
+
+```lisp
+(setf (my-struct-field ptr) 42
+      (my-struct-other ptr) 0)
+```
 
 ### Control flow
 

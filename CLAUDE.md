@@ -61,9 +61,13 @@ Programs are defined with `defprog`, maps with `defmap`, structs with `defstruct
 
 Use `(declare (type ...))` for narrowing when inference can't determine the type (integer literals, arithmetic results).
 
-Key forms: `let` (parallel bindings, standard CL), `let*` (sequential bindings), `if`, `when`, `unless`, `when-let`, `if-let`, `return`, `load`, `store`, `logand`, `logxor`, `>>`, `ash`, `cast`, `map-lookup`, `map-update`, `map-delete`, `map-lookup-ptr`, `struct-alloc`, `stack-addr`, `tail-call`, `get-prandom-u32`, `sizeof`, `memset`, `memcpy`, `do-user-ptrs`, `do-user-array`, `pt-regs-parm1`..`parm6`, `pt-regs-ret`, protocol accessors.
+Key forms: `let` (parallel bindings, standard CL), `let*` (sequential bindings), `if`, `when`, `unless`, `when-let`, `if-let`, `return`, `load`, `store`, `logand`, `logxor`, `>>`, `ash`, `cast`, `map-lookup`, `map-update`, `map-delete`, `map-lookup-ptr`, `struct-alloc`, `stack-addr`, `tail-call`, `get-prandom-u32`, `sizeof`, `memset`, `memcpy`, `do-user-ptrs`, `do-user-array`, `with-ringbuf`, `fill-process-info`, `pt-regs-parm1`..`parm6`, `pt-regs-ret`, protocol accessors.
+
+`setf` supports CL-style multi-pair: `(setf place1 val1 place2 val2 ...)`. `defmap` defaults `:key-size` and `:value-size` to 0 (omit for ringbuf maps).
 
 `defstruct` generates CL-style accessors `(name-field ptr)` and `setf` expanders `(setf (name-field ptr) val)`. Array fields `(field (array u8 16))` generate indexed accessors `(name-field ptr idx)` with `setf`, and pointer accessors `(name-field-ptr ptr)` for passing to helpers. `(sizeof name)` returns compile-time struct size. Maps support `(getmap m k)` / `(setf (getmap m k) v)` / `(remmap m k)` — matching CL's gethash/remhash pattern.
+
+`with-ringbuf` handles reserve/null-check/submit: `(with-ringbuf (var map size) body...)`. `fill-process-info` fills pid/uid/timestamp/comm from BPF helpers using struct accessor names.
 
 Memory ops: `(memset ptr off val n)` with widened stores, `(memcpy dst doff src soff n)` with wide load/store pairs. `(pt-regs-parm1)` through `(pt-regs-parm6)` and `(pt-regs-ret)` for x86-64 uprobe/kprobe context access.
 

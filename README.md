@@ -206,8 +206,10 @@ is specified:
   (declare (type u16 port) (type u8 flags))
   ...)
 
-;; setf mutates a bound variable
+;; setf mutates a bound variable — supports multi-pair like CL
 (setf x (+ x 1))
+(setf (my-struct-a ptr) 1
+      (my-struct-b ptr) 2)
 ```
 
 Types default to `u64` when omitted. Use `(declare (type ...))` for sub-64-bit
@@ -360,6 +362,27 @@ Iterate over user-space arrays without manual pointer arithmetic:
 
 Both require a compile-time `max-count` for the BPF verifier and a runtime
 `count` for the actual bound. Supply `:index name` to use the loop index.
+
+### Ring Buffer
+
+```lisp
+;; Reserve, execute body, auto-submit on normal exit
+(with-ringbuf (event events (sizeof my-event))
+  (setf (my-event-type event) 1)
+  ...)
+;; No manual ringbuf-reserve / ringbuf-submit needed
+```
+
+### Process Metadata
+
+```lisp
+;; Fill pid, uid, timestamp, and comm in one form
+(fill-process-info event
+  :pid-field my-event-pid
+  :uid-field my-event-uid
+  :timestamp-field my-event-timestamp
+  :comm-field my-event-comm-ptr)
+```
 
 ### pt_regs access (x86-64)
 
