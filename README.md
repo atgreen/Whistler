@@ -91,8 +91,12 @@ any loader (bpftool, libbpf, ip link) can load.
 `--gen lisp` generate matching struct definitions from your `defstruct`
 declarations — one source of truth for BPF and userspace.
 
-**The whole compiler is ~5,500 lines.** You can read it in an afternoon. Compare
-with the clang/LLVM BPF backend. When the verifier rejects your program, you
+**Pure CL userspace loader.** `whistler/loader` loads `.bpf.o` into the kernel,
+attaches probes, reads maps, and consumes ring buffers — no libbpf, no C.
+Or use `with-bpf-session` to compile and load BPF inline, in one Lisp form.
+
+**The whole project is ~7,000 lines.** Compiler, loader, and session runtime.
+You can read it in an afternoon. When the verifier rejects your program, you
 can read the compiler to understand exactly what bytecode was generated and why.
 
 ### Compared to alternatives
@@ -848,6 +852,61 @@ int synflood(struct xdp_md *ctx) {
 
 </td></tr>
 </table>
+
+## Userspace loader (`whistler/loader`)
+
+A pure Common Lisp BPF loader — no libbpf, no CFFI, no C dependencies.
+Load `.bpf.o` files, create maps, attach probes, and consume ring buffers
+from SBCL:
+
+```lisp
+(asdf:load-system "whistler/loader")
+
+(whistler/loader:with-bpf-object (obj "my-probes.bpf.o")
+  (whistler/loader:attach-obj-kprobe obj "trace_execve" "__x64_sys_execve")
+  (let* ((map (whistler/loader:bpf-object-map obj "stats"))
+         (val (whistler/loader:map-lookup map #(0 0 0 0))))
+    (when val
+      (format t "count: ~d~%" (whistler/loader:decode-int-value val)))))
+```
+
+### Inline BPF sessions
+
+Write BPF programs and userspace code in the same Lisp form. The BPF code
+compiles at macroexpand time; the bytecode is embedded as a literal:
+
+```lisp
+(whistler/loader:with-bpf-session ()
+  ;; Kernel side — compiled to eBPF at macroexpand time
+  (bpf:map counter :type :hash :key-size 4 :value-size 8 :max-entries 1024)
+  (bpf:prog trace (:type :kprobe :section "kprobe/__x64_sys_execve" :license "GPL")
+    (incf (getmap counter 0))
+    0)
+
+  ;; Userspace side — normal CL at runtime
+  (bpf:attach trace "__x64_sys_execve")
+  (loop (sleep 1)
+        (format t "count: ~d~%" (bpf:map-ref counter 0))))
+```
+
+No `.bpf.o` files, no build step, no separate loader binary. One file, one language.
+
+### Struct decode/encode
+
+`whistler:defstruct` generates both BPF macros and a CL struct with
+byte-level codec — one definition serves both kernel and userspace:
+
+```lisp
+(whistler:defstruct my-event
+  (pid u32) (comm (array u8 16)) (data u64))
+
+;; BPF side: (make-my-event), (my-event-pid ptr), (setf (my-event-pid ptr) val)
+;; CL side:  (decode-my-event bytes) → my-event-record struct
+;;           (my-event-record-pid rec), (my-event-record-comm rec)
+;;           (encode-my-event rec) → bytes (round-trips perfectly)
+```
+
+See `examples/ffi-call-tracker.lisp` for a complete standalone example.
 
 ## Internals
 

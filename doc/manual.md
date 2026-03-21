@@ -154,16 +154,26 @@ Defines a BPF struct with C-compatible layout (natural alignment, padding).
 Field types can be scalar (`u8`, `u16`, `u32`, `u64`) or fixed-size arrays
 (`(array type count)`).
 
-Generates:
+Generates for BPF:
 
 - `(make-NAME)` — Allocates the struct on the stack, returns a pointer.
-- `(NAME-FIELD ptr)` — Reads a scalar field. Emits CO-RE relocations.
-- `(setf (NAME-FIELD ptr) val)` — Writes a scalar field. Emits CO-RE relocations.
+- `(NAME-FIELD ptr)` — Reads a scalar field.
+- `(setf (NAME-FIELD ptr) val)` — Writes a scalar field (auto-truncates to field width).
 - `(NAME-FIELD ptr idx)` — Reads an array element. Constant indices fold to
   fixed offsets; runtime indices compute the offset dynamically.
 - `(setf (NAME-FIELD ptr idx) val)` — Writes an array element.
 - `(NAME-FIELD-PTR ptr)` — Returns a pointer to the array field start.
   Useful for passing to BPF helpers.
+
+Generates for CL userspace:
+
+- `NAME-RECORD` — CL `defstruct` with matching slots.
+- `(decode-NAME bytes)` — Decode a byte array into a `NAME-RECORD` struct.
+- `(encode-NAME record)` — Encode a `NAME-RECORD` back to bytes.
+- `(NAME-RECORD-FIELD record)` — Standard CL struct accessors.
+
+This lets both BPF code and userspace decode the same struct layout from
+a single definition.
 
 Example:
 
@@ -798,3 +808,70 @@ whistler disasm INPUT                       # disassemble to stdout
 
 When `-o` is omitted, the output path is derived from the input file
 (`.lisp` → `.bpf.o`).
+
+## Userspace loader (`whistler/loader`)
+
+A pure Common Lisp BPF loader. No libbpf, no CFFI — uses SBCL's `sb-alien`
+for direct syscall access.
+
+### Loading `.bpf.o` files
+
+```lisp
+(asdf:load-system "whistler/loader")
+
+;; Load and auto-close
+(whistler/loader:with-bpf-object (obj "my-prog.bpf.o")
+  ;; obj has maps created, programs loaded
+  ...)
+
+;; Or manual lifecycle
+(let ((obj (whistler/loader:open-bpf-object "my-prog.bpf.o")))
+  (whistler/loader:load-bpf-object obj)
+  ...
+  (whistler/loader:close-bpf-object obj))
+```
+
+### Attachment
+
+```lisp
+(whistler/loader:attach-kprobe prog-fd function-name)
+(whistler/loader:attach-uprobe prog-fd binary-path symbol-name)
+(whistler/loader:attach-xdp prog-fd interface-name)
+```
+
+### Map operations
+
+```lisp
+(whistler/loader:map-lookup map-info key-bytes)    ; → value-bytes or nil
+(whistler/loader:map-update map-info key val)
+(whistler/loader:map-delete map-info key)
+(whistler/loader:map-get-next-key map-info key)    ; → next-key or nil
+```
+
+### Ring buffer
+
+```lisp
+(let ((consumer (whistler/loader:open-ring-consumer map-info callback)))
+  (loop (whistler/loader:ring-poll consumer :timeout-ms 1000))
+  (whistler/loader:close-ring-consumer consumer))
+```
+
+### Inline BPF sessions
+
+Compile BPF code at macroexpand time and load at runtime — no files:
+
+```lisp
+(whistler/loader:with-bpf-session ()
+  ;; BPF side (compiled at macroexpand time, bytecode embedded as literal)
+  (bpf:map stats :type :hash :key-size 4 :value-size 8 :max-entries 1024)
+  (bpf:prog counter (:type :kprobe :section "kprobe/..." :license "GPL")
+    (incf (getmap stats 0)) 0)
+
+  ;; CL side (normal runtime code)
+  (bpf:attach counter "__x64_sys_execve")
+  (loop (sleep 1) (format t "~d~%" (bpf:map-ref stats 0))))
+```
+
+The `bpf:` prefix separates kernel-side forms from userspace code. The
+compiler runs during macroexpansion; the expanded code contains the raw
+bytecode as a literal array. `unwind-protect` closes all resources on exit.
