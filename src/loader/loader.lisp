@@ -87,6 +87,17 @@
       (setf (map-info-fd m) -1)))
   (setf (bpf-object-attachments obj) nil))
 
+;;; ========== with-bpf-object ==========
+
+(defmacro with-bpf-object ((var pathname) &body body)
+  "Open, load, and execute BODY with VAR bound to a loaded bpf-object.
+   Automatically closes all BPF resources (maps, programs, attachments)
+   on normal exit or error."
+  `(let ((,var (load-bpf-object (open-bpf-object ,pathname))))
+     (unwind-protect
+          (progn ,@body)
+       (close-bpf-object ,var))))
+
 ;;; ========== Accessors ==========
 
 (defun bpf-object-map (obj name)

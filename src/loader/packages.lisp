@@ -9,7 +9,7 @@
   (:use #:cl)
   (:export
    ;; Top-level
-   #:open-bpf-object #:load-bpf-object #:close-bpf-object
+   #:with-bpf-object #:open-bpf-object #:load-bpf-object #:close-bpf-object
    ;; Accessors
    #:bpf-object-map #:bpf-object-prog
    ;; Map operations
