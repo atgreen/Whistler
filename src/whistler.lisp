@@ -303,8 +303,9 @@
 
 ;;; User-facing macros for defining maps and programs
 
-(defmacro defmap (name &key type key-size value-size max-entries (map-flags 0))
-  "Define a BPF map."
+(defmacro defmap (name &key type (key-size 0) (value-size 0) max-entries (map-flags 0))
+  "Define a BPF map. KEY-SIZE and VALUE-SIZE default to 0 (appropriate for
+   ringbuf maps which don't use traditional key/value pairs)."
   `(push (list ',name :type ,type :key-size ,key-size
                       :value-size ,value-size :max-entries ,max-entries
                       :map-flags ,map-flags)
