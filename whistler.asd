@@ -24,6 +24,22 @@
                (:file "protocols")
                (:file "codegen")))
 
+(defsystem "whistler/loader"
+  :description "Pure Common Lisp BPF loader — load .bpf.o into the kernel"
+  :version "0.1.0"
+  :author "Anthony Green <green@moxielogic.com>"
+  :license "MIT"
+  :serial t
+  :pathname "src/loader/"
+  :components ((:file "packages")
+               (:file "syscall")
+               (:file "elf-reader")
+               (:file "map")
+               (:file "program")
+               (:file "attach")
+               (:file "ringbuf")
+               (:file "loader")))
+
 (defsystem "whistler/tests"
   :description "Whistler test suite"
   :depends-on ("whistler" "fiveam")
