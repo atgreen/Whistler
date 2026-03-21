@@ -7,6 +7,23 @@
 ;;;
 ;;; The entire BPF program, compilation, loading, and userspace analysis
 ;;; lives in this single Lisp file.
+;;;
+;;; Usage:
+;;;   sudo sbcl --load examples/ffi-call-tracker.lisp
+;;;
+;;; Expected output:
+;;;   Compiling and loading BPF program...
+;;;   Attaching uprobe to ffi_call in /lib64/libffi.so.8...
+;;;   Tracing ffi_call. Press Ctrl-C to dump stats.
+;;;   ^C
+;;;   COUNT       COMM              SIGNATURE
+;;;   --------    ----------------  ---------
+;;;          880  ghostty           void(ptr, ptr, u32) [unix64]
+;;;          384  gnome-shell       void(ptr, ptr, u32) [unix64]
+;;;          352  gnome-shell       void(ptr, ptr, ptr, s64, ptr) [unix64]
+;;;          224  gnome-shell       void(ptr, ptr) [unix64]
+;;;          176  ghostty           void(ptr, ptr) [unix64]
+;;;          ...
 
 (asdf:load-system "whistler/loader")
 
