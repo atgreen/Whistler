@@ -87,9 +87,9 @@ Lisp. The ELF writer is hand-rolled (~400 lines). No libelf, no libbpf, no
 kernel headers needed to compile. The output is a standard BPF ELF object that
 any loader (bpftool, libbpf, ip link) can load.
 
-**Polyglot header generation.** `--gen c`, `--gen go`, `--gen rust`, `--gen python`
-generate matching struct definitions from your `defstruct` declarations — one
-source of truth for BPF and userspace.
+**Polyglot header generation.** `--gen c`, `--gen go`, `--gen rust`, `--gen python`,
+`--gen lisp` generate matching struct definitions from your `defstruct`
+declarations — one source of truth for BPF and userspace.
 
 **The whole compiler is ~5,500 lines.** You can read it in an afternoon. Compare
 with the clang/LLVM BPF backend. When the verifier rejects your program, you
@@ -164,13 +164,13 @@ for both sides:
 ./whistler compile probes.lisp --gen c        # → probes.h
 
 # Generate for multiple languages at once
-./whistler compile probes.lisp --gen c go rust python
+./whistler compile probes.lisp --gen c go rust python lisp
 
 # Generate all supported languages
 ./whistler compile probes.lisp --gen all
 ```
 
-Supported: **C**, **Go**, **Rust**, **Python**, **Common Lisp**. Array fields
+Supported: **C**, **Go**, **Rust**, **Python**, **Common Lisp** (`--gen lisp`). Array fields
 map to native syntax (`uint8_t field[16]` in C, `[16]uint8` in Go,
 `[u8; 16]` in Rust). Struct layouts are guaranteed to match because they're
 derived from the same `defstruct`.
