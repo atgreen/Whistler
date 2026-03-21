@@ -33,10 +33,9 @@
 (defun make-perf-attr (type config)
   "Build a perf_event_attr buffer."
   (let ((buf (make-array 128 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (put-u32 buf 0 type)          ; type
-    (put-u32 buf 4 128)           ; size
-    (put-u64 buf 8 config)        ; config
-    (put-u64 buf 40 +perf-sample-raw+)  ; sample_type
+    (put-u32 buf 0 type)          ; type (offset 0)
+    (put-u32 buf 4 128)           ; size (offset 4)
+    (put-u64 buf 8 config)        ; config (offset 8)
     buf))
 
 (defun attach-perf-bpf (perf-attr prog-fd)
@@ -61,8 +60,8 @@
          (attr (make-perf-attr (or pmu-type +perf-type-tracepoint+) 0))
          (name-bytes (sb-ext:string-to-octets function-name :null-terminate t)))
     (sb-sys:with-pinned-objects (name-bytes)
-      ;; config1 = function name pointer (for PMU-based kprobe)
-      (put-ptr attr 72 (sb-sys:vector-sap name-bytes))
+      ;; config1 = function name pointer at offset 56
+      (put-ptr attr 56 (sb-sys:vector-sap name-bytes))
       (let ((fds (attach-perf-bpf attr prog-fd)))
         (make-attachment :type :kprobe :perf-fds fds :prog-fd prog-fd)))))
 
@@ -106,9 +105,9 @@
          (attr (make-perf-attr (or pmu-type 8) config))
          (path-bytes (sb-ext:string-to-octets binary-path :null-terminate t)))
     (sb-sys:with-pinned-objects (path-bytes)
-      ;; config1 = path pointer, config2 = symbol offset
-      (put-ptr attr 72 (sb-sys:vector-sap path-bytes))
-      (put-u64 attr 80 offset)
+      ;; config1 = path pointer at offset 56, config2 = symbol offset at offset 64
+      (put-ptr attr 56 (sb-sys:vector-sap path-bytes))
+      (put-u64 attr 64 offset)
       (let ((fds (attach-perf-bpf attr prog-fd)))
         (make-attachment :type :uprobe :perf-fds fds :prog-fd prog-fd)))))
 
