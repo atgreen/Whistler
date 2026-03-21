@@ -9,7 +9,8 @@
   (:use #:cl)
   (:export
    ;; Top-level
-   #:with-bpf-session
+   #:with-bpf-session #:*bpf-session* #:bpf-session-maps #:bpf-session-progs
+   #:encode-int-key #:decode-int-value
    #:with-bpf-object #:open-bpf-object #:load-bpf-object #:close-bpf-object
    ;; Accessors
    #:bpf-object-map #:bpf-object-prog

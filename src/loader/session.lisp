@@ -20,8 +20,7 @@
    Returns (map-defs prog-defs) where each is a list of plists with
    the compiled bytecode and metadata embedded as literals."
   (let ((whistler::*maps* nil)
-        (whistler::*programs* nil)
-        (whistler::*struct-defs* (make-hash-table :test 'equal)))
+        (whistler::*programs* nil))
     ;; Evaluate map definitions
     (dolist (form map-forms)
       (eval form))
@@ -191,37 +190,57 @@
         (compile-bpf-forms map-forms prog-forms)
 
       ;; Phase 3: Emit runtime code
-      ;; The compiled bytecode is embedded as literal arrays in the expansion
-      (let ((session-var (gensym "SESSION")))
-        `(let* ((,session-var
+      ;; Build section-name lookup for attach type detection
+      (let ((prog-section-names (make-hash-table :test 'equal)))
+        (dolist (spec prog-specs)
+          (setf (gethash (getf spec :name) prog-section-names)
+                (getf spec :section)))
+
+        `(let* ((*bpf-session*
                  (let* ((map-alist (session-create-maps ',map-specs))
                         (prog-alist (session-load-progs ',prog-specs map-alist)))
                    (make-bpf-session :maps map-alist :progs prog-alist))))
+           (declare (special *bpf-session*))
            (unwind-protect
                 (macrolet
-                    ((bpf:attach (prog-name function-name &rest args)
-                       (let ((pname (string-downcase
-                                     (substitute #\_ #\-
-                                                 (symbol-name prog-name)))))
-                         `(let* ((prog-entry (assoc ,pname
-                                                    (bpf-session-progs ,',session-var)
-                                                    :test #'string=))
-                                 (att (attach-kprobe (prog-info-fd (cdr prog-entry))
-                                                     ,function-name ,@args)))
-                            (push att (bpf-session-attachments ,',session-var))
-                            att)))
+                    ((bpf:attach (prog-name target &rest args)
+                       ;; Detect kprobe vs uprobe from section name
+                       (let* ((pname (string-downcase
+                                      (substitute #\_ #\-
+                                                  (symbol-name prog-name))))
+                              (sec-name (gethash pname ',prog-section-names))
+                              (is-uprobe (and sec-name
+                                              (>= (length sec-name) 7)
+                                              (string= (subseq sec-name 0 7)
+                                                       "uprobe/"))))
+                         (if is-uprobe
+                             ;; uprobe: (bpf:attach prog binary-path symbol-name)
+                             `(let* ((prog-entry (assoc ,pname
+                                                        (bpf-session-progs *bpf-session*)
+                                                        :test #'string=))
+                                     (att (attach-uprobe (prog-info-fd (cdr prog-entry))
+                                                         ,target ,@args)))
+                                (push att (bpf-session-attachments *bpf-session*))
+                                att)
+                             ;; kprobe: (bpf:attach prog function-name)
+                             `(let* ((prog-entry (assoc ,pname
+                                                        (bpf-session-progs *bpf-session*)
+                                                        :test #'string=))
+                                     (att (attach-kprobe (prog-info-fd (cdr prog-entry))
+                                                         ,target ,@args)))
+                                (push att (bpf-session-attachments *bpf-session*))
+                                att))))
                      (bpf:map-ref (map-name key)
                        (let* ((mname (string-downcase
                                       (substitute #\_ #\-
                                                   (symbol-name map-name))))
-                              (ks (gethash mname ',map-key-sizes))
-                              (vs (gethash mname ',map-value-sizes)))
+                              (ks (gethash mname ',map-key-sizes)))
                          `(let ((result (map-lookup
                                          (cdr (assoc ,mname
-                                                     (bpf-session-maps ,',session-var)
+                                                     (bpf-session-maps *bpf-session*)
                                                      :test #'string=))
                                          (encode-int-key ,key ,(or ks 4)))))
                             (when result
                               (decode-int-value result))))))
                   ,@runtime-body)
-             (session-close ,session-var)))))))
+             (session-close *bpf-session*)))))))
