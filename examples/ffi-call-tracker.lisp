@@ -13,7 +13,11 @@
 ;;; The entire BPF program, compilation, loading, and userspace analysis
 ;;; lives in this single Lisp file. No .bpf.o, no C, no Go.
 
-(in-package #:whistler)
+(defpackage #:ffi-call-tracker
+  (:use #:cl #:whistler #:whistler/loader)
+  (:shadowing-import-from #:whistler #:case #:defstruct #:incf #:decf))
+
+(in-package #:ffi-call-tracker)
 
 ;;; ========== BPF struct definitions ==========
 
@@ -27,7 +31,7 @@
   (comm (array u8 16)) (arg-types (array u8 16))
   (nargs u16) (rtype u8) (abi u8) (pad u32))
 
-(defconstant +max-args+ 16)
+(cl:defconstant +max-args+ 16)
 
 ;;; ========== FFI type name tables ==========
 
@@ -50,7 +54,7 @@
   "Decode a stats-key byte array into (comm signature)."
   (let* ((comm-end (or (position 0 key-bytes :end 16) 16))
          (comm (map 'string #'code-char (subseq key-bytes 0 comm-end)))
-         (nargs (logior (aref key-bytes 32) (ash (aref key-bytes 33) 8)))
+         (nargs (logior (aref key-bytes 32) (ash key-bytes 33) 8))
          (rtype (aref key-bytes 34))
          (abi (aref key-bytes 35))
          (n (min nargs 16))
@@ -66,9 +70,9 @@
 
 ;;; ========== Main ==========
 
-(defun run-ffi-tracker (&optional (libffi-path "/lib64/libffi.so.8"))
+(defun run (&optional (libffi-path "/lib64/libffi.so.8"))
   (format *error-output* "Compiling and loading BPF program...~%")
-  (whistler/loader:with-bpf-session ()
+  (with-bpf-session ()
     ;; ---- BPF side: compiled at macroexpand time ----
     (bpf:map stats :type :hash :key-size 40 :value-size 8 :max-entries 10240)
 
@@ -101,21 +105,18 @@
     (handler-case
         (loop (sleep 1))
       (sb-sys:interactive-interrupt ()
-        (let ((stats-map (cdr (assoc "stats"
-                                     (whistler/loader:bpf-session-maps
-                                      whistler/loader:*bpf-session*)
+        (let ((stats-map (cdr (assoc "stats" (bpf-session-maps *bpf-session*)
                                      :test #'string=)))
               (entries nil))
           (when stats-map
             (let ((key nil))
               (loop
-                (let ((next-key (whistler/loader:map-get-next-key stats-map key)))
+                (let ((next-key (map-get-next-key stats-map key)))
                   (unless next-key (return))
-                  (let ((value (whistler/loader:map-lookup stats-map next-key)))
+                  (let ((value (map-lookup stats-map next-key)))
                     (when value
                       (multiple-value-bind (comm sig) (decode-stats-key next-key)
-                        (push (list (whistler/loader:decode-int-value value) comm sig)
-                              entries))))
+                        (push (list (decode-int-value value) comm sig) entries))))
                   (setf key next-key)))))
           (if (null entries)
               (format t "~&No ffi_call events recorded.~%")
@@ -127,4 +128,4 @@
                   (format t "~10d  ~16a  ~a~%"
                           (first e) (second e) (third e))))))))))
 
-(run-ffi-tracker (or (second sb-ext:*posix-argv*) "/lib64/libffi.so.8"))
+(run (or (second sb-ext:*posix-argv*) "/lib64/libffi.so.8"))
