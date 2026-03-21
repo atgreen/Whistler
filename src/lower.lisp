@@ -869,6 +869,31 @@
 
 ;;; ========== Helper calls ==========
 
+;; Helper arguments that are pointer positions (1-indexed): arg N is a pointer.
+;; probe-read(dst, size, src), probe-read-user(dst, size, src), etc.
+(defparameter *helper-pointer-args*
+  '(("PROBE-READ" 1 3) ("PROBE-READ-USER" 1 3)
+    ("PROBE-READ-STR" 1 3) ("PROBE-READ-USER-STR" 1 3)))
+
+(defun check-narrow-pointer-args (ctx helper-name args arg-vregs)
+  "Warn when a narrow type (u8, u16) flows into a pointer-position argument."
+  (let ((ptr-positions (cdr (assoc (symbol-name helper-name) *helper-pointer-args*
+                                    :test #'string=))))
+    (when ptr-positions
+      (loop for vreg in arg-vregs
+            for arg in args
+            for pos from 1
+            when (member pos ptr-positions)
+            do (let ((type (vreg-type-in-env ctx vreg)))
+                 (when (and type (member (symbol-name type) '("U8" "U16") :test #'string=))
+                   (let ((bits (if (string= (symbol-name type) "U8") 8 16)))
+                     (warn "~&  warning: narrow type ~a passed as pointer argument ~d to ~a~%  ~
+                              in: (~a ~{~s~^ ~})~%  ~
+                              hint: ~a values are 0-~d, not valid pointers — ~
+                              use (load u64 ...) to read a full-width pointer~%"
+                           type pos helper-name helper-name args
+                           type (1- (ash 1 bits))))))))))
+
 (defun lower-helper-call (ctx helper-name args)
   (let ((func-id (cdr (assoc (symbol-name helper-name) whistler/compiler:*builtin-helpers*
                               :test #'string=))))
@@ -881,6 +906,7 @@
                      (mapcar #'car whistler/compiler:*builtin-helpers*))))
     (let ((arg-vregs (mapcar (lambda (a) (lower-expr ctx a)) args))
           (dst (ctx-fresh-vreg ctx)))
+      (check-narrow-pointer-args ctx helper-name args arg-vregs)
       (ctx-emit ctx :call dst (cons `(:helper ,func-id) arg-vregs) 'u64)
       dst)))
 
