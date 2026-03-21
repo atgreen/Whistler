@@ -131,14 +131,20 @@
 ;;; ---- Ring buffer patterns ----
 
 (defmacro with-ringbuf ((var map size &key (flags 0)) &body body)
-  "Reserve a ring buffer entry, execute BODY, and submit on normal exit.
+  "Reserve a ring buffer entry, zero it, execute BODY, and submit on normal exit.
    If BODY executes (return ...), the reservation is NOT auto-submitted —
    use (ringbuf-discard VAR 0) before returning if needed.
-   VAR is bound to the reserved pointer (guaranteed non-null in BODY)."
-  `(let ((,var (ringbuf-reserve ,map ,size ,flags)))
-     (when ,var
-       ,@body
-       (ringbuf-submit ,var 0))))
+   VAR is bound to the reserved pointer (guaranteed non-null in BODY).
+   SIZE must be a compile-time constant or (sizeof STRUCT)."
+  ;; Resolve size at macro-expansion time so memset gets a literal integer.
+  (let ((resolved-size (if (and (consp size) (eq (car size) 'sizeof))
+                           (macroexpand-1 size)
+                           size)))
+    `(let ((,var (ringbuf-reserve ,map ,resolved-size ,flags)))
+       (when ,var
+         (memset ,var 0 0 ,resolved-size)
+         ,@body
+         (ringbuf-submit ,var 0)))))
 
 ;;; ---- Process metadata helpers ----
 
