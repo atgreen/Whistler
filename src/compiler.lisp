@@ -86,6 +86,13 @@
   (name nil)            ; defprog name (symbol or string) for FUNC symbol
   (license "GPL"))      ; license string
 
+;;; Compiler error reporting
+
+(defun whistler-error (&key what where expected hint)
+  "Signal a structured compiler error with context."
+  (error "~&~%  error: ~a~@[~%  in: ~a~]~@[~%  expected: ~a~]~@[~%  hint: ~a~]~%"
+         what where expected hint))
+
 ;;; Shared utility functions
 
 (defun sym= (a b)

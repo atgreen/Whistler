@@ -170,7 +170,10 @@
     ((consp form)
      (lower-form ctx form))
 
-    (t (error "Cannot lower: ~s" form))))
+    (t (whistler/compiler:whistler-error
+        :what (format nil "cannot compile expression: ~s" form)
+        :expected "an integer, symbol, or (form ...) expression"
+        :hint "strings, floats, and other CL literals are not available in BPF"))))
 
 (defun lower-symbol (ctx sym)
   "Lower a symbol reference — variable or constant."
@@ -188,7 +191,15 @@
          v))
       (t
        (let ((binding (ctx-lookup-var ctx sym)))
-         (unless binding (error "Unbound variable in IR lowering: ~a" sym))
+         (unless binding
+           (let ((env-vars (remove-if (lambda (n) (search "%%" n))
+                                       (mapcar #'car (lower-ctx-env ctx)))))
+             (whistler/compiler:whistler-error
+              :what (format nil "unbound variable: ~a" sym)
+              :expected "a variable bound by LET, LET*, DOTIMES, or a builtin constant"
+              :hint (if env-vars
+                        (format nil "variables in scope: ~{~a~^, ~}" env-vars)
+                        "no variables are in scope here"))))
          (cdr binding))))))  ; return the vreg directly
 
 ;;; ========== Compound form lowering ==========
@@ -223,7 +234,11 @@
       ((sym= head 'ash)
        (let ((count (second args)))
          (unless (integerp count)
-           (error "ash requires a constant shift count in BPF, got: ~a" count))
+           (whistler/compiler:whistler-error
+            :what (format nil "non-constant shift count: ~a" count)
+            :where (format nil "(ash ~a ~a)" (first args) count)
+            :expected "a compile-time constant integer"
+            :hint "BPF requires constant shift amounts. Use (<< val N) or (>> val N) with a literal."))
          (cond
            ((>= count 0)
             (lower-alu ctx '<< (list (first args) count)))
@@ -348,7 +363,16 @@
       ((ir-builtin-helper-p head)
        (lower-helper-call ctx head args))
 
-      (t (error "Unknown form in IR lowering: ~s" head)))))
+      (t (whistler/compiler:whistler-error
+          :what (format nil "unknown form: ~a" head)
+          :where (format nil "(~a ...)" head)
+          :expected "a Whistler builtin (let, if, when, dotimes, ...), arithmetic op (+, -, *, ...), comparison (=, >, <, ...), or BPF helper (probe-read-user, ktime-get-ns, ...)"
+          :hint (if (member (symbol-name head)
+                            '("FORMAT" "PRINT" "LOOP" "MAPCAR" "FUNCALL" "APPLY"
+                              "CONCATENATE" "STRING" "LIST" "CONS" "MAKE-ARRAY")
+                            :test #'string=)
+                    (format nil "CL function ~a is not available in BPF programs" head)
+                    (format nil "check spelling, or ensure the macro/form is defined before compilation")))))))
 
 ;;; ========== Let bindings ==========
 
@@ -433,8 +457,25 @@
           (ctx-emit ctx :mov vreg (list '(:imm 0)) type)
           (list var type vreg)))))
 
+(defun validate-let-bindings (bindings form-name)
+  "Check let/let* bindings for common mistakes."
+  (when (and bindings (symbolp (first bindings)))
+    (whistler/compiler:whistler-error
+     :what (format nil "malformed ~a bindings" form-name)
+     :where (format nil "(~a (~{~s~^ ~}) ...)" form-name bindings)
+     :expected (format nil "(~a ((var init) ...) body...)" form-name)
+     :hint (format nil "note the double parentheses: (~a ((~a ...)) ...)"
+                   form-name (first bindings))))
+  (dolist (b bindings)
+    (when (and (consp b) (not (symbolp (first b))))
+      (whistler/compiler:whistler-error
+       :what (format nil "invalid variable name in ~a binding: ~s" form-name (first b))
+       :where (format nil "~s" b)
+       :expected "a symbol as the variable name"))))
+
 (defun lower-let (ctx bindings body)
   "Lower CL-style let: evaluate all inits before binding any variables."
+  (validate-let-bindings bindings "let")
   (multiple-value-bind (type-decls actual-body) (extract-type-declarations body)
     (let ((saved-env (lower-ctx-env ctx)))
       ;; Phase 1: lower all init expressions in the CURRENT environment
@@ -458,6 +499,7 @@
 
 (defun lower-let* (ctx bindings body)
   "Lower CL-style let*: evaluate and bind each variable sequentially."
+  (validate-let-bindings bindings "let*")
   (multiple-value-bind (type-decls actual-body) (extract-type-declarations body)
     (let ((saved-env (lower-ctx-env ctx)))
       (dolist (binding bindings)
@@ -607,7 +649,10 @@
              (ctx-emit ctx ir-op dst (list acc rhs) result-type)
              (setf acc dst)))
          acc))
-      (t (error "~a requires at least 1 argument" op)))))
+      (t (whistler/compiler:whistler-error
+          :what (format nil "~a requires at least 1 argument" op)
+          :where (format nil "(~a)" op)
+          :expected (format nil "(~a x) or (~a x y ...)" op op))))))
 
 ;;; ========== Comparison ==========
 
@@ -817,8 +862,12 @@
   (let ((func-id (cdr (assoc (symbol-name helper-name) whistler/compiler:*builtin-helpers*
                               :test #'string=))))
     (unless func-id
-      (error "Unknown BPF helper: ~a (known: ~{~a~^, ~})" helper-name
-             (mapcar #'car whistler/compiler:*builtin-helpers*)))
+      (whistler/compiler:whistler-error
+       :what (format nil "unknown BPF helper: ~a" helper-name)
+       :where (format nil "(~a ...)" helper-name)
+       :expected "a known BPF helper function"
+       :hint (format nil "known helpers: ~{~a~^, ~}"
+                     (mapcar #'car whistler/compiler:*builtin-helpers*))))
     (let ((arg-vregs (mapcar (lambda (a) (lower-expr ctx a)) args))
           (dst (ctx-fresh-vreg ctx)))
       (ctx-emit ctx :call dst (cons `(:helper ,func-id) arg-vregs) 'u64)
@@ -845,7 +894,11 @@
 (defun lower-stack-addr (ctx var-name)
   "Lower (stack-addr VAR) — get a pointer to a variable's stack location."
   (let ((binding (ctx-lookup-var ctx var-name)))
-    (unless binding (error "Unbound variable for stack-addr: ~a" var-name))
+    (unless binding
+      (whistler/compiler:whistler-error
+       :what (format nil "unbound variable in stack-addr: ~a" var-name)
+       :where (format nil "(stack-addr ~a)" var-name)
+       :expected "a variable bound by LET or LET*"))
     (let ((vreg (cdr binding))
           (dst (ctx-fresh-vreg ctx)))
       (ctx-emit ctx :stack-addr dst (list vreg) 'u64)
@@ -866,7 +919,11 @@
     (let ((n (cond ((integerp count) count)
                    ((and (symbolp count) (boundp count) (constantp count))
                     (symbol-value count))
-                   (t (error "dotimes count must be constant: ~a" count)))))
+                   (t (whistler/compiler:whistler-error
+                       :what (format nil "non-constant loop count: ~a" count)
+                       :where (format nil "(dotimes (~a ~a) ...)" var count)
+                       :expected "a compile-time constant integer or defconstant symbol"
+                       :hint "the BPF verifier requires a known upper bound for all loops")))))
       (let* ((prog (lower-ctx-prog ctx))
              (saved-env (lower-ctx-env ctx))
              (header-label (ir-fresh-label prog "loop_hdr"))

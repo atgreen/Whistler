@@ -33,7 +33,14 @@
           ((string= name "U16") 2)
           ((string= name "U32") 4)
           ((string= name "U64") 8)
-          (t (error "Unknown struct field type: ~a" type)))))
+          (t (whistler-error
+             :what (format nil "unknown struct field type: ~a" type)
+             :expected "one of: u8, u16, u32, u64, or (array TYPE COUNT)"
+             :hint (cond
+                     ((member (symbol-name type) '("INT" "CHAR" "UINT32_T" "UINT8_T"
+                               "UINT16_T" "UINT64_T" "SIZE_T") :test #'string=)
+                      (format nil "use BPF types: u8, u16, u32, u64 (not C types)"))
+                     (t nil)))))))
 
 (defun struct-type-to-store-type (type)
   "Convert a struct field type symbol to the surface-language store type."
@@ -42,7 +49,14 @@
           ((string= name "U16") 'u16)
           ((string= name "U32") 'u32)
           ((string= name "U64") 'u64)
-          (t (error "Unknown struct field type: ~a" type)))))
+          (t (whistler-error
+             :what (format nil "unknown struct field type: ~a" type)
+             :expected "one of: u8, u16, u32, u64, or (array TYPE COUNT)"
+             :hint (cond
+                     ((member (symbol-name type) '("INT" "CHAR" "UINT32_T" "UINT8_T"
+                               "UINT16_T" "UINT64_T" "SIZE_T") :test #'string=)
+                      (format nil "use BPF types: u8, u16, u32, u64 (not C types)"))
+                     (t nil)))))))
 
 (defun parse-field-type (ftype)
   "Parse a field type spec. Returns (values elem-type count is-array).
@@ -162,11 +176,20 @@
 (defun lookup-struct-field (struct-name field-name)
   "Look up a field in a struct definition. Returns (type offset size)."
   (let ((def (gethash (string struct-name) *struct-defs*)))
-    (unless def (error "Unknown struct: ~a" struct-name))
+    (unless def
+      (whistler-error
+       :what (format nil "unknown struct: ~a" struct-name)
+       :expected (format nil "(defstruct ~a ...) before this point" struct-name)
+       :hint (let ((names (loop for k being the hash-keys of *struct-defs* collect k)))
+               (if names (format nil "known structs: ~{~a~^, ~}" names) nil))))
     (let ((field (find (string field-name) (cdr def)
                        :key (lambda (f) (string (first f)))
                        :test #'string=)))
-      (unless field (error "Unknown field ~a in struct ~a" field-name struct-name))
+      (unless field
+        (let ((fields (mapcar (lambda (f) (first f)) (cdr def))))
+          (whistler-error
+           :what (format nil "unknown field ~a in struct ~a" field-name struct-name)
+           :expected (format nil "one of: ~{~a~^, ~}" fields))))
       (values (second field) (third field) (fourth field)))))
 
 (defmacro struct-set (struct-name var field-name value)
@@ -185,7 +208,10 @@
   "Return the byte size of a struct defined with defstruct.
    Expands to an integer constant at compile time."
   (let ((def (gethash (string struct-name) *struct-defs*)))
-    (unless def (error "sizeof: unknown struct ~a" struct-name))
+    (unless def
+      (whistler-error
+       :what (format nil "sizeof: unknown struct ~a" struct-name)
+       :expected (format nil "(defstruct ~a ...) before sizeof" struct-name)))
     (car def)))
 
 ;;; Memory operations
@@ -314,7 +340,10 @@
   (let* ((maps (or maps (reverse *maps*)))
          (progs (or programs (reverse *programs*))))
     (when (null progs)
-      (error "No programs defined"))
+      (whistler-error
+       :what "no BPF programs defined"
+       :expected "at least one (defprog name (:type ...) body...) form"
+       :hint "add a program, e.g.: (defprog my-prog (:type :xdp :license \"GPL\") XDP_PASS)"))
     ;; Compile each program independently
     (let ((compiled-units
            (mapcar (lambda (prog-spec)
