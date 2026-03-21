@@ -868,10 +868,10 @@ whistler/
 │   └── codegen.lisp       Shared header generation (C, Go, Rust, Python, CL)
 ├── examples/
 │   ├── count-xdp.lisp              Packet counter (11 insns)
-│   ├── drop-port.lisp              Port blocker (37 insns)
-│   ├── ratelimit-xdp.lisp          Per-IP rate limiter (62 insns)
-│   ├── synflood-xdp.lisp           SYN flood filter (74 insns)
-│   ├── runqlat.lisp                 Run queue latency histogram (57 insns)
+│   ├── drop-port.lisp              Port blocker (26 insns)
+│   ├── ratelimit-xdp.lisp          Per-IP rate limiter (55 insns)
+│   ├── synflood-xdp.lisp           SYN flood filter (68 insns)
+│   ├── runqlat.lisp                 Run queue latency histogram (37 insns)
 │   ├── tail-call-dispatch.lisp      Protocol dispatch via tail calls (26 insns)
 │   └── multi-prog.lisp             Multi-program ELF (2 programs, 44 insns)
 └── tests/
