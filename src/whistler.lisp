@@ -27,6 +27,25 @@
 (defvar *programs* '()
   "Program definitions for the current compilation.")
 
+;;; Byte encoding helpers for struct decode/encode (no external deps)
+
+(defun bpf-bytes-u32 (bytes offset)
+  (logior (aref bytes offset) (ash (aref bytes (+ offset 1)) 8)
+          (ash (aref bytes (+ offset 2)) 16) (ash (aref bytes (+ offset 3)) 24)))
+
+(defun bpf-bytes-u64 (bytes offset)
+  (logior (bpf-bytes-u32 bytes offset) (ash (bpf-bytes-u32 bytes (+ offset 4)) 32)))
+
+(defun bpf-put-u32 (bytes offset val)
+  (setf (aref bytes offset) (logand val #xff))
+  (setf (aref bytes (+ offset 1)) (logand (ash val -8) #xff))
+  (setf (aref bytes (+ offset 2)) (logand (ash val -16) #xff))
+  (setf (aref bytes (+ offset 3)) (logand (ash val -24) #xff)))
+
+(defun bpf-put-u64 (bytes offset val)
+  (bpf-put-u32 bytes offset (logand val #xffffffff))
+  (bpf-put-u32 bytes (+ offset 4) (logand (ash val -32) #xffffffff)))
+
 ;;; Struct definitions
 
 (defvar *struct-defs* (make-hash-table :test 'equal)
@@ -173,12 +192,81 @@
                           accessor-forms)
                     (push `(cl:defsetf ,accessor-name ,writer-name)
                           accessor-forms)))))))
-      `(progn
-         (setf (gethash ,(string name) *struct-defs*)
-               (cons ,total ',fields-rev))
-         (cl:defmacro ,make-name ()
-           '(struct-alloc ,total))
-         ,@(nreverse accessor-forms)))))
+      ;; Generate CL struct + decoder for userspace byte handling
+      (let* ((cl-struct-name (intern (format nil "~a-RECORD" (symbol-name name))
+                                     (symbol-package name)))
+             (cl-make-name (intern (format nil "MAKE-~a-RECORD" (symbol-name name))
+                                   (symbol-package name)))
+             (decode-name (intern (format nil "DECODE-~a" (symbol-name name))
+                                  (symbol-package name)))
+             (encode-name (intern (format nil "ENCODE-~a" (symbol-name name))
+                                  (symbol-package name)))
+             (cl-slots (mapcar (lambda (f)
+                                 (destructuring-bind (fname ftype foffset fsize) f
+                                   (declare (ignore foffset fsize))
+                                   (multiple-value-bind (elem-type count is-array)
+                                       (parse-field-type ftype)
+                                     (declare (ignore elem-type))
+                                     (let ((slot-name fname))
+                                       (if is-array
+                                           `(,slot-name nil)
+                                           `(,slot-name 0))))))
+                               fields-rev))
+             (decode-fields
+              (mapcar (lambda (f)
+                        (destructuring-bind (fname ftype foffset fsize) f
+                          (declare (ignore fsize))
+                          (multiple-value-bind (elem-type count is-array)
+                              (parse-field-type ftype)
+                            (declare (ignore elem-type))
+                            (let ((kw (intern (string fname) :keyword)))
+                              (if is-array
+                                  `(,kw (subseq bytes ,foffset ,(+ foffset count)))
+                                  (cl:case (struct-type-byte-size ftype)
+                                    (1 `(,kw (aref bytes ,foffset)))
+                                    (2 `(,kw (logior (aref bytes ,foffset)
+                                                     (ash (aref bytes ,(1+ foffset)) 8))))
+                                    (4 `(,kw (bpf-bytes-u32 bytes ,foffset)))
+                                    (8 `(,kw (bpf-bytes-u64 bytes ,foffset)))))))))
+                      fields-rev))
+             (encode-fields
+              (mapcar (lambda (f)
+                        (destructuring-bind (fname ftype foffset fsize) f
+                          (declare (ignore fsize))
+                          (multiple-value-bind (elem-type count is-array)
+                              (parse-field-type ftype)
+                            (declare (ignore elem-type))
+                            (let ((accessor (intern (format nil "~a-~a"
+                                                           (symbol-name cl-struct-name)
+                                                           (symbol-name fname))
+                                                   (symbol-package name))))
+                              (if is-array
+                                  `(replace bytes (,accessor rec) :start1 ,foffset)
+                                  (cl:case (struct-type-byte-size ftype)
+                                    (1 `(setf (aref bytes ,foffset) (,accessor rec)))
+                                    (2 `(let ((v (,accessor rec)))
+                                          (setf (aref bytes ,foffset) (logand v #xff))
+                                          (setf (aref bytes ,(1+ foffset)) (logand (ash v -8) #xff))))
+                                    (4 `(bpf-put-u32 bytes ,foffset (,accessor rec)))
+                                    (8 `(bpf-put-u64 bytes ,foffset (,accessor rec)))))))))
+                      fields-rev)))
+        `(progn
+           (setf (gethash ,(string name) *struct-defs*)
+                 (cons ,total ',fields-rev))
+           (cl:defmacro ,make-name ()
+             '(struct-alloc ,total))
+           ,@(nreverse accessor-forms)
+           ;; CL struct for userspace
+           (cl:defstruct ,cl-struct-name ,@cl-slots)
+           ;; Decoder: bytes → CL struct
+           (cl:defun ,decode-name (bytes)
+             (,cl-make-name ,@(mapcan #'identity decode-fields)))
+           ;; Encoder: CL struct → bytes
+           (cl:defun ,encode-name (rec)
+             (let ((bytes (make-array ,total :element-type '(unsigned-byte 8)
+                                             :initial-element 0)))
+               ,@encode-fields
+               bytes)))))))
 
 (defun lookup-struct-field (struct-name field-name)
   "Look up a field in a struct definition. Returns (type offset size)."
