@@ -5,13 +5,10 @@
 ;;; Traces all ffi_call() invocations via a uprobe on libffi.so, counts
 ;;; calls by (program, signature), and dumps stats on Ctrl-C.
 ;;;
-;;; Usage: sudo sbcl --eval '(require :asdf)'
-;;;              --eval '(push #p"/path/to/whistler/" asdf:*central-registry*)'
-;;;              --eval '(asdf:load-system "whistler/loader")'
-;;;              --load examples/ffi-call-tracker.lisp
-;;;
 ;;; The entire BPF program, compilation, loading, and userspace analysis
 ;;; lives in this single Lisp file.
+
+(asdf:load-system "whistler/loader")
 
 (defpackage #:ffi-call-tracker
   (:use #:cl #:whistler #:whistler/loader)
