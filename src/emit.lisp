@@ -53,7 +53,11 @@
          ;; Align down to natural boundary (works for power-of-2 alignment)
          (aligned (logand new-off (- align))))
     (when (< aligned -512)
-      (error "Stack frame exceeds 512 bytes"))
+      (whistler/compiler:whistler-error
+       :what (format nil "stack frame exceeds BPF 512-byte limit (~d bytes needed)" (- aligned))
+       :expected "total stack usage <= 512 bytes"
+       :hint "reduce struct sizes, reuse buffers, or split logic across tail-called programs"))
+
     (setf (emit-ctx-stack-offset ctx) aligned)
     aligned))
 

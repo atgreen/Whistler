@@ -905,6 +905,17 @@
        :expected "a known BPF helper function"
        :hint (format nil "known helpers: ~{~a~^, ~}"
                      (mapcar #'car whistler/compiler:*builtin-helpers*))))
+    ;; Check argument count
+    (let ((expected-count (cdr (assoc (symbol-name helper-name)
+                                      whistler/compiler:*helper-arg-counts*
+                                      :test #'string=))))
+      (when (and expected-count (/= (length args) expected-count))
+        (whistler/compiler:whistler-error
+         :what (format nil "~a expects ~d argument~:p, got ~d"
+                       helper-name expected-count (length args))
+         :where (format nil "(~a~{ ~s~})" helper-name args)
+         :expected (format nil "(~a~{~* ARG~})" helper-name
+                           (make-list expected-count)))))
     (let ((arg-vregs (mapcar (lambda (a) (lower-expr ctx a)) args))
           (dst (ctx-fresh-vreg ctx)))
       (check-narrow-pointer-args ctx helper-name args arg-vregs)

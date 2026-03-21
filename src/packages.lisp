@@ -70,7 +70,7 @@
 
 (defpackage #:whistler/compiler
   (:use #:cl #:whistler/bpf)
-  (:export #:whistler-error
+  (:export #:whistler-error #:*helper-arg-counts*
            #:make-compilation-unit #:cu-insns #:cu-maps
            #:cu-section #:cu-name #:cu-license #:cu-map-relocs #:cu-core-relocs
            #:whistler-macroexpand #:constant-fold-sexpr #:resolve-map-type

@@ -447,5 +447,9 @@
    Returns the new negative offset from R10."
   (let ((off (- current-offset 8)))
     (when (< off -512)
-      (error "Stack frame exceeds 512 bytes during regalloc"))
+      (whistler/compiler:whistler-error
+       :what (format nil "stack frame exceeds BPF 512-byte limit (~d bytes needed)" (- off))
+       :expected "total stack usage <= 512 bytes"
+       :hint "reduce struct sizes, reuse buffers, or split logic across tail-called programs"))
+
     off))

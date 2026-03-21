@@ -41,6 +41,20 @@
   "BPF helper functions: string name → helper ID.
    Single source of truth — referenced by the SSA pipeline via lower.lisp.")
 
+(defparameter *helper-arg-counts*
+  '(("PROBE-READ" . 3) ("PROBE-READ-USER" . 3)
+    ("PROBE-READ-STR" . 3) ("PROBE-READ-USER-STR" . 3)
+    ("KTIME-GET-NS" . 0) ("GET-PRANDOM-U32" . 0)
+    ("GET-SMP-PROCESSOR-ID" . 0) ("GET-CURRENT-CGROUP-ID" . 0)
+    ("GET-CURRENT-PID-TGID" . 0) ("GET-CURRENT-UID-GID" . 0)
+    ("GET-CURRENT-COMM" . 2)
+    ("REDIRECT" . 2) ("PERF-EVENT-OUTPUT" . 3) ("SKB-LOAD-BYTES" . 3)
+    ("TRACE-PRINTK" . 3)
+    ("RINGBUF-RESERVE" . 3) ("RINGBUF-SUBMIT" . 2) ("RINGBUF-DISCARD" . 2)
+    ("RINGBUF-OUTPUT" . 4))
+  "Expected argument counts for BPF helpers that users call directly.
+   BPF allows max 5 args (R1-R5). Helpers not listed here are not checked.")
+
 ;;; Known constants
 
 (defparameter *builtin-constants*
