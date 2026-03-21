@@ -1,0 +1,227 @@
+;;; session.lisp — with-bpf-session: inline BPF compilation + loading
+;;;
+;;; SPDX-License-Identifier: MIT
+;;;
+;;; Compiles BPF code at macroexpand time and loads it at runtime.
+;;; The bpf: prefix separates kernel-side forms from userspace CL code.
+
+(in-package #:whistler/loader)
+
+;;; ========== BPF session package ==========
+;;; Provides bpf:map, bpf:prog, bpf:attach, bpf:map-ref
+
+(defpackage #:bpf
+  (:export #:map #:prog #:attach #:map-ref #:map-ref-int))
+
+;;; ========== Compile-time BPF collection ==========
+
+(defun compile-bpf-forms (map-forms prog-forms)
+  "Compile BPF map and program definitions at macroexpand time.
+   Returns (map-defs prog-defs) where each is a list of plists with
+   the compiled bytecode and metadata embedded as literals."
+  (let ((whistler::*maps* nil)
+        (whistler::*programs* nil)
+        (whistler::*struct-defs* (make-hash-table :test 'equal)))
+    ;; Evaluate map definitions
+    (dolist (form map-forms)
+      (eval form))
+    ;; Evaluate prog definitions (and any structs they reference)
+    (dolist (form prog-forms)
+      (eval form))
+    ;; Compile
+    (let* ((maps (reverse whistler::*maps*))
+           (progs (reverse whistler::*programs*)))
+      (when (null progs)
+        (error "with-bpf-session: no bpf:prog forms found"))
+      ;; Compile each program
+      (let ((compiled-units
+             (mapcar (lambda (prog-spec)
+                       (destructuring-bind (name &key section license body) prog-spec
+                         (let ((cu (whistler::compile-program section license maps body)))
+                           (setf (whistler/compiler:cu-name cu)
+                                 (substitute #\_ #\-
+                                             (string-downcase (symbol-name name))))
+                           cu)))
+                     progs))
+            (map-specs
+             (loop for (name . rest) in maps
+                   collect (list :name (string-downcase
+                                        (substitute #\_ #\- (symbol-name name)))
+                                 :type (getf rest :type)
+                                 :key-size (getf rest :key-size)
+                                 :value-size (getf rest :value-size)
+                                 :max-entries (getf rest :max-entries)
+                                 :flags (or (getf rest :map-flags) 0)))))
+        (values map-specs
+                (mapcar (lambda (cu prog-spec)
+                          (list :name (whistler/compiler:cu-name cu)
+                                :section (whistler/compiler:cu-section cu)
+                                :license (whistler/compiler:cu-license cu)
+                                :insns (whistler::insn-bytes
+                                        (whistler/compiler:cu-insns cu))
+                                :relocs (reverse
+                                         (whistler/compiler:cu-map-relocs cu))))
+                        compiled-units progs))))))
+
+;;; ========== Integer key/value encoding ==========
+
+(defun encode-int-key (value size)
+  "Encode an integer as a little-endian byte array of SIZE bytes."
+  (let ((buf (make-array size :element-type '(unsigned-byte 8) :initial-element 0)))
+    (loop for i below (min size 8)
+          do (setf (aref buf i) (logand (ash value (* i -8)) #xff)))
+    buf))
+
+(defun decode-int-value (bytes)
+  "Decode a little-endian byte array as an unsigned integer."
+  (loop for i below (length bytes)
+        sum (ash (aref bytes i) (* i 8))))
+
+;;; ========== Session runtime ==========
+
+(defstruct bpf-session
+  maps progs attachments)
+
+(defun session-create-maps (map-specs)
+  "Create all maps from compiled specs. Returns name→map-info alist."
+  (loop for spec in map-specs
+        for info = (make-map-info
+                    :name (getf spec :name)
+                    :type (whistler/compiler:resolve-map-type (getf spec :type))
+                    :key-size (getf spec :key-size)
+                    :value-size (getf spec :value-size)
+                    :max-entries (getf spec :max-entries)
+                    :flags (getf spec :flags))
+        do (create-map info)
+        collect (cons (getf spec :name) info)))
+
+(defun session-load-progs (prog-specs map-alist)
+  "Load all programs with map FD relocations. Returns name→prog-info alist."
+  (let ((map-fds (mapcar (lambda (e) (cons (car e) (map-info-fd (cdr e)))) map-alist)))
+    (mapcar
+     (lambda (spec)
+       (let* ((insns (copy-seq (getf spec :insns)))
+              (relocs (getf spec :relocs))
+              (sec-name (getf spec :section))
+              (name (getf spec :name))
+              (license (getf spec :license))
+              (prog-type (section-to-prog-type sec-name)))
+         ;; Patch relocations: each reloc is (insn-byte-offset map-index)
+         (dolist (rel relocs)
+           (let* ((offset (first rel))
+                  (map-idx (second rel))
+                  (map-name (car (nth map-idx map-alist)))
+                  (fd (cdr (assoc map-name map-fds :test #'string=))))
+             (when fd
+               (setf (aref insns (+ offset 1))
+                     (logior (logand (aref insns (+ offset 1)) #x0f)
+                             (ash +bpf-pseudo-map-fd+ 4)))
+               (setf (aref insns (+ offset 4)) (logand fd #xff))
+               (setf (aref insns (+ offset 5)) (logand (ash fd -8) #xff))
+               (setf (aref insns (+ offset 6)) (logand (ash fd -16) #xff))
+               (setf (aref insns (+ offset 7)) (logand (ash fd -24) #xff)))))
+         (let ((fd (load-program insns prog-type license)))
+           (cons name (make-prog-info :name name :section-name sec-name
+                                      :type prog-type :insns insns :fd fd)))))
+     prog-specs)))
+
+(defun session-close (session)
+  "Close all session resources."
+  (dolist (att (bpf-session-attachments session))
+    (handler-case (detach att) (error () nil)))
+  (dolist (entry (bpf-session-progs session))
+    (let ((fd (prog-info-fd (cdr entry))))
+      (when (plusp fd)
+        (handler-case (sb-posix:close fd) (error () nil)))))
+  (dolist (entry (bpf-session-maps session))
+    (let ((fd (map-info-fd (cdr entry))))
+      (when (plusp fd)
+        (handler-case (sb-posix:close fd) (error () nil))))))
+
+;;; ========== The macro ==========
+
+(defmacro with-bpf-session (() &body body)
+  "Compile BPF code inline and load it into the kernel.
+
+   Use bpf:map and bpf:prog for kernel-side definitions (compiled at
+   macroexpand time). Use bpf:attach for program attachment.
+   Use bpf:map-ref to read map values.
+   All other forms are normal CL code.
+
+   Example:
+     (with-bpf-session ()
+       (bpf:map stats :type :hash :key-size 4 :value-size 8 :max-entries 1024)
+       (bpf:prog counter (:type :kprobe :section \"kprobe/__x64_sys_execve\" :license \"GPL\")
+         (incf (getmap stats 0)) 0)
+       (bpf:attach counter \"__x64_sys_execve\")
+       (loop (sleep 1)
+             (format t \"count: ~d~%\" (bpf:map-ref stats 0))))"
+  ;; Phase 1: Walk body, separate BPF forms from CL forms
+  (let ((map-forms nil)
+        (prog-forms nil)
+        (map-key-sizes (make-hash-table :test 'equal))  ; name → key-size
+        (map-value-sizes (make-hash-table :test 'equal))
+        (runtime-body nil))
+    ;; Classify each top-level form
+    (dolist (form body)
+      (cond
+        ;; (bpf:map name &key type key-size value-size max-entries)
+        ((and (consp form) (eq (car form) 'bpf:map))
+         (let* ((name (second form))
+                (args (cddr form))
+                (ks (or (getf args :key-size) 0))
+                (vs (or (getf args :value-size) 0)))
+           (setf (gethash (string-downcase (substitute #\_ #\- (symbol-name name)))
+                          map-key-sizes) ks)
+           (setf (gethash (string-downcase (substitute #\_ #\- (symbol-name name)))
+                          map-value-sizes) vs)
+           (push `(whistler:defmap ,name ,@args) map-forms)))
+        ;; (bpf:prog name (options...) body...)
+        ((and (consp form) (eq (car form) 'bpf:prog))
+         (push `(whistler:defprog ,(second form) ,(third form) ,@(cdddr form))
+               prog-forms))
+        ;; Everything else is runtime CL code
+        (t (push form runtime-body))))
+    (setf map-forms (nreverse map-forms))
+    (setf prog-forms (nreverse prog-forms))
+    (setf runtime-body (nreverse runtime-body))
+
+    ;; Phase 2: Compile BPF at macroexpand time
+    (multiple-value-bind (map-specs prog-specs)
+        (compile-bpf-forms map-forms prog-forms)
+
+      ;; Phase 3: Emit runtime code
+      ;; The compiled bytecode is embedded as literal arrays in the expansion
+      (let ((session-var (gensym "SESSION")))
+        `(let* ((,session-var
+                 (let* ((map-alist (session-create-maps ',map-specs))
+                        (prog-alist (session-load-progs ',prog-specs map-alist)))
+                   (make-bpf-session :maps map-alist :progs prog-alist))))
+           (unwind-protect
+                (macrolet
+                    ((bpf:attach (prog-name function-name &rest args)
+                       (let ((pname (string-downcase
+                                     (substitute #\_ #\-
+                                                 (symbol-name prog-name)))))
+                         `(let* ((prog-entry (assoc ,pname
+                                                    (bpf-session-progs ,',session-var)
+                                                    :test #'string=))
+                                 (att (attach-kprobe (prog-info-fd (cdr prog-entry))
+                                                     ,function-name ,@args)))
+                            (push att (bpf-session-attachments ,',session-var))
+                            att)))
+                     (bpf:map-ref (map-name key)
+                       (let* ((mname (string-downcase
+                                      (substitute #\_ #\-
+                                                  (symbol-name map-name))))
+                              (ks (gethash mname ',map-key-sizes))
+                              (vs (gethash mname ',map-value-sizes)))
+                         `(let ((result (map-lookup
+                                         (cdr (assoc ,mname
+                                                     (bpf-session-maps ,',session-var)
+                                                     :test #'string=))
+                                         (encode-int-key ,key ,(or ks 4)))))
+                            (when result
+                              (decode-int-value result))))))
+                  ,@runtime-body)
+             (session-close ,session-var)))))))

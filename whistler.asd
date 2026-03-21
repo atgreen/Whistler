@@ -29,6 +29,7 @@
   :version "0.1.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
+  :depends-on ("whistler")
   :serial t
   :pathname "src/loader/"
   :components ((:file "packages")
@@ -38,7 +39,8 @@
                (:file "program")
                (:file "attach")
                (:file "ringbuf")
-               (:file "loader")))
+               (:file "loader")
+               (:file "session")))
 
 (defsystem "whistler/tests"
   :description "Whistler test suite"
