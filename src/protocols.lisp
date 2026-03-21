@@ -128,6 +128,43 @@
                  (let ((,var (load ,type ,buf 0)))
                    ,@body))))))))
 
+;;; ---- Ring buffer patterns ----
+
+(defmacro with-ringbuf ((var map size &key (flags 0)) &body body)
+  "Reserve a ring buffer entry, execute BODY, and submit on normal exit.
+   If BODY executes (return ...), the reservation is NOT auto-submitted —
+   use (ringbuf-discard VAR 0) before returning if needed.
+   VAR is bound to the reserved pointer (guaranteed non-null in BODY)."
+  `(let ((,var (ringbuf-reserve ,map ,size ,flags)))
+     (when ,var
+       ,@body
+       (ringbuf-submit ,var 0))))
+
+;;; ---- Process metadata helpers ----
+
+(defmacro fill-process-info (event &key pid-field uid-field timestamp-field comm-field comm-size)
+  "Fill common process metadata fields in a struct.
+   Each keyword names the struct accessor setter (a symbol like moxie-event-pid).
+   PID-FIELD and UID-FIELD receive u32 values from get-current-pid-tgid/uid-gid.
+   TIMESTAMP-FIELD receives ktime-get-ns.
+   COMM-FIELD is a -ptr accessor symbol; COMM-SIZE is the array size."
+  (let ((forms '()))
+    (when pid-field
+      (let ((tgid (gensym "TGID")))
+        (push `(let ((,tgid (get-current-pid-tgid)))
+                 (setf (,pid-field ,event) (cast u32 (ash ,tgid -32))))
+              forms)))
+    (when uid-field
+      (let ((ugid (gensym "UGID")))
+        (push `(let ((,ugid (get-current-uid-gid)))
+                 (setf (,uid-field ,event) (cast u32 ,ugid)))
+              forms)))
+    (when timestamp-field
+      (push `(setf (,timestamp-field ,event) (ktime-get-ns)) forms))
+    (when comm-field
+      (push `(get-current-comm (,comm-field ,event) ,(or comm-size 16)) forms))
+    `(progn ,@(nreverse forms))))
+
 ;;; ---- incf / decf ----
 
 (defmacro incf (place &optional (delta 1))

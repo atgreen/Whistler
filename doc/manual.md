@@ -457,6 +457,32 @@ should be a struct pointer (from `make-*`).
 (ringbuf-discard ptr flags)           ; discard reserved data
 ```
 
+```lisp
+(with-ringbuf (var map-name size [:flags 0])
+  body...)
+```
+
+Reserve a ring buffer entry, execute `body`, and auto-submit on normal exit.
+`var` is bound to the reserved pointer (guaranteed non-null inside `body`).
+If reserve fails, `body` is skipped. Use `(ringbuf-discard var 0)` before
+`(return ...)` if you need to abort inside `body`.
+
+#### Process metadata
+
+```lisp
+(fill-process-info event
+  :pid-field STRUCT-PID
+  :uid-field STRUCT-UID
+  :timestamp-field STRUCT-TIMESTAMP
+  :comm-field STRUCT-COMM-PTR
+  :comm-size 16)
+```
+
+Fill common process metadata fields in a struct. Each keyword names the
+struct accessor to use. All fields are optional. Expands to
+`get-current-pid-tgid`, `get-current-uid-gid`, `ktime-get-ns`, and
+`get-current-comm` calls as needed.
+
 ### Tail calls
 
 ```lisp
