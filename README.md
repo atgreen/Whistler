@@ -7,8 +7,6 @@ s-expressions directly to eBPF bytecode and emits valid ELF object files
 loadable by the kernel — no C compiler, no clang, no LLVM in the pipeline.
 
 ```lisp
-(in-package #:whistler)
-
 (defmap pkt-count :type :array
   :key-size 4 :value-size 8 :max-entries 1)
 
