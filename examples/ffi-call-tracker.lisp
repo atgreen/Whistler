@@ -15,7 +15,8 @@
 
 (defpackage #:ffi-call-tracker
   (:use #:cl #:whistler #:whistler/loader)
-  (:shadowing-import-from #:whistler #:case #:defstruct #:incf #:decf))
+  (:shadowing-import-from #:whistler #:defstruct #:incf #:decf)
+  (:shadowing-import-from #:cl #:case))
 
 (in-package #:ffi-call-tracker)
 
@@ -31,7 +32,7 @@
   (comm (array u8 16)) (arg-types (array u8 16))
   (nargs u16) (rtype u8) (abi u8) (pad u32))
 
-(cl:defconstant +max-args+ 16)
+(defconstant +max-args+ 16)
 
 ;;; ========== FFI type name tables ==========
 
@@ -46,7 +47,7 @@
       "?"))
 
 (defun ffi-abi-name (abi)
-  (cl:case abi (2 "unix64") (3 "win64") (4 "gnuw64") (otherwise "?")))
+  (case abi (2 "unix64") (3 "win64") (4 "gnuw64") (otherwise "?")))
 
 ;;; ========== Stats key decoder ==========
 
@@ -54,7 +55,7 @@
   "Decode a stats-key byte array into (comm signature)."
   (let* ((comm-end (or (position 0 key-bytes :end 16) 16))
          (comm (map 'string #'code-char (subseq key-bytes 0 comm-end)))
-         (nargs (logior (aref key-bytes 32) (ash key-bytes 33) 8))
+         (nargs (logior (aref key-bytes 32) (ash (aref key-bytes 33) 8)))
          (rtype (aref key-bytes 34))
          (abi (aref key-bytes 35))
          (n (min nargs 16))
