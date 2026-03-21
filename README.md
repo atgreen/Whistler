@@ -43,11 +43,6 @@ verifier-constrained, repetitive, and highly pattern-driven.
 - **Automatic CO-RE support.** Whistler preserves struct identity through the
   compiler pipeline and emits CO-RE relocations automatically, so portable
   struct access does not require extra ceremony in user code.
-- **Optimization for eBPF specifically.** The backend is tuned around eBPF
-  realities like helper clobbers, stack-slot reuse, map-fd caching, and
-  instruction-count pressure, rather than being a general optimizer retargeted
-  to BPF.
-
 If you already have a C/libbpf workflow, Whistler is not trying to replace that
 ecosystem wholesale. It is for cases where you want a language and compiler
 designed around eBPF itself.
@@ -908,61 +903,9 @@ byte-level codec — one definition serves both kernel and userspace:
 
 See `examples/ffi-call-tracker.lisp` for a complete standalone example.
 
-## Internals
+## Author
 
-### Architecture
-
-The SSA-based optimizing pipeline matches or beats `clang -O2` on instruction
-count.
-
-```
-Whistler source (.lisp)
-  → CL macroexpand (user macros, protocol macros)
-  → Lowering to SSA IR (virtual registers, basic blocks, φ-functions)
-  → SSA optimization passes:
-      copy propagation → constant propagation → offset folding →
-      dead code elimination → lookup-delete fusion → load hoisting →
-      PHI-branch threading → bitmask-check fusion
-  → Linear-scan register allocation (callee-saved / caller-saved pools)
-  → BPF instruction emission from SSA IR
-  → Peephole optimization (redundant mov/jump elimination, tail merging)
-  → CO-RE relocation tracking (struct field access → .BTF.ext records)
-  → ELF emission (sections, symbols, relocations, .BTF, .BTF.ext)
-  → .bpf.o (loadable by bpftool / ip link / libbpf)
-```
-
-### Project structure
-
-```
-whistler/
-├── whistler.asd       ASDF system definition
-├── src/
-│   ├── packages.lisp      Package definitions
-│   ├── bpf.lisp           eBPF instruction encoding and constants
-│   ├── btf.lisp           BTF and BTF.ext (CO-RE) encoder
-│   ├── elf.lisp           ELF object file writer (no dependencies)
-│   ├── compiler.lisp      Shared definitions, macro expansion, constant folding
-│   ├── ir.lisp            SSA IR data structures (basic blocks, instructions)
-│   ├── lower.lisp         S-expression → SSA IR lowering
-│   ├── ssa-opt.lisp       SSA optimization passes
-│   ├── regalloc.lisp      Linear-scan register allocator
-│   ├── emit.lisp          SSA IR → BPF instruction emission
-│   ├── peephole.lisp      Post-regalloc peephole optimizer
-│   ├── whistler.lisp      Top-level API (defmap, defprog, CLI)
-│   ├── protocols.lisp     Surface language macros + protocol headers
-│   └── codegen.lisp       Shared header generation (C, Go, Rust, Python, CL)
-├── examples/
-│   ├── count-xdp.lisp              Packet counter (11 insns)
-│   ├── drop-port.lisp              Port blocker (26 insns)
-│   ├── ratelimit-xdp.lisp          Per-IP rate limiter (55 insns)
-│   ├── synflood-xdp.lisp           SYN flood filter (68 insns)
-│   ├── runqlat.lisp                 Run queue latency histogram (37 insns)
-│   ├── tail-call-dispatch.lisp      Protocol dispatch via tail calls (26 insns)
-│   └── multi-prog.lisp             Multi-program ELF (2 programs, 44 insns)
-└── tests/
-    ├── test.lisp             14 tests
-    └── test-ssa.lisp         SSA pipeline integration test
-```
+Whistler is created by [Anthony Green](https://github.com/atgreen).
 
 ## License
 
