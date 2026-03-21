@@ -306,7 +306,18 @@
        (lower-core-ctx-load ctx args))
 
       ((sym= head 'setf)
-       (lower-setf ctx (first args) (second args)))
+       ;; CL-style multi-pair setf: (setf place1 val1 place2 val2 ...)
+       (let ((pairs args)
+             (result nil))
+         (loop while pairs do
+           (unless (cdr pairs)
+             (whistler/compiler:whistler-error
+              :what "odd number of arguments to setf"
+              :where (format nil "(setf ~{~s~^ ~})" args)
+              :expected "(setf place value ...) with paired arguments"))
+           (setf result (lower-setf ctx (first pairs) (second pairs)))
+           (setf pairs (cddr pairs)))
+         result))
 
       ((sym= head 'stack-addr)
        (lower-stack-addr ctx (first args)))

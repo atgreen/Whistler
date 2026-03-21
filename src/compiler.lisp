@@ -191,14 +191,25 @@
                                          (whistler-macroexpand f)))
                                    (cddr form))))
                   (list* (car form) bindings body)))
-               ;; (setf (accessor args...) val) — try CL setf expansion
-               ((and (sym= head 'setf)
-                     (consp (second form)))
-                (let ((expanded (macroexpand-1 form)))
-                  (if (not (eq expanded form))
-                      (whistler-macroexpand expanded)
-                      ;; No setf expander — recurse normally
-                      (cons (car form) (mapcar #'whistler-macroexpand (cdr form))))))
+               ;; (setf ...) — handle multi-pair and accessor expansion
+               ((sym= head 'setf)
+                (let ((args (cdr form)))
+                  (cond
+                    ;; Multi-pair: (setf a 1 b 2 ...) → (progn (setf a 1) (setf b 2) ...)
+                    ((> (length args) 2)
+                     (let ((pairs '()))
+                       (loop while args do
+                         (push `(setf ,(first args) ,(second args)) pairs)
+                         (setf args (cddr args)))
+                       (whistler-macroexpand `(progn ,@(nreverse pairs)))))
+                    ;; Accessor place: (setf (accessor ...) val) — try CL setf expansion
+                    ((consp (first args))
+                     (let ((expanded (macroexpand-1 form)))
+                       (if (not (eq expanded form))
+                           (whistler-macroexpand expanded)
+                           (cons (car form) (mapcar #'whistler-macroexpand (cdr form))))))
+                    ;; Simple: (setf var val) — recurse normally
+                    (t (cons (car form) (mapcar #'whistler-macroexpand (cdr form)))))))
                ;; Everything else — expand all arguments
                (t
                 (cons (car form) (mapcar #'whistler-macroexpand (cdr form))))))
