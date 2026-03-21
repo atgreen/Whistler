@@ -3,7 +3,7 @@
   :version "0.6.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
-  :depends-on ("version-string")
+  :depends-on ()
   :build-operation "program-op"
   :build-pathname "../whistler"
   :entry-point "whistler:main"

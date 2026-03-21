@@ -9,7 +9,14 @@
 ;;; Whistler: top-level interface
 ;;; Compile Lisp forms to eBPF ELF object files.
 
-(version-string:define-version-parameter *version* "whistler")
+(defun whistler-version ()
+  "Return the Whistler version string from the ASDF system definition."
+  (let ((sys (asdf:find-system "whistler" nil)))
+    (if sys
+        (format nil "v~a" (asdf:component-version sys))
+        "unknown")))
+
+(defvar *version* (whistler-version))
 
 (defvar *user-constants* '()
   "Constants defined by user code in the current compilation. Set by codegen.")

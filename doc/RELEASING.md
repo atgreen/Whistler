@@ -83,11 +83,11 @@ sbcl --eval '(require :asdf)' \
      --eval '(asdf:make "whistler")'
 ```
 
-This produces a standalone binary with the `cl-version-string` library
-embedding the git hash in the version string (e.g., `0.1.0-gabcdef`).
+This produces a standalone binary. The version comes from `:version` in
+`whistler.asd`.
 
 ### Dependencies
 
-- **Build:** SBCL 2.0+, cl-version-string (via ocicl)
+- **Build:** SBCL 2.0+ (no external CL libraries required)
 - **Runtime:** None (standalone binary)
 - **Optional:** clang (for compiling C reference programs), bpftool/readelf (for inspecting output)
