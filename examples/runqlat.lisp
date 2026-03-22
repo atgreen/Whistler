@@ -13,11 +13,9 @@
 
 ;;; ---- Maps ----
 
-;; pid → enqueue timestamp (nanoseconds)
 (defmap start :type :hash
   :key-size 4 :value-size 8 :max-entries 10240)
 
-;; Log2 histogram: 26 buckets (index → count)
 (defmap hist :type :array
   :key-size 4 :value-size 8 :max-entries 26)
 
@@ -27,10 +25,24 @@
 (defconstant +max-slots+ 26)
 
 ;;; ---- Tracepoint field accessors ----
+;;; Use deftracepoint when the format file is readable (root),
+;;; otherwise fall back to hardcoded offsets for x86-64 Linux 6.x.
 
-(defmacro tp-prev-pid ()   `(ctx-load u32 24))
-(defmacro tp-prev-state () `(ctx-load u64 32))
-(defmacro tp-next-pid ()   `(ctx-load u32 56))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (if (probe-file "/sys/kernel/tracing/events/sched/sched_switch/format")
+      (handler-case
+          (eval '(deftracepoint sched/sched-switch prev-pid prev-state next-pid))
+        (error ()
+          ;; Permission denied — use fallback offsets
+          (eval '(progn
+                   (defmacro tp-prev-pid ()   '(ctx-load u32 24))
+                   (defmacro tp-prev-state () '(ctx-load u64 32))
+                   (defmacro tp-next-pid ()   '(ctx-load u32 56))))))
+      ;; No tracefs — use fallback offsets
+      (progn
+        (defmacro tp-prev-pid ()   '(ctx-load u32 24))
+        (defmacro tp-prev-state () '(ctx-load u64 32))
+        (defmacro tp-next-pid ()   '(ctx-load u32 56)))))
 
 ;;; ---- Program ----
 
@@ -38,9 +50,9 @@
                   :section "tracepoint/sched/sched_switch"
                   :license "GPL")
 
-  (let ((prev-pid   (tp-prev-pid))
-        (prev-state (tp-prev-state))
-        (next-pid   (tp-next-pid)))
+  (let* ((prev-pid   (tp-prev-pid))
+         (prev-state (tp-prev-state))
+         (next-pid   (tp-next-pid)))
 
     ;; If previous task is still runnable (preempted, not blocking),
     ;; record its enqueue time.

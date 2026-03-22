@@ -4,7 +4,7 @@
 ;;; (new TCP SYN packets) and sends them to userspace via a ring
 ;;; buffer. Userspace can read events with bpftool or libbpf.
 ;;;
-;;; Each event is a 16-byte struct: (src-ip dst-ip dst-port proto).
+;;; Each event is a 12-byte struct: (src-ip dst-ip dst-port proto).
 ;;;
 ;;; Attach with:
 ;;;   bpftool prog load ringbuf-events.bpf.o /sys/fs/bpf/ringbuf_events
@@ -26,11 +26,8 @@
 
 ;;; Maps
 
-;; Ring buffer for sending events to userspace
-(defmap events :type :ringbuf
-  :key-size 0 :value-size 0 :max-entries 4096)
+(defmap events :type :ringbuf :max-entries 4096)
 
-;; Statistics
 (defmap rb-stats :type :array
   :key-size 4 :value-size 8 :max-entries 2)
 
@@ -40,37 +37,24 @@
 ;;; Program
 
 (defprog event-logger (:type :xdp :section "xdp" :license "GPL")
-  (let ((data     (xdp-data))
-        (data-end (xdp-data-end)))
-    ;; Need Eth + IPv4 + at least TCP header start (ports)
-    (when (> (+ data 38) data-end)
-      (return XDP_PASS))
-    (when (/= (eth-type data) +ethertype-ipv4+)
-      (return XDP_PASS))
-    (let ((ip    (+ data +eth-hdr-len+))
-          (proto (ipv4-protocol (+ data +eth-hdr-len+))))
-      ;; TCP SYN packets only
-      (when (/= proto +ip-proto-tcp+)
-        (return XDP_PASS))
-      ;; Need TCP header for flags
-      (when (> (+ data 54) data-end)         ; 14 + 20 + 20 = 54
-        (return XDP_PASS))
-      (let ((tcp   (+ ip +ipv4-hdr-len+))
-            (flags (tcp-flags (+ ip +ipv4-hdr-len+))))
-        ;; Only log new connections (SYN set, ACK not set)
-        (when (and (logand flags +tcp-syn+)
-                   (not (logand flags +tcp-ack+)))
-          ;; Reserve space in ring buffer
-          (let ((event (ringbuf-reserve events (sizeof conn-event) 0)))
-            (if event
-                ;; Fill event struct and submit
-                (progn
-                  (setf (conn-event-src-addr event) (ipv4-src-addr ip))
-                  (setf (conn-event-dst-addr event) (ipv4-dst-addr ip))
-                  (setf (conn-event-dst-port event) (tcp-dst-port tcp))
-                  (setf (conn-event-proto event) proto)
-                  (ringbuf-submit event 0)
-                  (incf (getmap rb-stats +stat-events-sent+)))
-                ;; Ring buffer full
-                (incf (getmap rb-stats +stat-events-dropped+))))))))
+  (with-packet (data data-end :min-len 38)    ; Eth + IPv4 + TCP ports
+    (when (= (eth-type data) +ethertype-ipv4+)
+      (let* ((ip    (+ data +eth-hdr-len+))
+             (proto (ipv4-protocol ip)))
+        ;; TCP SYN packets only
+        (when (and (= proto +ip-proto-tcp+)
+                   (> (+ data 54) data-end))
+          (return XDP_PASS))
+        (when (= proto +ip-proto-tcp+)
+          (let* ((tcp   (+ ip +ipv4-hdr-len+))
+                 (flags (tcp-flags tcp)))
+            ;; Only log new connections (SYN set, ACK not set)
+            (when (and (logand flags +tcp-syn+)
+                       (not (logand flags +tcp-ack+)))
+              (with-ringbuf (event events (sizeof conn-event))
+                (setf (conn-event-src-addr event) (ipv4-src-addr ip)
+                      (conn-event-dst-addr event) (ipv4-dst-addr ip)
+                      (conn-event-dst-port event) (tcp-dst-port tcp)
+                      (conn-event-proto event) proto)
+                (incf (getmap rb-stats +stat-events-sent+)))))))))
   XDP_PASS)

@@ -535,6 +535,10 @@
 (defun parse-tracepoint-format (path)
   "Parse a tracepoint format file. Returns list of (name offset size signed-p)."
   (let ((fields '()))
+    (handler-bind ((error (lambda (e)
+                            (whistler-error
+                             :what (format nil "cannot read tracepoint format: ~a" path)
+                             :hint "compile with root access, or: sudo chmod a+r <path>"))))
     (with-open-file (f path)
       (loop for line = (read-line f nil nil)
             while line
@@ -561,7 +565,7 @@
                        (push (list name offset size signed-p
                                    (or array-size 0))
                              fields)))))))
-    (nreverse fields)))
+    (nreverse fields))))
 
 (defun split-field-decl (decl)
   "Split a C declaration into tokens by spaces and *."
