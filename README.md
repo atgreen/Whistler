@@ -150,6 +150,19 @@ bpftool map dump name pkt_count
 ip link set dev eth0 xdp off
 ```
 
+### Permissions
+
+BPF programs require elevated privileges to load. Instead of running as
+root, grant capabilities to your SBCL binary:
+
+```sh
+# Allow BPF program loading and perf event attachment
+sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/sbcl
+
+# Allow reading tracepoint format files (for deftracepoint)
+sudo chmod a+r /sys/kernel/tracing/events/sched/sched_switch/format
+```
+
 ### Generate userspace headers
 
 Whistler can generate matching struct definitions for your userland code from
@@ -422,9 +435,35 @@ C's `PT_REGS_PARM1()` etc.:
 (pt-regs-ret)      ; return value (rax)
 ```
 
-XDP context accessors (`xdp-data`, `xdp-data-end`) also emit CO-RE relocations
-for the kernel's `xdp_md` struct, so field offsets are patched automatically by
-libbpf at load time.
+### Tracepoints
+
+Auto-resolve tracepoint field offsets from the running kernel at compile time:
+
+```lisp
+;; Reads /sys/kernel/tracing/events/sched/sched_switch/format
+(deftracepoint sched/sched-switch prev-pid prev-state next-pid)
+
+;; Generates: (tp-prev-pid) → (ctx-load u32 24)
+;;            (tp-prev-state) → (ctx-load u64 32)
+;;            (tp-next-pid) → (ctx-load u32 56)
+```
+
+No hardcoded offsets — field positions come from your kernel's tracefs.
+
+### Kernel struct import
+
+Import kernel struct definitions from vmlinux BTF at compile time:
+
+```lisp
+;; Reads /sys/kernel/btf/vmlinux
+(import-kernel-struct task_struct pid tgid flags)
+
+;; Generates: (task-struct-pid ptr) → (load u32 ptr 2768)
+;;            (task-struct-tgid ptr) → (load u32 ptr 2772)
+;;            +task-struct-size+ → 9856
+```
+
+No kernel headers, no vmlinux.h — field offsets come from your kernel's BTF.
 
 ### Map operations
 

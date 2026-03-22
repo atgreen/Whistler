@@ -75,6 +75,14 @@ Memory ops: `(memset ptr off val n)` with widened stores, `(memcpy dst doff src 
 
 Pure CL BPF loader — no libbpf, no CFFI. ASDF system `whistler/loader`. Key APIs: `with-bpf-object` (load .bpf.o), `with-bpf-session` (inline compile+load), `map-lookup`/`map-update`/`map-get-next-key`, `attach-kprobe`/`attach-uprobe`, `open-ring-consumer`/`ring-poll`. `with-bpf-session` compiles BPF at macroexpand time using `bpf:map`, `bpf:prog`, `bpf:attach`, `bpf:map-ref`. The `bpf:` prefix separates kernel-side from userspace code. See `examples/ffi-call-tracker.lisp` for a complete inline example.
 
+## Kernel Integration
+
+`deftracepoint` reads tracepoint format files from tracefs at macroexpand time: `(deftracepoint sched/sched-switch prev-pid prev-state next-pid)` → generates `(tp-prev-pid)` etc. `import-kernel-struct` reads `/sys/kernel/btf/vmlinux`: `(import-kernel-struct task_struct pid tgid)` → generates `(task-struct-pid ptr)` etc.
+
+Permissions: `CAP_BPF` + `CAP_PERFMON` for loading/attaching. Use `sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/sbcl` instead of root. Tracepoint format files need `chmod a+r`.
+
+Protocol headers: Ethernet, IPv4, IPv6, TCP, UDP, ICMP with constants and `with-packet`/`with-tcp`/`with-udp` parsing macros.
+
 Types: `u8`, `u16`, `u32`, `u64`. The `whistler` package shadows `case` and `defstruct` from CL.
 
 ## Multi-program and tail calls

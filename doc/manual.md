@@ -627,6 +627,71 @@ Emits a single raw BPF instruction. All arguments are integer constants. Use
 the BPF opcode encoding from the kernel headers. This is an escape hatch for
 instructions the compiler does not directly support.
 
+## Kernel integration
+
+### deftracepoint
+
+```lisp
+(deftracepoint category/event-name [field1 field2 ...])
+```
+
+Reads the tracepoint format file from tracefs at macroexpand time and generates
+`ctx-load` accessor macros named `tp-FIELD`. If no field names are given, all
+non-common fields are imported.
+
+```lisp
+(deftracepoint sched/sched-switch prev-pid prev-state next-pid)
+;; Generates: (tp-prev-pid), (tp-prev-state), (tp-next-pid)
+```
+
+The format file path is
+`/sys/kernel/tracing/events/{category}/{event}/format`. Requires read
+permission on the file (default is root-only; use `chmod a+r` to allow
+non-root compilation).
+
+Array fields generate a `-ptr` accessor instead of a value accessor.
+
+### import-kernel-struct
+
+```lisp
+(import-kernel-struct struct-name [field1 field2 ...])
+```
+
+Reads `/sys/kernel/btf/vmlinux` at macroexpand time and generates `load`
+accessor macros for the specified kernel struct fields. If no field names are
+given, all scalar fields are imported.
+
+```lisp
+(import-kernel-struct task_struct pid tgid flags)
+;; Generates: (task-struct-pid ptr), (task-struct-tgid ptr),
+;;            (task-struct-flags ptr), +task-struct-size+
+```
+
+BTF types are resolved through typedefs, const, volatile, etc. to the
+underlying scalar type. Pointer fields become `u64`. The struct's total size
+is available as `+NAME-SIZE+`.
+
+### Permissions
+
+BPF operations require Linux capabilities:
+
+- **`CAP_BPF`** — load programs, create maps
+- **`CAP_PERFMON`** — attach to perf events (kprobes, uprobes, tracepoints)
+
+Grant them to SBCL instead of running as root:
+
+```sh
+sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/sbcl
+```
+
+Tracepoint format files and vmlinux BTF are readable by root by default.
+To allow non-root compilation:
+
+```sh
+sudo chmod a+r /sys/kernel/tracing/events/sched/sched_switch/format
+# vmlinux BTF is typically world-readable already
+```
+
 ## Protocol library
 
 The protocol library (`protocols.lisp`) provides compile-time macros for
@@ -658,6 +723,12 @@ accessor wraps the load in `ntohs` or `ntohl` as appropriate.
 `tcp-data-off`, `tcp-flags`, `tcp-window`, `tcp-checksum`, `tcp-urgent`
 
 **UDP** — `udp-src-port`, `udp-dst-port`, `udp-length`, `udp-checksum`
+
+**IPv6** — `ipv6-ver-tc-flow`, `ipv6-payload-len`, `ipv6-nexthdr`,
+`ipv6-hop-limit`, `ipv6-src-addr-hi`, `ipv6-src-addr-lo`,
+`ipv6-dst-addr-hi`, `ipv6-dst-addr-lo`
+
+**ICMP** — `icmp-type`, `icmp-code`, `icmp-checksum`, `icmp-rest`
 
 ### XDP context accessors
 
