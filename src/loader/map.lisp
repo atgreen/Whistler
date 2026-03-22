@@ -90,7 +90,6 @@
         (symtab (bpf-elf-symtab elf)))
     (when map-sec
       (let ((sec-idx (car map-sec))
-            (sec (cdr map-sec))
             (data (elf-section-data (cdr map-sec))))
         ;; Find OBJECT symbols in the maps section
         (loop for sym in symtab

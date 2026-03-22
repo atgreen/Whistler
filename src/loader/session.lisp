@@ -53,6 +53,7 @@
                                  :flags (or (getf rest :map-flags) 0)))))
         (values map-specs
                 (mapcar (lambda (cu prog-spec)
+                          (declare (ignore prog-spec))
                           (list :name (whistler/compiler:cu-name cu)
                                 :section (whistler/compiler:cu-section cu)
                                 :license (whistler/compiler:cu-license cu)
