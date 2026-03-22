@@ -73,19 +73,7 @@
           (t "u64"))))
 
 ;;; ========== Constant collection ==========
-
-(defvar *user-constants* '()
-  "Constants defined by user code in the current compilation.")
-
-(defun collect-package-constants (pkg)
-  "Return an alist of (symbol-name . value) for all integer constants in PKG."
-  (let ((result '()))
-    (do-symbols (sym pkg)
-      (when (and (boundp sym) (constantp sym)
-                 (not (keywordp sym))
-                 (integerp (symbol-value sym)))
-        (push (cons (symbol-name sym) (symbol-value sym)) result)))
-    result))
+;;; *user-constants* is defined in whistler.lisp (single source of truth).
 
 (defun find-new-constants (before after)
   "Find constants in AFTER that are new or changed vs BEFORE.

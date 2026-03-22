@@ -218,10 +218,10 @@
                           (declare (ignore fsize))
                           (multiple-value-bind (elem-type count is-array)
                               (parse-field-type ftype)
-                            (declare (ignore elem-type))
                             (let ((kw (intern (string fname) :keyword)))
                               (if is-array
-                                  `(,kw (subseq bytes ,foffset ,(+ foffset count)))
+                                  (let ((byte-len (* count (struct-type-byte-size elem-type))))
+                                    `(,kw (subseq bytes ,foffset ,(+ foffset byte-len))))
                                   (cl:case (struct-type-byte-size ftype)
                                     (1 `(,kw (aref bytes ,foffset)))
                                     (2 `(,kw (logior (aref bytes ,foffset)
@@ -241,7 +241,11 @@
                                                            (symbol-name fname))
                                                    (symbol-package name))))
                               (if is-array
-                                  `(replace bytes (,accessor rec) :start1 ,foffset)
+                                  (let ((byte-len (* count (struct-type-byte-size
+                                                            (second ftype)))))
+                                    `(replace bytes (,accessor rec)
+                                              :start1 ,foffset
+                                              :end1 ,(+ foffset byte-len)))
                                   (cl:case (struct-type-byte-size ftype)
                                     (1 `(setf (aref bytes ,foffset) (,accessor rec)))
                                     (2 `(let ((v (,accessor rec)))
