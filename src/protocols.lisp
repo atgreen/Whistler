@@ -538,7 +538,7 @@
     (handler-bind ((error (lambda (e)
                             (whistler-error
                              :what (format nil "cannot read tracepoint format: ~a" path)
-                             :hint "compile with root access, or: sudo chmod a+r <path>"))))
+                             :hint "tracefs format files are root-readable by default. Fix with: sudo chmod a+r <path>"))))
     (with-open-file (f path)
       (loop for line = (read-line f nil nil)
             while line
