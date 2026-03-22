@@ -141,6 +141,8 @@
            #:+udp-hdr-len+
            ;; Structs
            #:defstruct #:struct-set #:struct-ref #:sizeof
+           ;; Kernel integration
+           #:deftracepoint #:import-kernel-struct
            ;; Memory operations
            #:memset #:memcpy
            ;; User-space iteration

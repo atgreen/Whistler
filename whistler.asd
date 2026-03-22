@@ -22,6 +22,7 @@
                (:file "peephole")
                (:file "whistler")
                (:file "protocols")
+               (:file "vmlinux")
                (:file "codegen")))
 
 (defsystem "whistler/loader"

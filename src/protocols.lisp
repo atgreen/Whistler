@@ -524,3 +524,141 @@
 (defmacro xdp-data-end ()
   "Load XDP context data-end pointer."
   `(core-ctx-load u32 4 xdp-md data-end))
+
+;;; ================================================================
+;;; Tracepoint support
+;;; ================================================================
+;;;
+;;; deftracepoint reads /sys/kernel/tracing/events/{category}/{event}/format
+;;; at macroexpand time and generates ctx-load accessors for each field.
+
+(defun parse-tracepoint-format (path)
+  "Parse a tracepoint format file. Returns list of (name offset size signed-p)."
+  (let ((fields '()))
+    (with-open-file (f path)
+      (loop for line = (read-line f nil nil)
+            while line
+            do (let ((fpos (search "field:" line)))
+                 (when fpos
+                   (let* ((rest (subseq line (+ fpos 6)))
+                          ;; Extract field name: last word before ";"
+                          (semi (position #\; rest))
+                          (decl (string-trim '(#\Space #\Tab) (subseq rest 0 semi)))
+                          ;; Name is last token (may have [N] suffix)
+                          (tokens (remove "" (split-field-decl decl) :test #'string=))
+                          (raw-name (car (last tokens)))
+                          ;; Strip array suffix like [16]
+                          (bracket (position #\[ raw-name))
+                          (name (if bracket (subseq raw-name 0 bracket) raw-name))
+                          (array-size (when bracket
+                                        (parse-integer (subseq raw-name (1+ bracket))
+                                                       :junk-allowed t)))
+                          ;; Parse offset, size, signed from remaining "key:val;" pairs
+                          (offset (parse-format-field line "offset"))
+                          (size (parse-format-field line "size"))
+                          (signed-p (= 1 (or (parse-format-field line "signed") 0))))
+                     (when (and name offset size)
+                       (push (list name offset size signed-p
+                                   (or array-size 0))
+                             fields)))))))
+    (nreverse fields)))
+
+(defun split-field-decl (decl)
+  "Split a C declaration into tokens by spaces and *."
+  (let ((result '()) (current '()))
+    (loop for c across decl
+          do (cond ((member c '(#\Space #\Tab #\*))
+                    (when current
+                      (push (coerce (nreverse current) 'string) result)
+                      (setf current nil)))
+                   (t (push c current))))
+    (when current
+      (push (coerce (nreverse current) 'string) result))
+    (nreverse result)))
+
+(defun parse-format-field (line key)
+  "Extract integer value for KEY from a tracepoint format line."
+  (let ((pos (search (format nil "~a:" key) line)))
+    (when pos
+      (let ((start (+ pos (length key) 1)))
+        (parse-integer (subseq line start) :junk-allowed t)))))
+
+(defun tracepoint-type (size signed-p array-size)
+  "Map tracepoint field size to a Whistler BPF type."
+  (if (plusp array-size)
+      ;; Array field — return as (array u8 N)
+      nil
+      (if signed-p
+          (cl:case size (1 'i8) (2 'i16) (4 'i32) (8 'i64) (t 'u64))
+          (cl:case size (1 'u8) (2 'u16) (4 'u32) (8 'u64) (t 'u64)))))
+
+(defun find-tracepoint-format-path (category event)
+  "Find the tracepoint format file path."
+  (let ((paths (list (format nil "/sys/kernel/tracing/events/~a/~a/format"
+                             category event)
+                     (format nil "/sys/kernel/debug/tracing/events/~a/~a/format"
+                             category event))))
+    (find-if #'probe-file paths)))
+
+(defmacro deftracepoint (category/event &rest field-names)
+  "Define tracepoint field accessors by reading the kernel format file.
+   CATEGORY/EVENT is a symbol like sched/sched-switch.
+   FIELD-NAMES optionally restricts which fields to import.
+   If omitted, all non-common fields are imported.
+
+   Example:
+     (deftracepoint sched/sched-switch prev-pid prev-state next-pid)
+
+   Generates: (tp-prev-pid), (tp-prev-state), (tp-next-pid)
+   Each expands to (ctx-load TYPE OFFSET)."
+  (let* ((name-str (substitute #\_ #\- (string-downcase
+                                          (symbol-name category/event))))
+         (slash (position #\/ name-str))
+         (category (subseq name-str 0 slash))
+         (event (subseq name-str (1+ slash)))
+         (path (find-tracepoint-format-path category event)))
+    (unless path
+      (whistler-error
+       :what (format nil "tracepoint format not found: ~a/~a" category event)
+       :expected (format nil "/sys/kernel/tracing/events/~a/~a/format" category event)
+       :hint "ensure tracefs is mounted and you have read access"))
+    (let* ((all-fields (parse-tracepoint-format (namestring path)))
+           ;; Filter out common_ fields unless explicitly requested
+           (fields (if field-names
+                       (loop for fname in field-names
+                             for c-name = (substitute #\_ #\-
+                                            (string-downcase (symbol-name fname)))
+                             for field = (find c-name all-fields
+                                               :key #'first :test #'string=)
+                             when field collect field
+                             else do (whistler-error
+                                      :what (format nil "field ~a not found in ~a/~a"
+                                                    fname category event)
+                                      :expected (format nil "one of: ~{~a~^, ~}"
+                                                        (mapcar #'first all-fields))))
+                       (remove-if (lambda (f)
+                                    (let ((n (first f)))
+                                      (and (>= (length n) 7)
+                                           (string= (subseq n 0 7) "common_"))))
+                                  all-fields)))
+           (forms '()))
+      ;; Generate accessor macros
+      (dolist (field fields)
+        (destructuring-bind (c-name offset size signed-p array-size) field
+          (let* ((lisp-name (substitute #\- #\_ c-name))
+                 (accessor (intern (format nil "TP-~a" (string-upcase lisp-name))
+                                   (symbol-package category/event)))
+                 (type (tracepoint-type size signed-p array-size)))
+            (when type
+              (push `(defmacro ,accessor ()
+                       '(ctx-load ,type ,offset))
+                    forms))
+            ;; For array fields, generate a -ptr accessor
+            (when (plusp array-size)
+              (let ((ptr-name (intern (format nil "TP-~a-PTR"
+                                             (string-upcase lisp-name))
+                                      (symbol-package category/event))))
+                (push `(defmacro ,ptr-name ()
+                         '(+ (ctx-load u64 0) ,offset))
+                      forms))))))
+      `(progn ,@(nreverse forms)))))
