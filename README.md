@@ -943,7 +943,7 @@ See `examples/ffi-call-tracker.lisp` for a complete standalone example.
 
 ## Author
 
-Whistler is created by [Anthony Green](https://github.com/atgreen).
+Whistler was created by [Anthony Green](https://github.com/atgreen).
 
 ## License
 
