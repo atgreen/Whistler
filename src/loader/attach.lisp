@@ -86,34 +86,34 @@
 
 ;;; ========== Uprobe attachment ==========
 
-(defun elf-base-vaddr (bytes)
-  "Find the base virtual address from the first PT_LOAD segment.
-   For ET_DYN (shared libs, PIE), symbol st_value is relative to this base.
-   Returns 0 for ET_EXEC where st_value is already a file offset."
-  (let ((e-type (elf-u16 bytes 16))
-        (e-phoff (elf-u64 bytes 32))
+(defun vaddr-to-file-offset (bytes vaddr)
+  "Convert a virtual address to a file offset using PT_LOAD segments.
+   Finds the PT_LOAD segment containing VADDR and computes
+   p_offset + (vaddr - p_vaddr)."
+  (let ((e-phoff (elf-u64 bytes 32))
         (e-phentsize (elf-u16 bytes 54))
         (e-phnum (elf-u16 bytes 56)))
-    (if (/= e-type 3)  ; ET_DYN = 3
-        0  ; ET_EXEC — st_value is already correct
-        ;; ET_DYN — find first PT_LOAD and return p_vaddr
-        (loop for i below e-phnum
-              for ph-off = (+ e-phoff (* i e-phentsize))
-              for p-type = (elf-u32 bytes ph-off)
-              when (= p-type 1)  ; PT_LOAD
-              return (elf-u64 bytes (+ ph-off 16))  ; p_vaddr
-              finally (return 0)))))
+    (loop for i below e-phnum
+          for ph-off = (+ e-phoff (* i e-phentsize))
+          for p-type = (elf-u32 bytes ph-off)
+          when (= p-type 1)  ; PT_LOAD
+          do (let ((p-offset (elf-u64 bytes (+ ph-off 8)))
+                   (p-vaddr (elf-u64 bytes (+ ph-off 16)))
+                   (p-memsz (elf-u64 bytes (+ ph-off 40))))
+               (when (and (>= vaddr p-vaddr)
+                          (< vaddr (+ p-vaddr p-memsz)))
+                 (return (+ p-offset (- vaddr p-vaddr))))))
+    ;; Fallback: return vaddr unchanged (best effort)
+    vaddr))
 
 (defun resolve-elf-symbol-offset (binary-path symbol-name)
   "Find the file offset of a symbol in an ELF binary.
-   Handles both ET_EXEC and ET_DYN (shared libs, PIE) by subtracting
-   the base virtual address of the first PT_LOAD segment."
+   Looks up st_value in symtab/dynsym, then converts the virtual address
+   to a file offset via PT_LOAD segment mapping."
   (let* ((bytes (read-elf-bytes binary-path))
-         (base-vaddr (elf-base-vaddr bytes))
          (e-shoff (elf-u64 bytes 40))
          (e-shentsize (elf-u16 bytes 58))
          (e-shnum (elf-u16 bytes 60)))
-    ;; Find .dynsym or .symtab
     (loop for i below e-shnum
           for hdr-off = (+ e-shoff (* i e-shentsize))
           for sh-type = (elf-u32 bytes (+ hdr-off 4))
@@ -130,7 +130,7 @@
                      for value = (elf-u64 bytes (+ sym-off off 8))
                      when (string= name symbol-name)
                      do (return-from resolve-elf-symbol-offset
-                          (- value base-vaddr)))))
+                          (vaddr-to-file-offset bytes value)))))
     (error "Symbol ~a not found in ~a" symbol-name binary-path)))
 
 (defun attach-uprobe (prog-fd binary-path symbol-name &key retprobe)
