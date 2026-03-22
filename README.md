@@ -111,7 +111,7 @@ can read the compiler to understand exactly what bytecode was generated and why.
 
 - [SBCL](http://www.sbcl.org/) (Steel Bank Common Lisp) 2.0+
 - Linux with kernel 5.3+ (for bounded loop support)
-- [FiveAM](https://github.com/lispci/fiveam) (for tests only, install via Quicklisp: `(ql:quickload :fiveam)`)
+- [FiveAM](https://github.com/lispci/fiveam) (for tests only)
 - `readelf` / `llvm-objdump` (optional, for inspecting output)
 
 ### Build
