@@ -17,6 +17,7 @@
                (:file "ir")
                (:file "lower")
                (:file "ssa-opt")
+               (:file "sccp")
                (:file "regalloc")
                (:file "emit")
                (:file "peephole")

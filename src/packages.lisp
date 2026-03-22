@@ -96,7 +96,7 @@
            ;; Lowering
            #:lower-program
            ;; Optimization
-           #:copy-propagation #:dead-code-elimination #:optimize-ir
+           #:copy-propagation #:dead-code-elimination #:sccp #:optimize-ir
            ;; Register allocation
            #:linear-scan-alloc #:compute-liveness
            ;; Emission

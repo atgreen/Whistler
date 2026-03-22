@@ -2034,6 +2034,9 @@
   (eliminate-common-subexpressions prog)
   (forward-stores-to-loads prog)
 
+  ;; Phase 3b: SCCP — propagate constants through PHIs and fold branches
+  (sccp prog)
+
   ;; Phase 4: Clean up after transformations
   (dead-code-elimination prog)
   (dead-destination-elimination prog)
