@@ -163,3 +163,57 @@
   "Does call-like INSN have the given EFFECT (a keyword)?
    Convenience predicate for checking a single effect."
   (member effect (helper-effects insn)))
+
+;;; ========== Debugging and Inspection ==========
+
+(defun format-ir-arg (arg)
+  "Format a single IR operand for printing."
+  (cond
+    ((integerp arg) (format nil "%~d" arg))
+    ((and (consp arg) (eq (car arg) :imm))
+     (let ((val (second arg)))
+       (if (integerp val)
+           (if (or (> val 1000) (< val -1000))
+               (format nil "0x~x" val)
+               (format nil "~d" val))
+           (format nil "~a" val))))
+    ((and (consp arg) (eq (car arg) :label)) (format nil "@~a" (second arg)))
+    ((and (consp arg) (eq (car arg) :map)) (format nil "[~a]" (second arg)))
+    ((and (consp arg) (eq (car arg) :type)) (format nil "<~a>" (second arg)))
+    ((and (consp arg) (eq (car arg) :helper)) (format nil "helper:~d" (second arg)))
+    ((and (consp arg) (integerp (first arg)))
+     ;; Phi operand: (vreg (:label L))
+     (format nil "(%~d from @~a)" (first arg) (second (second arg))))
+    (t (format nil "~s" arg))))
+
+(defmethod print-object ((insn ir-insn) stream)
+  (print-unreadable-object (insn stream :type nil :identity nil)
+    (format stream "IR: ")
+    (when (ir-insn-dst insn)
+      (format stream "%~d = " (ir-insn-dst insn)))
+    (format stream "~a" (ir-insn-op insn))
+    (dolist (arg (ir-insn-args insn))
+      (format stream " ~a" (format-ir-arg arg)))
+    (when (ir-insn-type insn)
+      (format stream " :~a" (ir-insn-type insn)))))
+
+(defun ir-dump (prog &optional (stream *standard-output*))
+  "Print a human-readable dump of the SSA IR program."
+  (format stream "~&; IR Program (~a, ~a)~%"
+          (ir-program-section prog) (ir-program-license prog))
+  (dolist (block (ir-program-blocks prog))
+    (format stream "~%~a:~%" (basic-block-label block))
+    (when (basic-block-preds block)
+      (format stream "  ; preds: ~{~a~^, ~}~%" (basic-block-preds block)))
+    (dolist (insn (basic-block-insns block))
+      (format stream "    ")
+      (when (ir-insn-dst insn)
+        (format stream "%~-3d = " (ir-insn-dst insn)))
+      (format stream "~-10a" (ir-insn-op insn))
+      (let ((args (mapcar #'format-ir-arg (ir-insn-args insn))))
+        (format stream "~{~a~^, ~}" args))
+      (when (ir-insn-type insn)
+        (format stream "  (~a)" (ir-insn-type insn)))
+      (terpri stream))
+    (when (basic-block-succs block)
+      (format stream "  ; succs: ~{~a~^, ~}~%" (basic-block-succs block)))))

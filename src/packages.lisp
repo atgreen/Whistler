@@ -92,7 +92,7 @@
            #:ir-fresh-vreg #:ir-fresh-label #:ir-find-block #:ir-add-block
            #:bb-emit #:bb-terminator-p
            #:ir-insn-vreg-uses #:ir-insn-side-effect-p #:ir-insn-all-vreg-uses
-           #:call-like-op-p #:helper-effects #:helper-invalidates-p
+           #:call-like-op-p #:helper-effects #:helper-invalidates-p #:ir-dump
            ;; Lowering
            #:lower-program
            ;; Optimization
@@ -124,6 +124,15 @@
            #:ipv4-src-addr #:ipv4-dst-addr #:ipv4-protocol #:ipv4-ttl
            #:ipv4-total-len #:ipv4-ver-ihl #:ipv4-tos
            #:+ipv4-hdr-len+ #:+ip-proto-tcp+ #:+ip-proto-udp+ #:+ip-proto-icmp+
+           #:+ip-proto-ipv6-icmp+
+           ;; IPv6
+           #:ipv6-ver-tc-flow #:ipv6-payload-len #:ipv6-nexthdr #:ipv6-hop-limit
+           #:ipv6-src-addr-hi #:ipv6-src-addr-lo
+           #:ipv6-dst-addr-hi #:ipv6-dst-addr-lo
+           #:+ipv6-hdr-len+
+           ;; ICMP
+           #:icmp-type #:icmp-code #:icmp-checksum #:icmp-rest
+           #:+icmp-hdr-len+
            ;; TCP
            #:tcp-src-port #:tcp-dst-port #:tcp-flags #:tcp-seq #:tcp-ack-seq
            #:+tcp-hdr-len+ #:+tcp-syn+ #:+tcp-ack+ #:+tcp-fin+ #:+tcp-rst+

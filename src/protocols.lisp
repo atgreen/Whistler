@@ -375,6 +375,29 @@
 (defconstant +ip-proto-icmp+  1)
 (defconstant +ip-proto-tcp+   6)
 (defconstant +ip-proto-udp+  17)
+(defconstant +ip-proto-ipv6-icmp+ 58)
+
+;; IPv6 header (40 bytes)
+(defheader ipv6
+  (ver-tc-flow :offset 0  :type u32 :net-order t)
+  (payload-len :offset 4  :type u16 :net-order t)
+  (nexthdr     :offset 6  :type u8)
+  (hop-limit   :offset 7  :type u8)
+  (src-addr-hi :offset 8  :type u64)
+  (src-addr-lo :offset 16 :type u64)
+  (dst-addr-hi :offset 24 :type u64)
+  (dst-addr-lo :offset 32 :type u64))
+
+(defconstant +ipv6-hdr-len+ 40)
+
+;; ICMP header (8 bytes)
+(defheader icmp
+  (type        :offset 0 :type u8)
+  (code        :offset 1 :type u8)
+  (checksum    :offset 2 :type u16)
+  (rest        :offset 4 :type u32))
+
+(defconstant +icmp-hdr-len+ 8)
 
 ;; TCP header (20 bytes minimum)
 (defheader tcp
