@@ -13,6 +13,25 @@
 (defpackage #:bpf
   (:export #:map #:prog #:attach #:map-ref #:map-ref-int))
 
+;;; ========== Symbol re-interning ==========
+;;; When bpf:prog body is written in CL-USER, symbols like INCF and GETMAP
+;;; resolve to CL:INCF and CL-USER::GETMAP instead of WHISTLER::INCF and
+;;; WHISTLER::GETMAP. Re-intern them so the Whistler macros fire correctly.
+
+(defun whistler-intern-form (form)
+  "Walk FORM and re-intern symbols into the WHISTLER package where a
+   same-named symbol already exists there."
+  (cond
+    ((null form) nil)
+    ((keywordp form) form)
+    ((symbolp form)
+     (multiple-value-bind (sym status)
+         (find-symbol (symbol-name form) :whistler)
+       (if status sym form)))
+    ((atom form) form)
+    (t (cons (whistler-intern-form (car form))
+             (whistler-intern-form (cdr form))))))
+
 ;;; ========== Compile-time BPF collection ==========
 
 (defun compile-bpf-forms (map-forms prog-forms)
@@ -178,8 +197,9 @@
            (push `(whistler:defmap ,name ,@args) map-forms)))
         ;; (bpf:prog name (options...) body...)
         ((and (consp form) (eq (car form) 'bpf:prog))
-         (push `(whistler:defprog ,(second form) ,(third form) ,@(cdddr form))
-               prog-forms))
+         (let ((body (mapcar #'whistler-intern-form (cdddr form))))
+           (push `(whistler:defprog ,(second form) ,(third form) ,@body)
+                 prog-forms)))
         ;; Everything else is runtime CL code
         (t (push form runtime-body))))
     (setf map-forms (nreverse map-forms))

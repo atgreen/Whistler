@@ -192,7 +192,7 @@
       (t
        (let ((binding (ctx-lookup-var ctx sym)))
          (unless binding
-           (let ((env-vars (remove-if (lambda (n) (search "%%" n))
+           (let ((env-vars (remove-if (lambda (n) (search "%%" (symbol-name n)))
                                        (mapcar #'car (lower-ctx-env ctx)))))
              (whistler/compiler:whistler-error
               :what (format nil "unbound variable: ~a" sym)
