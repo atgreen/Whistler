@@ -1,10 +1,11 @@
 # Whistler
 
-A Lisp that compiles to eBPF.
+A Lisp compiling to eBPF.
 
 Whistler is a Common Lisp dialect for writing eBPF programs. It compiles
-s-expressions directly to eBPF bytecode and emits valid ELF object files
-loadable by the kernel — no C compiler, no clang, no LLVM in the pipeline.
+s-expressions to eBPF bytecode and emits valid ELF object files your kernel
+loads directly. The compilation pipeline has zero dependency on C, clang,
+or LLVM.
 
 ```lisp
 (defmap pkt-count :type :array
@@ -17,47 +18,59 @@ loadable by the kernel — no C compiler, no clang, no LLVM in the pipeline.
 
 This compiles to 11 eBPF instructions and a valid BPF ELF object file.
 
-## Why Whistler?
+## Whistler vs alternatives
 
-### Why use Whistler instead of `clang -target bpf`?
+### vs `clang -target bpf`
 
-Whistler is built for the actual shape of eBPF programs: small,
-verifier-constrained, repetitive, and highly pattern-driven.
+Whistler is built for the shape of eBPF programs: small, verifier-constrained,
+repetitive, pattern-driven.
 
-- **Smaller toolchain, tighter feedback loop.** eBPF programs are usually tens
-  to hundreds of instructions. Whistler compiles them directly without pulling
-  in the full C/LLVM pipeline.
-- **A language matched to the domain.** eBPF is full of explicit bounds checks,
+- Smaller toolchain, tighter feedback loop. eBPF programs are usually tens
+  to hundreds of instructions. Whistler compiles them without pulling in the
+  full C/LLVM pipeline.
+- A language matched to the domain. eBPF requires explicit bounds checks,
   map lookups, helper calls, stack shaping, and verifier-visible control flow.
-  Whistler exposes those concepts directly instead of encoding them indirectly
-  through C.
-- **Real metaprogramming.** eBPF code is full of recurring patterns: parse
+  Whistler exposes those concepts directly instead of encoding them through C.
+- Real metaprogramming. eBPF code is full of recurring patterns: parse
   headers, validate packet bounds, look up state, fast-path success, bail out
   early. In Whistler, those become hygienic macros and compile-time
   abstractions instead of preprocessor tricks.
-- **Compiler-aware abstractions.** Struct accessors, protocol helpers, and map
-  operations are part of the language surface, so the compiler can optimize
+- Compiler-aware abstractions. Struct accessors, protocol helpers, and map
+  operations are part of the language surface, so the compiler optimizes
   them intentionally rather than recovering patterns after C lowering.
-- **Automatic CO-RE support.** Whistler preserves struct identity through the
-  compiler pipeline and emits CO-RE relocations automatically, so portable
-  struct access does not require extra ceremony in user code.
-If you already have a C/libbpf workflow, Whistler is not trying to replace that
-ecosystem wholesale. It is for cases where you want a language and compiler
-designed around eBPF itself.
+- Automatic CO-RE support. Whistler preserves struct identity through the
+  compiler pipeline and emits CO-RE relocations automatically. Portable
+  struct access requires no extra ceremony in your code.
 
-### What Whistler does differently
+If you already have a C/libbpf workflow, Whistler is not trying to replace
+it wholesale. It targets cases where you want a language and compiler designed
+around eBPF itself.
 
-**The compiler is the language runtime.** Whistler source files are valid Common
-Lisp. When you compile a Whistler program, the full power of Common Lisp is
-available at compile time — real macros with hygiene, a REPL for interactive
-development, and an actual language for code generation. At runtime, the output
-is pure eBPF bytecode, indistinguishable from clang's output.
+### Side-by-side
 
-**The surface language is declarative.** Built-in macros erase BPF ceremony:
+| | Whistler | C + clang | BCC (Python) | Aya (Rust) | bpftrace |
+|---|---|---|---|---|---|
+| Toolchain size | ~3 MB (SBCL) | ~200 MB | ~100 MB | ~500 MB | ~50 MB |
+| Compile-time metaprogramming | Full CL macros | `#define` | Python strings | `proc_macro` | none |
+| Output | ELF .o | ELF .o | JIT loaded | ELF .o | JIT loaded |
+| Compile-time language | Common Lisp | cpp | Python | Rust | n/a |
+| Self-contained compiler | yes | no (needs LLVM) | no (needs kernel headers) | no (needs LLVM) | no |
+| Interactive development | REPL | no | yes | no | yes |
+| Code quality vs clang -O2 | matches or beats | baseline | n/a | comparable | n/a |
+| Lines of compiler code | ~5,500 | ~50,000+ | n/a | ~20,000+ | n/a |
+
+## How Whistler works
+
+Your Whistler source files are valid Common Lisp. When you compile one, all
+of Common Lisp is available at compile time: real macros with hygiene, a REPL
+for interactive development, and a full language for code generation. At
+runtime, the output is pure eBPF bytecode, indistinguishable from clang's.
+
+Built-in macros erase BPF ceremony:
 
 ```lisp
 ;; incf on a map handles lookup, null check, atomic increment,
-;; and initialization for new keys — all in one form.
+;; and initialization for new keys. All in one form.
 (incf (getmap pkt-count 0))
 
 ;; with-tcp does bounds check, EtherType, and protocol check
@@ -72,38 +85,24 @@ is pure eBPF bytecode, indistinguishable from clang's output.
   (setf (getmap my-map key) 1))     ; key is new
 ```
 
-The last expression in a `defprog` body is implicitly returned — no need
-for `(return XDP_PASS)` at the end.
+The last expression in a `defprog` body is implicitly returned. No
+`(return XDP_PASS)` needed at the end.
 
-**Zero dependencies for compilation.** The compiler is self-contained Common
-Lisp. The ELF writer is hand-rolled (~400 lines). No libelf, no libbpf, no
-kernel headers needed to compile. The output is a standard BPF ELF object that
-any loader (bpftool, libbpf, ip link) can load.
+The compiler is self-contained Common Lisp. The ELF writer is hand-rolled
+(~400 lines). It needs no libelf, libbpf, or kernel headers. The output is
+a standard BPF ELF loadable by bpftool, libbpf, or `ip link`.
 
-**Polyglot header generation.** `--gen c`, `--gen go`, `--gen rust`, `--gen python`,
-`--gen lisp` generate matching struct definitions from your `defstruct`
-declarations — one source of truth for BPF and userspace.
+`--gen c`, `--gen go`, `--gen rust`, `--gen python`, `--gen lisp` generate
+matching struct definitions from your `defstruct` declarations. One source of
+truth for BPF and userspace.
 
-**Pure CL userspace loader.** `whistler/loader` loads `.bpf.o` into the kernel,
-attaches probes, reads maps, and consumes ring buffers — no libbpf, no C.
-Or use `with-bpf-session` to compile and load BPF inline, in one Lisp form.
+`whistler/loader` loads `.bpf.o` into the kernel, attaches probes, reads maps,
+and consumes ring buffers from pure CL. Or use `with-bpf-session` to compile
+and load BPF inline, in one Lisp form.
 
-**The whole project is ~7,000 lines.** Compiler, loader, and session runtime.
-You can read it in an afternoon. When the verifier rejects your program, you
-can read the compiler to understand exactly what bytecode was generated and why.
-
-### Compared to alternatives
-
-| | Whistler | C + clang | BCC (Python) | Aya (Rust) | bpftrace |
-|---|---|---|---|---|---|
-| Toolchain size | ~3 MB (SBCL) | ~200 MB | ~100 MB | ~500 MB | ~50 MB |
-| Compile-time metaprogramming | Full CL macros | `#define` | Python strings | `proc_macro` | none |
-| Output | ELF .o | ELF .o | JIT loaded | ELF .o | JIT loaded |
-| Compile-time language | Common Lisp | cpp | Python | Rust | n/a |
-| Self-contained compiler | yes | no (needs LLVM) | no (needs kernel headers) | no (needs LLVM) | no |
-| Interactive development | REPL | no | yes | no | yes |
-| Code quality vs clang -O2 | **matches or beats** | baseline | n/a | comparable | n/a |
-| Lines of compiler code | ~5,500 | ~50,000+ | n/a | ~20,000+ | n/a |
+The whole project is ~7,000 lines. Compiler, loader, and session runtime. It
+reads in an afternoon. When the verifier rejects your program, you read the
+compiler to understand what bytecode it generated and why.
 
 ## Getting started
 
@@ -166,8 +165,8 @@ sudo chmod a+r /sys/kernel/tracing/events/sched/sched_switch/format
 
 ### Generate userspace headers
 
-Whistler can generate matching struct definitions for your userland code from
-the same `defstruct` definitions used in the BPF program — one source of truth
+Whistler generates matching struct definitions for your userland code from
+the same `defstruct` definitions used in the BPF program. One source of truth
 for both sides:
 
 ```sh
@@ -181,10 +180,10 @@ for both sides:
 ./whistler compile probes.lisp --gen all
 ```
 
-Supported: **C**, **Go**, **Rust**, **Python**, **Common Lisp** (`--gen lisp`). Array fields
+Supported: C, Go, Rust, Python, Common Lisp (`--gen lisp`). Array fields
 map to native syntax (`uint8_t field[16]` in C, `[16]uint8` in Go,
-`[u8; 16]` in Rust). Struct layouts are guaranteed to match because they're
-derived from the same `defstruct`.
+`[u8; 16]` in Rust). Struct layouts are guaranteed to match because they
+derive from the same `defstruct`.
 
 ## Language reference
 
@@ -202,14 +201,14 @@ macros:
 
 ;; Declare BPF programs
 (defprog my-prog (:type :xdp :section "xdp" :license "GPL")
-  ;; program body — Whistler forms
+  ;; program body
   (return XDP_PASS))
 ```
 
-**Map types:** `:hash`, `:array`, `:percpu-hash`, `:percpu-array`, `:ringbuf`,
+Map types: `:hash`, `:array`, `:percpu-hash`, `:percpu-array`, `:ringbuf`,
 `:prog-array` (for tail calls), `:lpm-trie` (for CIDR matching)
 
-**Program types:** `:xdp`, `:socket-filter`, `:tracepoint`, `:kprobe`
+Program types: `:xdp`, `:socket-filter`, `:tracepoint`, `:kprobe`
 
 ### Types
 
@@ -231,27 +230,27 @@ is specified:
       (y (load u32 ptr 4)))
   body...)
 
-;; let* binds sequentially — each init can reference prior bindings.
+;; let* binds sequentially. Each init references prior bindings.
 (let* ((x 42)
        (y (+ x 1))
        (ptr (map-lookup my-map x)))
   body...)
 
-;; Use (declare (type ...)) for sub-64-bit narrowing, just like CL.
+;; Use (declare (type ...)) for sub-64-bit narrowing, same as CL.
 (let ((port (load u16 tcp-ptr 2))
       (flags (tcp-flags tcp-ptr)))
   (declare (type u16 port) (type u8 flags))
   ...)
 
-;; setf mutates a bound variable — supports multi-pair like CL
+;; setf mutates a bound variable. Supports multi-pair like CL.
 (setf x (+ x 1))
 (setf (my-struct-a ptr) 1
       (my-struct-b ptr) 2)
 ```
 
 Types default to `u64` when omitted. Use `(declare (type ...))` for sub-64-bit
-narrowing where it matters (map keys, struct fields, protocol fields) — the
-same form CL uses. The SSA pipeline's type narrowing pass will further optimize
+narrowing where it matters (map keys, struct fields, protocol fields). This is
+the same form CL uses. The SSA pipeline's type narrowing pass further optimizes
 ALU operations to 32-bit when safe.
 
 ### Control flow
@@ -326,7 +325,7 @@ accessor functions and `setf` expanders. Scalar field accesses emit CO-RE
 relocations, enabling cross-kernel portability.
 
 ```lisp
-;; Define a struct — generates accessors and setf expanders
+;; Define a struct. Generates accessors and setf expanders.
 (defstruct ct-key
   (src-addr u32)
   (dst-addr u32)
@@ -350,11 +349,11 @@ Structs support fixed-size array fields with indexed access:
   (pid     u32)
   (data    (array u8 16)))
 
-;; Indexed read/write — constant indices fold to fixed offsets
+;; Indexed read/write. Constant indices fold to fixed offsets.
 (my-event-data evt 5)                         ; read element 5
 (setf (my-event-data evt 5) (cast u8 val))    ; write element 5
 
-;; Pointer accessor — for passing array field addresses to BPF helpers
+;; Pointer accessor, for passing array field addresses to BPF helpers
 (get-current-comm (my-event-data-ptr evt) 16)
 ```
 
@@ -378,7 +377,7 @@ Structs support fixed-size array fields with indexed access:
 
 All offsets and sizes must be compile-time constants.
 
-### User-Space Iteration
+### User-space iteration
 
 Iterate over user-space arrays without manual pointer arithmetic:
 
@@ -398,9 +397,9 @@ Iterate over user-space arrays without manual pointer arithmetic:
 ```
 
 Both require a compile-time `max-count` for the BPF verifier and a runtime
-`count` for the actual bound. Supply `:index name` to use the loop index.
+`count` for the bound. Supply `:index name` to use the loop index.
 
-### Ring Buffer
+### Ring buffer
 
 ```lisp
 ;; Reserve, execute body, auto-submit on normal exit
@@ -410,7 +409,7 @@ Both require a compile-time `max-count` for the BPF verifier and a runtime
 ;; No manual ringbuf-reserve / ringbuf-submit needed
 ```
 
-### Process Metadata
+### Process metadata
 
 ```lisp
 ;; Fill pid, uid, timestamp, and comm in one form
@@ -449,7 +448,7 @@ Auto-resolve tracepoint field offsets from the running kernel at compile time:
 ;;            (tp-next-pid) → (ctx-load u32 56)
 ```
 
-No hardcoded offsets — field positions come from your kernel's tracefs.
+No hardcoded offsets. Field positions come from your kernel's tracefs.
 
 ### Kernel struct import
 
@@ -464,7 +463,8 @@ Import kernel struct definitions from vmlinux BTF at compile time:
 ;;            +task-struct-size+ → 9856
 ```
 
-No kernel headers, no vmlinux.h — field offsets come from your kernel's BTF.
+Field offsets come from your kernel's BTF, bypassing kernel headers and
+vmlinux.h entirely.
 
 ### Map operations
 
@@ -541,7 +541,7 @@ normally (no crash).
 
 ;; Dispatch to protocol-specific handler
 (tail-call jump-table protocol-index)
-;; Falls through here if no handler loaded for that index
+;; Falls through here if no handler loaded for the index
 XDP_PASS
 ```
 
@@ -567,7 +567,7 @@ sections. All programs share the same maps.
 ### Protocol headers
 
 Whistler includes compile-time protocol header definitions. These expand to
-`(load TYPE ptr OFFSET)` with automatic byte-order conversion — zero runtime
+`(load TYPE ptr OFFSET)` with automatic byte-order conversion, at zero runtime
 cost.
 
 ```lisp
@@ -605,15 +605,15 @@ Define your own protocol headers:
 
 ### Macros
 
-Since Whistler source files are Common Lisp, you can define macros with
-`defmacro`. They are expanded at compile time before eBPF code generation.
+Since Whistler source files are Common Lisp, you define macros with
+`defmacro`. They expand at compile time before eBPF code generation.
 
 ```lisp
 ;; Define reusable patterns
 (defmacro bump-counter (map idx)
   `(incf (getmap ,map ,idx)))
 
-;; Use them — expands to the same code you'd write by hand
+;; Use them. Expands to the same code you'd write by hand.
 (bump-counter stats 0)
 
 ;; Generate code programmatically
@@ -643,7 +643,7 @@ Built-in constants: `XDP_ABORTED`, `XDP_DROP`, `XDP_PASS`, `XDP_TX`,
 
 ### Packet counter
 
-Whistler: **11 instructions** · clang -O2: **11 instructions**
+Whistler: 11 instructions. clang -O2: 11 instructions.
 
 <table>
 <tr><th>Whistler</th><th>C + clang</th></tr>
@@ -691,7 +691,7 @@ int count_packets(struct xdp_md *ctx) {
 
 ### Port blocker
 
-Whistler: **25 instructions** · clang -O2: **26 instructions**
+Whistler: 25 instructions. clang -O2: 26 instructions.
 
 <table>
 <tr><th>Whistler</th><th>C + clang</th></tr>
@@ -763,7 +763,7 @@ int drop_port(struct xdp_md *ctx) {
 
 ### SYN flood mitigation
 
-Whistler: **65 instructions** · clang -O2: **68 instructions**
+Whistler: 65 instructions. clang -O2: 68 instructions.
 
 <table>
 <tr><th>Whistler</th><th>C + clang</th></tr>
@@ -888,9 +888,8 @@ int synflood(struct xdp_md *ctx) {
 
 ## Userspace loader (`whistler/loader`)
 
-A pure Common Lisp BPF loader — no libbpf, no CFFI, no C dependencies.
-Load `.bpf.o` files, create maps, attach probes, and consume ring buffers
-from SBCL:
+A pure Common Lisp BPF loader with zero C dependencies. It loads `.bpf.o`
+files, creates maps, attaches probes, and consumes ring buffers from SBCL:
 
 ```lisp
 (asdf:load-system "whistler/loader")
@@ -906,28 +905,28 @@ from SBCL:
 ### Inline BPF sessions
 
 Write BPF programs and userspace code in the same Lisp form. The BPF code
-compiles at macroexpand time; the bytecode is embedded as a literal:
+compiles at macroexpand time, and the bytecode is embedded as a literal:
 
 ```lisp
 (whistler/loader:with-bpf-session ()
-  ;; Kernel side — compiled to eBPF at macroexpand time
+  ;; Kernel side, compiled to eBPF at macroexpand time
   (bpf:map counter :type :hash :key-size 4 :value-size 8 :max-entries 1024)
   (bpf:prog trace (:type :kprobe :section "kprobe/__x64_sys_execve" :license "GPL")
     (incf (getmap counter 0))
     0)
 
-  ;; Userspace side — normal CL at runtime
+  ;; Userspace side, normal CL at runtime
   (bpf:attach trace "__x64_sys_execve")
   (loop (sleep 1)
         (format t "count: ~d~%" (bpf:map-ref counter 0))))
 ```
 
-No `.bpf.o` files, no build step, no separate loader binary. One file, one language.
+One file, one language. No intermediate artifacts or separate build steps.
 
 ### Struct decode/encode
 
 `whistler:defstruct` generates both BPF macros and a CL struct with
-byte-level codec — one definition serves both kernel and userspace:
+byte-level codec. One definition serves both kernel and userspace:
 
 ```lisp
 (whistler:defstruct my-event
@@ -949,6 +948,6 @@ Whistler was created by [Anthony Green](https://github.com/atgreen).
 
 MIT
 
-Note: The compiler itself is MIT-licensed. BPF programs compiled by Whistler
+The compiler itself is MIT-licensed. BPF programs compiled by Whistler
 typically use `license "GPL"` in their `defprog` because the kernel requires
-GPL for BPF programs that call GPL-only helpers.
+GPL for BPF programs calling GPL-only helpers.
