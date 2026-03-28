@@ -205,6 +205,17 @@ macros:
   (return XDP_PASS))
 ```
 
+Standalone BPF source files should use `(in-package #:whistler)` as shown
+above. To embed Whistler forms in your own application package, use
+`:shadowing-import-from` to resolve the symbols that Whistler shadows from CL
+(`case`, `defstruct`, `incf`, `decf`):
+
+```lisp
+(defpackage #:my-bpf
+  (:use #:cl #:whistler)
+  (:shadowing-import-from #:whistler #:case #:defstruct #:incf #:decf))
+```
+
 Map types: `:hash`, `:array`, `:percpu-hash`, `:percpu-array`, `:ringbuf`,
 `:prog-array` (for tail calls), `:lpm-trie` (for CIDR matching)
 

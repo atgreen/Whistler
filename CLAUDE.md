@@ -83,7 +83,13 @@ Permissions: `CAP_BPF` + `CAP_PERFMON` for loading/attaching. Use `sudo setcap c
 
 Protocol headers: Ethernet, IPv4, IPv6, TCP, UDP, ICMP with constants and `with-packet`/`with-tcp`/`with-udp` parsing macros.
 
-Types: `u8`, `u16`, `u32`, `u64`. The `whistler` package shadows `case` and `defstruct` from CL.
+Types: `u8`, `u16`, `u32`, `u64`. The `whistler` package shadows `case`, `defstruct`, `incf`, and `decf` from CL. Standalone BPF source files use `(in-package #:whistler)` which avoids conflicts. To use Whistler from another package, add `:shadowing-import-from`:
+
+```lisp
+(defpackage #:my-bpf
+  (:use #:cl #:whistler)
+  (:shadowing-import-from #:whistler #:case #:defstruct #:incf #:decf))
+```
 
 ## Multi-program and tail calls
 
