@@ -351,7 +351,8 @@
                                 (let ((ptr-vreg (first (ir-insn-args load-insn)))
                                       (call-dst (ir-insn-dst call-insn)))
                                   (when (and (integerp ptr-vreg)
-                                             (/= ptr-vreg call-dst))
+                                             (or (null call-dst)
+                                                 (/= ptr-vreg call-dst)))
                                     (setf new-insns (remove load-insn new-insns :count 1))
                                     (setf new-insns
                                           (append (subseq new-insns 0 i)
