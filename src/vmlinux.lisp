@@ -145,10 +145,10 @@
                (t (return (values 'u64 8 "unknown")))))))
 
 (defun btf-struct-fields (vmbtf struct-type-id)
-  "Extract fields from a BTF struct. Returns list of (name type offset size)."
+  "Extract fields from a BTF struct, recursively flattening anonymous
+   struct/union members. Returns list of (name type offset size)."
   (let* ((types (vmlinux-btf-types vmbtf))
          (strtab (vmlinux-btf-strtab vmbtf))
-         (rec (aref types struct-type-id))
          (type-data (with-open-file (f "/sys/kernel/btf/vmlinux"
                                        :element-type '(unsigned-byte 8))
                       (let ((buf (make-array (file-length f)
@@ -158,22 +158,38 @@
                                (type-off (btf-u32 buf 8))
                                (type-len (btf-u32 buf 12)))
                           (subseq buf (+ hdr-len type-off)
-                                  (+ hdr-len type-off type-len))))))
-         (data-off (getf rec :data-off))
-         (vlen (getf rec :vlen))
-         (fields '()))
-    (dotimes (i vlen)
-      (let* ((moff (+ data-off (* i 12)))
-             (name-off (btf-u32 type-data moff))
-             (type-id (btf-u32 type-data (+ moff 4)))
-             (bit-offset (btf-u32 type-data (+ moff 8)))
-             (byte-offset (ash bit-offset -3))
-             (fname (btf-string strtab name-off)))
-        (multiple-value-bind (bpf-type size)
-            (btf-resolve-type vmbtf type-id)
-          (when (and bpf-type (plusp (length fname)))
-            (push (list fname bpf-type byte-offset size) fields)))))
-    (nreverse fields)))
+                                  (+ hdr-len type-off type-len)))))))
+    (labels ((collect-fields (tid base-offset)
+               "Collect fields from struct/union at TID, adding BASE-OFFSET
+                to each field's byte offset. Recurses into anonymous members."
+               (let* ((rec (aref types tid))
+                      (data-off (getf rec :data-off))
+                      (vlen (getf rec :vlen))
+                      (fields '()))
+                 (dotimes (i vlen)
+                   (let* ((moff (+ data-off (* i 12)))
+                          (name-off (btf-u32 type-data moff))
+                          (member-type-id (btf-u32 type-data (+ moff 4)))
+                          (bit-offset (btf-u32 type-data (+ moff 8)))
+                          (byte-offset (+ base-offset (ash bit-offset -3)))
+                          (fname (btf-string strtab name-off)))
+                     (if (plusp (length fname))
+                         ;; Named field: resolve type and collect
+                         (multiple-value-bind (bpf-type size)
+                             (btf-resolve-type vmbtf member-type-id)
+                           (when bpf-type
+                             (push (list fname bpf-type byte-offset size) fields)))
+                         ;; Anonymous member: recurse into it if struct/union
+                         (let ((member-rec (when (< member-type-id (length types))
+                                             (aref types member-type-id))))
+                           (when (and member-rec
+                                      (member (getf member-rec :kind)
+                                              (list +btf-kind-struct+ +btf-kind-union+)))
+                             (setf fields
+                                   (nconc (collect-fields member-type-id byte-offset)
+                                          fields)))))))
+                 (nreverse fields))))
+      (collect-fields struct-type-id 0))))
 
 ;;; ========== The macro ==========
 
