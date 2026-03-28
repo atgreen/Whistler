@@ -35,7 +35,8 @@
   (core-relocs '())                  ; (bpf-insn-object struct-name field-name) for CO-RE
   (ptr-cache (make-hash-table))     ; R10-relative offset → stack slot holding cached ptr
   (struct-ptr-uses (make-hash-table)) ; struct vreg → count of map-ptr uses
-  (phi-moves (make-hash-table :test 'equal))) ; (src-label . tgt-label) → ((phi-dst . src-vreg) ...)
+  (phi-moves (make-hash-table :test 'equal)) ; (src-label . tgt-label) → ((phi-dst . src-vreg) ...)
+  (stack-ledger '()))                 ; ((category . size) ...) for stack usage breakdown
 
 (defun ectx-emit (ctx insn-list)
   (dolist (insn insn-list)
@@ -44,17 +45,34 @@
 (defun ectx-current-idx (ctx)
   (length (emit-ctx-insns ctx)))
 
-(defun ectx-alloc-stack (ctx size)
+(defun format-stack-breakdown (ledger)
+  "Format stack ledger entries into a human-readable breakdown string.
+   Aggregates entries by category and sorts by total bytes descending."
+  (let ((totals (make-hash-table :test 'equal)))
+    (dolist (entry ledger)
+      (cl:incf (gethash (car entry) totals 0) (cdr entry)))
+    (let ((sorted (sort (loop for cat being the hash-keys of totals
+                              using (hash-value bytes)
+                              collect (cons cat bytes))
+                        #'> :key #'cdr)))
+      (with-output-to-string (s)
+        (dolist (entry sorted)
+          (format s "~&    ~4d bytes  ~a" (cdr entry) (car entry)))))))
+
+(defun ectx-alloc-stack (ctx size &optional (category "other"))
   "Allocate SIZE bytes on the stack with natural alignment.
+   CATEGORY is a string describing the allocation purpose for diagnostics.
    Returns the (negative) offset from R10."
   (let* ((align (min size 8))
          (cur (emit-ctx-stack-offset ctx))
          (new-off (- cur size))
          ;; Align down to natural boundary (works for power-of-2 alignment)
          (aligned (logand new-off (- align))))
+    (push (cons category (- cur aligned)) (emit-ctx-stack-ledger ctx))
     (when (< aligned -512)
       (whistler/compiler:whistler-error
-       :what (format nil "stack frame exceeds BPF 512-byte limit (~d bytes needed)" (- aligned))
+       :what (format nil "stack frame exceeds BPF 512-byte limit (~d bytes needed)~%  breakdown:~a"
+                     (- aligned) (format-stack-breakdown (emit-ctx-stack-ledger ctx)))
        :expected "total stack usage <= 512 bytes"
        :hint "reduce struct sizes, reuse buffers, or split logic across tail-called programs"))
 
@@ -80,7 +98,7 @@
       (let ((loc (let ((reg (ectx-alloc-callee ctx)))
                    (if reg
                        (list :reg reg)
-                       (list :stack (ectx-alloc-stack ctx 8))))))
+                       (list :stack (ectx-alloc-stack ctx 8 "register spills"))))))
         (setf (gethash vreg (emit-ctx-vreg-map ctx)) loc)
         loc)))
 
@@ -305,6 +323,9 @@
            (dom-map (compute-dominators prog))
            (ctx (make-emit-ctx :ir-prog prog :vreg-map alloc-map
                                :stack-offset regalloc-stack
+                               :stack-ledger (when (< regalloc-stack 0)
+                                               (list (cons "register spills (regalloc)"
+                                                           (- regalloc-stack))))
                                :vreg-types (build-vreg-type-map prog)
                                :free-callee-regs free-callee
                                :map-ref-counts map-refs
@@ -849,7 +870,7 @@
                              (ir-type-to-bpf-size (or vreg-type 'u64))))
                (const-val (or imm-val
                               (gethash key-arg (emit-ctx-const-values ctx))))
-               (offset (ectx-alloc-stack ctx byte-size)))
+               (offset (ectx-alloc-stack ctx byte-size "map key temporaries")))
           (if (and const-val (typep const-val '(signed-byte 32)))
               ;; Constant key: use st-mem (1 insn)
               (ectx-emit ctx (whistler/bpf:emit-st-mem
@@ -885,7 +906,7 @@
    explicit zero stores, and DSE removes dead ones).
    Returns a pointer (R10 + offset) in DST."
   (let* ((size (imm-arg-value (first args)))
-         (offset (ectx-alloc-stack ctx size))
+         (offset (ectx-alloc-stack ctx size "struct-alloc"))
          (dst-loc (allocate-vreg ctx dst))
          (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc)
                       whistler/bpf:+bpf-reg-1+))
@@ -900,7 +921,7 @@
     ;; on the stack for 1-insn reload (saves 1 insn per subsequent use).
     ;; Reuse the vreg's stack home when possible to avoid a duplicate store.
     (when (>= ptr-uses 3)
-      (let ((cache-slot (or stack-home (ectx-alloc-stack ctx 8))))
+      (let ((cache-slot (or stack-home (ectx-alloc-stack ctx 8 "pointer cache"))))
         (unless stack-home
           (ectx-emit ctx (whistler/bpf:emit-stx-mem
                            whistler/bpf:+bpf-dw+

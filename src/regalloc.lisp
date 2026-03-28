@@ -448,7 +448,9 @@
   (let ((off (- current-offset 8)))
     (when (< off -512)
       (whistler/compiler:whistler-error
-       :what (format nil "stack frame exceeds BPF 512-byte limit (~d bytes needed)" (- off))
+       :what (format nil "stack frame exceeds BPF 512-byte limit during register allocation ~
+                          (~d bytes in ~d spill slots)"
+                     (- off) (/ (- off) 8))
        :expected "total stack usage <= 512 bytes"
        :hint "reduce struct sizes, reuse buffers, or split logic across tail-called programs"))
 
