@@ -31,7 +31,9 @@
     ("PERF-EVENT-OUTPUT"    . 25)
     ("SKB-LOAD-BYTES"       . 26)
     ("PROBE-READ-STR"       . 45)
+    ("GET-CURRENT-TASK"     . 35)
     ("GET-CURRENT-CGROUP-ID" . 80)
+    ("PROBE-READ-KERNEL"    . 113)
     ("PROBE-READ-USER"      . 112)
     ("PROBE-READ-USER-STR"  . 114)
     ("RINGBUF-OUTPUT"       . 130)
@@ -42,9 +44,9 @@
    Single source of truth — referenced by the SSA pipeline via lower.lisp.")
 
 (defparameter *helper-arg-counts*
-  '(("PROBE-READ" . 3) ("PROBE-READ-USER" . 3)
+  '(("PROBE-READ" . 3) ("PROBE-READ-USER" . 3) ("PROBE-READ-KERNEL" . 3)
     ("PROBE-READ-STR" . 3) ("PROBE-READ-USER-STR" . 3)
-    ("KTIME-GET-NS" . 0) ("GET-PRANDOM-U32" . 0)
+    ("KTIME-GET-NS" . 0) ("GET-PRANDOM-U32" . 0) ("GET-CURRENT-TASK" . 0)
     ("GET-SMP-PROCESSOR-ID" . 0) ("GET-CURRENT-CGROUP-ID" . 0)
     ("GET-CURRENT-PID-TGID" . 0) ("GET-CURRENT-UID-GID" . 0)
     ("GET-CURRENT-COMM" . 2)
