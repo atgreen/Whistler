@@ -416,6 +416,16 @@
                             Define it with defstruct before defmap." name value-type))
                   (car def))
                 value-size)))
+    ;; Validate key/value sizes for non-ringbuf maps
+    (when (and (not (eq type :ringbuf))
+               (or (eql key-size 0) (eql vs 0)))
+      (error "defmap ~a: non-ringbuf maps (~a) require non-zero :key-size and :value-size"
+             name type))
+    ;; Validate ringbuf maps don't have key/value sizes
+    (when (and (eq type :ringbuf)
+               (or (not (eql key-size 0)) (and (not value-type) (not (eql vs 0)))))
+      (warn "defmap ~a: ringbuf maps don't use :key-size or :value-size (they will be ignored)"
+            name))
     `(push (list ',name :type ,type :key-size ,key-size
                         :value-size ,vs
                         ,@(when value-type `(:value-type ',value-type))
