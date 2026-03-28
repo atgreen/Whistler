@@ -585,6 +585,17 @@
                   (setf best-cu cu))))))
         best-cu))))
 
+(defun reset-compilation-state ()
+  "Clear accumulated maps, programs, and struct definitions.
+   Call this between separate compile-to-elf invocations in the same
+   Lisp image when not using compile-file* or with-bpf-session
+   (which isolate state automatically)."
+  (setf *maps* '()
+        *programs* '()
+        *user-constants* '())
+  (clrhash *struct-defs*)
+  (values))
+
 ;;; File-based compilation
 
 (defun compile-file* (input-path output-path)

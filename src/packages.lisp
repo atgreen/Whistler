@@ -108,6 +108,7 @@
   (:use #:cl #:whistler/bpf #:whistler/compiler #:whistler/elf #:whistler/btf)
   (:shadow #:case #:defstruct #:incf #:decf)
   (:export #:compile-file* #:defmap #:defprog #:compile-to-elf #:main
+           #:reset-compilation-state
            ;; Surface language macros
            #:when-let #:if-let #:case
            #:incf #:decf

@@ -16,6 +16,8 @@ sbcl --noinform --non-interactive \
 # Use whistler::disassemble-cu on the compilation-unit returned by compile-to-elf
 ```
 
+`compile-file*` and `with-bpf-session` automatically isolate compilation state. When using `compile-to-elf` directly in the REPL, call `(reset-compilation-state)` between separate compilations to clear accumulated maps/programs/structs.
+
 No test suite. Verify correctness by checking instruction counts and comparing disassembly output.
 
 ## Architecture
