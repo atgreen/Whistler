@@ -124,3 +124,29 @@
                                     :value-size 1 :max-entries 1)))))
     (is (has-opcode-p bytes +ldxb+)
         "Expected ldxb (0x71) for 8-bit map value dereference")))
+
+;;; ========== kernel-load tests (issue #18) ==========
+;;;
+;;; kernel-load emits probe-read-kernel (helper #113) into a stack
+;;; buffer, then loads the result.  This is the safe path for kernel
+;;; pointers that the BPF verifier won't trust for direct dereference.
+
+(test kernel-load-emits-probe-read-kernel
+  "kernel-load should emit probe_read_kernel (helper 113)"
+  (let ((bytes (w-body "(let ((task (get-current-task)))
+                          (return (kernel-load u32 task 2772)))")))
+    (let ((call-count 0))
+      (let ((n (/ (length bytes) 8)))
+        (loop for i below n
+              when (and (= +jmp-call+ (nth-insn-opcode bytes i))
+                        (= 113 (nth-insn-imm bytes i)))
+                do (cl:incf call-count)))
+      (is (> call-count 0)
+          "Expected call to helper 113 (probe_read_kernel)"))))
+
+(test kernel-load-u64-emits-dw-load
+  "kernel-load u64 should load the result as a 64-bit value"
+  (let ((bytes (w-body "(let ((task (get-current-task)))
+                          (return (kernel-load u64 task 0)))")))
+    (is (has-opcode-p bytes +ldxdw+)
+        "Expected ldxdw for kernel-load u64")))

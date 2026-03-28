@@ -231,7 +231,7 @@
                                             (string-upcase lisp-fname))
                                      (symbol-package struct-name))))
               (push `(defmacro ,accessor (ptr)
-                       (list 'load ',bpf-type ptr ,byte-offset))
+                       (list 'kernel-load ',bpf-type ptr ,byte-offset))
                     forms))))
         ;; Generate sizeof constant
         (let ((sizeof-name (intern (format nil "+~a-SIZE+"
