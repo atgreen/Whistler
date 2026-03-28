@@ -633,8 +633,39 @@
         (narrowest-type t1 t2)
         'u64)))
 
+(defun check-alu-constant-args (op ir-op args)
+  "Check for compile-time-detectable arithmetic errors."
+  ;; Division or modulo by constant zero
+  (when (and (member ir-op '(:div :mod))
+             (= (length args) 2)
+             (let ((rhs (second args)))
+               (or (eql rhs 0)
+                   (and (symbolp rhs) (boundp rhs) (constantp rhs)
+                        (eql (symbol-value rhs) 0)))))
+    (whistler/compiler:whistler-error
+     :what (format nil "~a by zero" (if (eq ir-op :div) "division" "modulo"))
+     :where (format nil "(~a ~a ~a)" op (first args) (second args))
+     :expected "a non-zero divisor"
+     :hint "BPF division by zero causes a verifier rejection or runtime exception"))
+  ;; Shift by >= 64 bits
+  (when (and (member ir-op '(:lsh :rsh :arsh))
+             (= (length args) 2)
+             (let ((rhs (second args)))
+               (or (and (integerp rhs) (>= rhs 64))
+                   (and (symbolp rhs) (boundp rhs) (constantp rhs)
+                        (integerp (symbol-value rhs))
+                        (>= (symbol-value rhs) 64)))))
+    (let ((amt (let ((rhs (second args)))
+                 (if (integerp rhs) rhs (symbol-value rhs)))))
+      (whistler/compiler:whistler-error
+       :what (format nil "shift amount ~d >= 64 bits" amt)
+       :where (format nil "(~a ~a ~a)" op (first args) (second args))
+       :expected "a shift amount between 0 and 63"
+       :hint "BPF operates on 64-bit registers; shifting by 64+ is undefined"))))
+
 (defun lower-alu (ctx op args)
   (let ((ir-op (ir-alu-op op)))
+    (check-alu-constant-args op ir-op args)
     (cond
       ;; Unary neg
       ((and (sym= op '-) (= (length args) 1))
@@ -678,8 +709,10 @@
 
 ;;; ========== Load / Store / Atomic ==========
 
+;;; ========== Compile-time validation helpers ==========
+
 (defun check-unchecked-map-ptr (ptr-form op-name)
-  "Warn at compile time if PTR-FORM is a bare map-lookup, which returns a
+  "Error at compile time if PTR-FORM is a bare map-lookup, which returns a
    potentially-null pointer that the BPF verifier requires a null check for."
   (when (and (consp ptr-form)
              (member (car ptr-form) '(map-lookup map-lookup-ptr)
@@ -690,7 +723,39 @@
      :hint (format nil "use (when-let ((p ~a)) (~a ...p...)) to guard the pointer"
                    ptr-form op-name))))
 
+(defun ctx-map-type (ctx map-name)
+  "Look up the integer map type for MAP-NAME from the lowering context, or nil."
+  (let ((entry (assoc map-name (lower-ctx-maps ctx)
+                      :test (lambda (a b) (string= (symbol-name a) (symbol-name b))))))
+    (when entry
+      (whistler/compiler:bpf-map-type (cdr entry)))))
+
+(defun check-map-type-is (ctx map-name expected-type expected-name op-name)
+  "Error if MAP-NAME's type doesn't match EXPECTED-TYPE."
+  (let ((actual (ctx-map-type ctx map-name)))
+    (when (and actual (/= actual expected-type))
+      (whistler/compiler:whistler-error
+       :what (format nil "~a requires a ~a map, but ~a is not" op-name expected-name map-name)
+       :expected (format nil "(defmap ~a :type :~a ...)" map-name
+                         (string-downcase expected-name))
+       :hint (format nil "~a only works with :type :~a maps"
+                     op-name (string-downcase expected-name))))))
+
+(defun check-map-type-is-not (ctx map-name forbidden-type forbidden-name op-name)
+  "Error if MAP-NAME's type matches FORBIDDEN-TYPE."
+  (let ((actual (ctx-map-type ctx map-name)))
+    (when (and actual (= actual forbidden-type))
+      (whistler/compiler:whistler-error
+       :what (format nil "~a does not work with ~a maps" op-name forbidden-name)
+       :expected (format nil "a hash, array, or other key/value map")
+       :hint (format nil "~a maps use ringbuf-reserve/ringbuf-submit instead" forbidden-name)))))
+
 (defun lower-load (ctx args)
+  (unless (<= 2 (length args) 3)
+    (whistler/compiler:whistler-error
+     :what (format nil "load expects 2-3 arguments, got ~d" (length args))
+     :expected "(load type ptr [offset])"
+     :hint "example: (load u32 ptr 0)"))
   (check-unchecked-map-ptr (second args) "load")
   (let* ((type-kw (first args))
          (ptr (lower-expr ctx (second args)))
@@ -700,6 +765,11 @@
     dst))
 
 (defun lower-store (ctx args)
+  (unless (= (length args) 4)
+    (whistler/compiler:whistler-error
+     :what (format nil "store expects 4 arguments, got ~d" (length args))
+     :expected "(store type ptr offset value)"
+     :hint "example: (store u32 ptr 0 val)"))
   (check-unchecked-map-ptr (second args) "store")
   (let* ((type-kw (first args))
          (ptr (lower-expr ctx (second args)))
@@ -784,6 +854,10 @@
 ;;; ========== Map operations ==========
 
 (defun lower-map-lookup (ctx map-name key-expr)
+  (check-map-type-is-not ctx map-name whistler/bpf:+bpf-map-type-ringbuf+
+                         "ringbuf" "map-lookup")
+  (check-map-type-is-not ctx map-name whistler/bpf:+bpf-map-type-prog-array+
+                         "prog-array" "map-lookup")
   (let ((key-vreg (lower-expr ctx key-expr))
         (dst (ctx-fresh-vreg ctx)))
     (ctx-emit ctx :map-lookup dst (list `(:map ,map-name) key-vreg) 'u64)
@@ -833,6 +907,8 @@
 
 (defun lower-ringbuf-reserve (ctx map-name size-expr flags-expr)
   "Lower (ringbuf-reserve map size flags): reserve space in a ring buffer."
+  (check-map-type-is ctx map-name whistler/bpf:+bpf-map-type-ringbuf+
+                     "ringbuf" "ringbuf-reserve")
   (let ((size-vreg (lower-expr ctx size-expr))
         (flags-vreg (lower-expr ctx flags-expr))
         (dst (ctx-fresh-vreg ctx)))
@@ -892,6 +968,8 @@
   "Lower (tail-call MAP INDEX). Emits bpf_tail_call(ctx, map, index).
    If the tail call succeeds, execution transfers to the target program.
    If it fails (bad index, no program loaded), execution continues."
+  (check-map-type-is ctx map-name whistler/bpf:+bpf-map-type-prog-array+
+                     "prog-array" "tail-call")
   (let ((idx-vreg (lower-expr ctx index-expr))
         (ctx-vreg (cdr (ctx-lookup-var ctx (intern "%%CTX" (find-package '#:whistler/ir)))))
         (dst (ctx-fresh-vreg ctx)))
@@ -948,6 +1026,20 @@
          :where (format nil "(~a~{ ~s~})" helper-name args)
          :expected (format nil "(~a~{~* ARG~})" helper-name
                            (make-list expected-count)))))
+    ;; Check probe-read size argument (arg 2) against 512-byte stack limit
+    (when (and (member (symbol-name helper-name)
+                       '("PROBE-READ-KERNEL" "PROBE-READ-USER"
+                         "PROBE-READ" "PROBE-READ-STR" "PROBE-READ-USER-STR")
+                       :test #'string=)
+               (>= (length args) 2))
+      (let ((size-arg (second args)))
+        (when (and (integerp size-arg) (> size-arg 512))
+          (whistler/compiler:whistler-error
+           :what (format nil "~a size ~d exceeds 512-byte BPF stack limit"
+                         helper-name size-arg)
+           :where (format nil "(~a ... ~d ...)" helper-name size-arg)
+           :expected "a size <= 512 bytes"
+           :hint "BPF programs have a 512-byte stack; probe reads must fit within it"))))
     (let ((arg-vregs (mapcar (lambda (a) (lower-expr ctx a)) args))
           (dst (ctx-fresh-vreg ctx)))
       (check-narrow-pointer-args ctx helper-name args arg-vregs)
@@ -1005,6 +1097,12 @@
                        :where (format nil "(dotimes (~a ~a) ...)" var count)
                        :expected "a compile-time constant integer or defconstant symbol"
                        :hint "the BPF verifier requires a known upper bound for all loops")))))
+      (when (and (integerp n) (< n 0))
+        (whistler/compiler:whistler-error
+         :what (format nil "negative loop count: ~d" n)
+         :where (format nil "(dotimes (~a ~a) ...)" var count)
+         :expected "a non-negative integer"
+         :hint "BPF loops require count >= 0"))
       (let* ((prog (lower-ctx-prog ctx))
              (saved-env (lower-ctx-env ctx))
              (header-label (ir-fresh-label prog "loop_hdr"))
