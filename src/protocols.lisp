@@ -265,10 +265,10 @@
                        (map-update ,map ,k ,init 0)))))))))
 
 (defmacro getmap (map key-form)
-  "Look up a map value. For scalar values (≤8 bytes), dereferences the
-   pointer and returns the value. For struct values (>8 bytes), returns
-   the map_value pointer directly so fields can be accessed with struct
-   accessors. Returns 0/nil if the key is not found.
+  "Look up a map value. For maps declared with :value-type, returns the
+   map_value pointer directly so fields can be accessed with struct
+   accessors. For scalar maps (no :value-type), dereferences the pointer
+   and returns the value. Returns 0/nil if the key is not found.
    Automatically uses -ptr operations for struct key maps."
   (let ((p (gensym "P"))
         (vtype (map-value-type map))
@@ -305,15 +305,23 @@
 
 (defmacro setmap (map key-form val-form &optional (flags 0))
   "Update a map entry. Prefer (setf (getmap ...) ...) for the common case.
-   Automatically uses -ptr operations for struct key maps."
+   For maps declared with :value-type, val-form should be a pointer to a
+   stack-allocated struct. Automatically uses -ptr operations for struct
+   key maps."
   (let ((v (gensym "V"))
         (vtype (map-value-type map)))
-    (if (struct-key-map-p map)
-        `(let ((,v (struct-alloc ,(map-value-size-bytes map))))
-           (store ,vtype ,v 0 ,val-form)
-           (map-update-ptr ,map ,key-form ,v ,flags))
-        `(let ((,v ,vtype ,val-form))
-           (map-update ,map ,key-form ,v ,flags)))))
+    (cond
+      ((struct-value-map-p map)
+       (if (struct-key-map-p map)
+           `(map-update-ptr ,map ,key-form ,val-form ,flags)
+           `(map-update ,map ,key-form ,val-form ,flags)))
+      ((struct-key-map-p map)
+       `(let ((,v (struct-alloc ,(map-value-size-bytes map))))
+          (store ,vtype ,v 0 ,val-form)
+          (map-update-ptr ,map ,key-form ,v ,flags)))
+      (t
+       `(let ((,v ,vtype ,val-form))
+          (map-update ,map ,key-form ,v ,flags))))))
 
 (defmacro remmap (map key-form)
   "Delete a map entry. CL-style name (cf. remhash)."
