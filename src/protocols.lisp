@@ -170,6 +170,29 @@
       (push `(get-current-comm (,comm-field ,event) ,(or comm-size 16)) forms))
     `(progn ,@(nreverse forms))))
 
+;;; ---- kernel-load ----
+
+(defmacro kernel-load (type ptr offset)
+  "Safely read a value of TYPE at byte OFFSET from a kernel pointer PTR.
+   Compiles to probe-read-kernel into a stack buffer followed by a load.
+   Use this instead of (load TYPE PTR OFFSET) when PTR is a kernel address
+   (e.g., from get-current-task) that the BPF verifier does not trust for
+   direct memory access.
+
+   Example:
+     ;; Read task_struct->tgid (u32 at offset 2772) safely
+     (kernel-load u32 task 2772)
+
+     ;; Equivalent to the manual pattern:
+     (let ((buf (struct-alloc 4)))
+       (probe-read-kernel buf 4 (+ task 2772))
+       (load u32 buf 0))"
+  (let ((buf (gensym "KBUF"))
+        (byte-size (cl:case type (u8 1) (u16 2) (u32 4) (u64 8) (t 8))))
+    `(let ((,buf (struct-alloc ,byte-size)))
+       (probe-read-kernel ,buf ,byte-size (+ ,ptr ,offset))
+       (load ,type ,buf 0))))
+
 ;;; ---- incf / decf ----
 
 (defmacro incf (place &optional (delta 1))
