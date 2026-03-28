@@ -148,6 +148,48 @@
       (let ((fds (attach-perf-bpf attr prog-fd)))
         (make-attachment :type :uprobe :perf-fds fds :prog-fd prog-fd)))))
 
+;;; ========== TC (traffic control) attachment ==========
+
+(defun attach-tc (prog-fd interface-name &key (direction "ingress"))
+  "Attach a BPF program as a TC filter on INTERFACE-NAME.
+   DIRECTION is \"ingress\" or \"egress\".
+   Uses bpffs pin + tc command. Returns an attachment that can be passed to detach."
+  (let* ((ifindex (read-file-int
+                   (format nil "/sys/class/net/~a/ifindex" interface-name)))
+         (pin-path (format nil "/sys/fs/bpf/kinsight_tc_~a_~a" interface-name direction)))
+    (unless ifindex
+      (error "Interface not found: ~a" interface-name))
+    ;; Pin the program to bpffs
+    (let ((buf (make-attr-buf)))
+      (put-u32 buf 0 prog-fd)
+      (let ((path-bytes (sb-ext:string-to-octets pin-path :null-terminate t)))
+        (sb-sys:with-pinned-objects (path-bytes)
+          (put-ptr buf 8 (sb-sys:vector-sap path-bytes))
+          (handler-case
+              (%bpf +bpf-obj-pin+ buf 32 "bpf-pin")
+            (bpf-error ()
+              ;; Already pinned, unpin first and retry
+              (delete-file pin-path)
+              (%bpf +bpf-obj-pin+ buf 32 "bpf-pin"))))))
+    ;; Set up clsact qdisc (idempotent)
+    (sb-ext:run-program "tc" (list "qdisc" "add" "dev" interface-name "clsact")
+                        :search t :wait t)
+    ;; Attach as tc filter
+    (let ((ret (sb-ext:run-program
+                "tc" (list "filter" "replace" "dev" interface-name
+                           direction "bpf" "da" "pinned" pin-path)
+                :search t :wait t)))
+      (unless (zerop (sb-ext:process-exit-code ret))
+        (delete-file pin-path)
+        (error "Failed to attach TC (~a) to ~a" direction interface-name)))
+    (make-attachment :type :tc :perf-fds nil :prog-fd prog-fd
+                     :cleanup (lambda ()
+                                (sb-ext:run-program
+                                 "tc" (list "filter" "del" "dev" interface-name direction)
+                                 :search t :wait t)
+                                (handler-case (delete-file pin-path)
+                                  (error () nil))))))
+
 ;;; ========== XDP attachment ==========
 
 (defun attach-xdp (prog-fd interface-name &key (mode "xdp"))

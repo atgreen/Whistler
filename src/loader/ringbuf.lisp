@@ -30,18 +30,21 @@
   (let* ((map-fd (map-info-fd map-info))
          (ring-size (map-info-max-entries map-info))
          (pgsz (page-size))
-         ;; mmap: consumer page (rw) + producer page + 2*data (ro)
-         (mmap-size (+ pgsz pgsz (* 2 ring-size)))
-         (mmap-ptr (sb-posix:mmap nil mmap-size
-                                  (logior sb-posix:prot-read sb-posix:prot-write)
-                                  sb-posix:map-shared
-                                  map-fd 0))
-         ;; Consumer position at mmap-ptr + 0
-         ;; Producer position at mmap-ptr + page-size
-         ;; Data at mmap-ptr + 2*page-size
-         (consumer-ptr mmap-ptr)
-         (producer-ptr (sb-sys:sap+ mmap-ptr pgsz))
-         (data-ptr (sb-sys:sap+ mmap-ptr (* 2 pgsz)))
+         ;; mmap in two parts:
+         ;; 1. Consumer page (rw) — page 0, offset 0
+         ;; 2. Producer page + data (ro) — pages 1+, offset page-size
+         (consumer-ptr (sb-posix:mmap nil pgsz
+                                      (logior sb-posix:prot-read sb-posix:prot-write)
+                                      sb-posix:map-shared
+                                      map-fd 0))
+         (ro-size (+ pgsz (* 2 ring-size)))
+         (ro-ptr (sb-posix:mmap nil ro-size
+                                sb-posix:prot-read
+                                sb-posix:map-shared
+                                map-fd pgsz))
+         (mmap-ptr consumer-ptr)
+         (producer-ptr ro-ptr)
+         (data-ptr (sb-sys:sap+ ro-ptr pgsz))
          ;; Create epoll
          (epoll-fd (syscall +sys-epoll-create1+ +epoll-cloexec+)))
 
@@ -115,6 +118,9 @@
   "Close a ring buffer consumer, unmapping memory and closing epoll."
   (let ((pgsz (page-size))
         (ring-size (ring-consumer-ring-size consumer)))
-    (sb-posix:munmap (ring-consumer-mmap-ptr consumer)
-                     (+ pgsz pgsz (* 2 ring-size))))
+    ;; Unmap consumer page (rw)
+    (sb-posix:munmap (ring-consumer-mmap-ptr consumer) pgsz)
+    ;; Unmap producer + data pages (ro)
+    (sb-posix:munmap (ring-consumer-producer-ptr consumer)
+                     (+ pgsz (* 2 ring-size))))
   (sb-posix:close (ring-consumer-epoll-fd consumer)))
