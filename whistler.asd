@@ -61,4 +61,5 @@
                (:file "test-protocol")
                (:file "test-optimization")
                (:file "test-maps")
-               (:file "test-programs")))
+               (:file "test-programs")
+               (:file "test-regalloc")))

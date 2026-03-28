@@ -459,9 +459,10 @@
                     (then-label (fourth args))
                     (else-label (fifth args)))
                 (when phi-insn
-                  (dolist (phi-arg (ir-insn-args phi-insn))
+                  ;; Copy args list: threading mutates it via removal
+                  (dolist (phi-arg (copy-list (ir-insn-args phi-insn)))
                     (when (and (consp phi-arg) (integerp (first phi-arg)))
-                      (phi-thread-one-input prog block phi-arg
+                      (phi-thread-one-input prog block phi-insn phi-arg
                                             then-label else-label
                                             def-map const-map
                                             (lambda () (setf changed t))))))))))))
@@ -510,7 +511,7 @@
       x
       (list :label x)))
 
-(defun phi-thread-one-input (prog block phi-arg then-label else-label
+(defun phi-thread-one-input (prog block phi-insn phi-arg then-label else-label
                              def-map const-map on-change)
   "Thread one PHI input: redirect predecessor to skip the PHI+branch block."
   (let* ((val-vreg (first phi-arg))
@@ -532,6 +533,10 @@
             (const-val
              (setf (ir-insn-args pred-term)
                    (list (if (zerop const-val) else-label then-label)))
+             ;; Remove this input from the PHI so downstream passes
+             ;; (simplify-cfg merge) see the correct input count.
+             (setf (ir-insn-args phi-insn)
+                   (remove phi-arg (ir-insn-args phi-insn) :test #'equal))
              (funcall on-change))
 
             ;; CMP result → replace br with direct br-cond
@@ -543,6 +548,9 @@
                          (third (ir-insn-args def-insn))
                          then-label
                          else-label))
+             ;; Remove this input from the PHI
+             (setf (ir-insn-args phi-insn)
+                   (remove phi-arg (ir-insn-args phi-insn) :test #'equal))
              (funcall on-change))))))))
 
 ;;; ========== Bitmask check fusion ==========
