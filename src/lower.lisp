@@ -678,7 +678,20 @@
 
 ;;; ========== Load / Store / Atomic ==========
 
+(defun check-unchecked-map-ptr (ptr-form op-name)
+  "Warn at compile time if PTR-FORM is a bare map-lookup, which returns a
+   potentially-null pointer that the BPF verifier requires a null check for."
+  (when (and (consp ptr-form)
+             (member (car ptr-form) '(map-lookup map-lookup-ptr)
+                     :test #'sym=))
+    (whistler/compiler:whistler-error
+     :what (format nil "map-lookup result used directly in ~a without null check" op-name)
+     :expected "a null-checked pointer (BPF verifier requires it)"
+     :hint (format nil "use (when-let ((p ~a)) (~a ...p...)) to guard the pointer"
+                   ptr-form op-name))))
+
 (defun lower-load (ctx args)
+  (check-unchecked-map-ptr (second args) "load")
   (let* ((type-kw (first args))
          (ptr (lower-expr ctx (second args)))
          (off (or (third args) 0))
@@ -687,6 +700,7 @@
     dst))
 
 (defun lower-store (ctx args)
+  (check-unchecked-map-ptr (second args) "store")
   (let* ((type-kw (first args))
          (ptr (lower-expr ctx (second args)))
          (off (or (third args) 0))
@@ -742,10 +756,28 @@
     dst))
 
 (defun lower-atomic-add (ctx args)
-  (let ((ptr (lower-expr ctx (first args)))
-        (off (or (second args) 0))
-        (val (lower-expr ctx (third args)))
-        (type-kw (or (fourth args) 'u64)))
+  (unless (<= 3 (length args) 4)
+    (whistler/compiler:whistler-error
+     :what (format nil "atomic-add expects 3-4 arguments, got ~d" (length args))
+     :expected "(atomic-add ptr offset value [type])"
+     :hint "example: (atomic-add ptr 0 1) or (atomic-add ptr 0 1 u32)"))
+  (when (and (consp (first args))
+             (member (car (first args)) '(map-lookup map-lookup-ptr)
+                     :test #'sym=))
+    (whistler/compiler:whistler-error
+     :what "map-lookup result used directly in atomic-add without null check"
+     :expected "a null-checked pointer (BPF verifier requires it)"
+     :hint "use (when-let ((p (map-lookup map key))) (atomic-add p 0 val)) or (incf (getmap map key))"))
+  (let* ((type-kw (or (fourth args) 'u64))
+         (type-size (cl:case type-kw (u8 1) (u16 2) (u32 4) (u64 8) (t 8)))
+         (ptr (lower-expr ctx (first args)))
+         (off (second args))
+         (val (lower-expr ctx (third args))))
+    (when (and (integerp off) (not (zerop (mod off type-size))))
+      (whistler/compiler:whistler-error
+       :what (format nil "atomic-add offset ~d is not aligned to ~d-byte ~a boundary"
+                     off type-size type-kw)
+       :expected (format nil "offset divisible by ~d" type-size)))
     (ctx-emit ctx :atomic-add nil (list ptr `(:imm ,off) val `(:type ,type-kw)))
     nil))
 
