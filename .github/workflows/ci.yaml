@@ -27,8 +27,8 @@ jobs:
           sbcl --noinform --non-interactive \
             --load /tmp/quicklisp.lisp \
             --eval '(quicklisp-quickstart:install)' \
-            --eval '(ql:quickload "fiveam")' \
-            --eval '(ql:add-to-init-file)'
+            --eval '(ql:quickload "fiveam")'
+          echo '(load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))' > ~/.sbclrc
 
       - name: Run tests
         run: make test
