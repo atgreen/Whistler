@@ -402,13 +402,26 @@
 
 ;;; User-facing macros for defining maps and programs
 
-(defmacro defmap (name &key type (key-size 0) (value-size 0) max-entries (map-flags 0))
+(defmacro defmap (name &key type (key-size 0) (value-size 0) value-type
+                           max-entries (map-flags 0))
   "Define a BPF map. KEY-SIZE and VALUE-SIZE default to 0 (appropriate for
-   ringbuf maps which don't use traditional key/value pairs)."
-  `(push (list ',name :type ,type :key-size ,key-size
-                      :value-size ,value-size :max-entries ,max-entries
-                      :map-flags ,map-flags)
-         *maps*))
+   ringbuf maps which don't use traditional key/value pairs).
+   VALUE-TYPE optionally names a struct defined with defstruct.  When provided,
+   VALUE-SIZE is derived automatically from the struct definition, and getmap
+   returns a map_value pointer instead of a dereferenced scalar."
+  (let ((vs (if value-type
+                (let ((def (gethash (string value-type) *struct-defs*)))
+                  (unless def
+                    (error "defmap ~a: :value-type ~a is not a known struct. ~
+                            Define it with defstruct before defmap." name value-type))
+                  (car def))
+                value-size)))
+    `(push (list ',name :type ,type :key-size ,key-size
+                        :value-size ,vs
+                        ,@(when value-type `(:value-type ',value-type))
+                        :max-entries ,max-entries
+                        :map-flags ,map-flags)
+           *maps*)))
 
 (defmacro defprog (name (&key (type :xdp) (section nil) (license "GPL"))
                    &body body)
@@ -539,9 +552,10 @@
   (let ((map-structs
          (loop for map-spec in maps
                for idx from 0
-               collect (destructuring-bind (name &key type key-size value-size max-entries
-                                                 (map-flags 0))
+               collect (destructuring-bind (name &key type key-size value-size value-type
+                                                 max-entries (map-flags 0))
                            map-spec
+                         (declare (ignore value-type))
                          (make-bpf-map
                           :name name
                           :type (whistler/compiler:resolve-map-type type)
