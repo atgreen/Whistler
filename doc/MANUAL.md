@@ -946,3 +946,232 @@ Compile BPF code at macroexpand time and load at runtime — no files:
 The `bpf:` prefix separates kernel-side forms from userspace code. The
 compiler runs during macroexpansion; the expanded code contains the raw
 bytecode as a literal array. `unwind-protect` closes all resources on exit.
+
+## Cookbook
+
+Worked examples showing how Whistler forms compose into complete programs.
+
+### Tracepoint with ring buffer events
+
+The most common pattern: attach to a kernel tracepoint, build a struct,
+send it to userspace via a ring buffer.
+
+```lisp
+(in-package #:whistler)
+
+;; 1. Define the event struct. This generates both BPF accessors
+;;    (make-conn-event, conn-event-src-addr, setf expanders) and
+;;    CL-side codec (decode-conn-event → conn-event-record struct).
+(defstruct conn-event
+  (src-addr u32)
+  (dst-addr u32)
+  (dst-port u16)
+  (proto    u8)
+  (pad      u8))    ; align to 12 bytes
+
+;; 2. Declare maps. Ring buffers need :max-entries (buffer size in bytes)
+;;    but not :key-size or :value-size.
+(defmap events :type :ringbuf :max-entries 4096)
+
+;; 3. Write the program. with-tcp does bounds + EtherType + protocol
+;;    checks automatically. with-ringbuf handles reserve/null-check/submit.
+(defprog event-logger (:type :xdp :section "xdp" :license "GPL")
+  (with-tcp (data data-end tcp)
+    (let ((flags (tcp-flags tcp)))
+      ;; Only new connections: SYN set, ACK not set
+      (when (and (logand flags +tcp-syn+)
+                 (not (logand flags +tcp-ack+)))
+        (let ((ip (+ data +eth-hdr-len+)))
+          (with-ringbuf (event events (sizeof conn-event))
+            (setf (conn-event-src-addr event) (ipv4-src-addr ip)
+                  (conn-event-dst-addr event) (ipv4-dst-addr ip)
+                  (conn-event-dst-port event) (tcp-dst-port tcp)
+                  (conn-event-proto event) +ip-proto-tcp+))))))
+  XDP_PASS)
+
+(compile-to-elf "events.bpf.o")
+```
+
+Key points:
+- `with-tcp` expands to bounds check → EtherType check → protocol check,
+  all as flat guards with early return. Zero overhead beyond what you'd
+  write by hand.
+- `with-ringbuf` reserves space, executes the body, and submits on normal
+  exit. If the reserve fails (buffer full), the body is skipped.
+- `sizeof` is a compile-time constant — no runtime cost.
+- The same `defstruct` drives both the BPF accessors and the CL-side
+  `decode-conn-event` for reading events in userspace.
+
+### Kernel struct traversal
+
+Reading kernel data structures from kprobes/tracepoints. This is the
+get-current-task → import-kernel-struct → kernel-load chain.
+
+```lisp
+(in-package #:whistler)
+
+;; 1. Import kernel struct fields from vmlinux BTF. This reads
+;;    /sys/kernel/btf/vmlinux at compile time and generates accessors
+;;    that use kernel-load (probe-read-kernel under the hood).
+(import-kernel-struct task_struct pid tgid real_parent)
+
+;; 2. Define the event we'll send to userspace.
+(defstruct exec-event
+  (pid  u32)
+  (ppid u32)
+  (comm (array u8 16)))
+
+(defmap events :type :ringbuf :max-entries 16384)
+
+;; 3. Attach to execve. get-current-task returns a kernel pointer;
+;;    the imported accessors use probe-read-kernel automatically.
+(defprog trace-exec (:type :kprobe
+                     :section "kprobe/__x64_sys_execve"
+                     :license "GPL")
+  (let* ((task   (get-current-task))
+         (pid    (task-struct-tgid task))       ; safe: uses kernel-load
+         (parent (task-struct-real-parent task)) ; pointer to parent task
+         (ppid   (task-struct-tgid parent)))    ; read parent's tgid
+    (with-ringbuf (event events (sizeof exec-event))
+      (setf (exec-event-pid event) pid
+            (exec-event-ppid event) ppid)
+      (get-current-comm (exec-event-comm-ptr event) 16)))
+  0)
+
+(compile-to-elf "exec-trace.bpf.o")
+```
+
+Key points:
+- `import-kernel-struct` reads offsets from your running kernel's BTF,
+  so the program is portable across kernel versions (CO-RE).
+- The generated accessors (`task-struct-pid`, etc.) use `kernel-load`,
+  which expands to `probe-read-kernel` into a stack buffer. This is
+  required because the BPF verifier won't allow direct loads from
+  kernel pointers.
+- Pointer chasing works naturally: `task-struct-real-parent` returns a
+  kernel pointer, and you can pass it directly to another accessor.
+- `get-current-comm` writes the process name into an array field via
+  the `-ptr` accessor (`exec-event-comm-ptr`).
+
+### XDP with tail call dispatch
+
+Split packet processing across multiple programs using tail calls.
+A dispatcher reads the protocol and jumps into the appropriate handler.
+
+```lisp
+(in-package #:whistler)
+
+;; Jump table: IP protocol number → handler program FD.
+;; Populated at load time by bpftool or libbpf.
+(defmap jt :type :prog-array
+  :key-size 4 :value-size 4 :max-entries 256)
+
+;; Per-protocol counters (shared across all programs in the ELF).
+(defmap stats :type :array
+  :key-size 4 :value-size 8 :max-entries 3)
+
+(defconstant +stat-dispatched+ 0)
+(defconstant +stat-tcp+        1)
+(defconstant +stat-udp+        2)
+
+;; Dispatcher — the XDP entry point.
+(defprog xdp-dispatch (:type :xdp :section "xdp" :license "GPL")
+  (let ((data     (xdp-data))
+        (data-end (xdp-data-end)))
+    (when (> (+ data 34) data-end)
+      (return XDP_PASS))
+    (when (/= (eth-type data) +ethertype-ipv4+)
+      (return XDP_PASS))
+    (let ((proto (ipv4-protocol (+ data +eth-hdr-len+))))
+      (declare (type u32 proto))
+      (incf (getmap stats +stat-dispatched+))
+      ;; Tail call into the handler. If no program is loaded for
+      ;; this protocol number, execution falls through to XDP_PASS.
+      (tail-call jt proto)))
+  XDP_PASS)
+
+;; TCP handler — loaded into jt[6] at runtime.
+(defprog tcp-handler (:type :xdp :section "xdp/tcp" :license "GPL")
+  (incf (getmap stats +stat-tcp+))
+  ;; ... TCP-specific processing ...
+  XDP_PASS)
+
+;; UDP handler — loaded into jt[17] at runtime.
+(defprog udp-handler (:type :xdp :section "xdp/udp" :license "GPL")
+  (incf (getmap stats +stat-udp+))
+  ;; ... UDP-specific processing ...
+  XDP_PASS)
+
+;; All three programs compile into one ELF, sharing maps.
+(compile-to-elf "dispatch.bpf.o")
+```
+
+Key points:
+- Multiple `defprog` forms compile into a single ELF with separate
+  sections. Maps are shared.
+- `tail-call` transfers execution to the program at the given index
+  in the prog-array map. It's a zero-cost jump — no new stack frame.
+- If the index is out of range or no program is loaded there,
+  execution continues normally. This makes tail calls safe as a
+  dispatch mechanism.
+- At load time, populate the jump table:
+  ```sh
+  bpftool prog load dispatch.bpf.o /sys/fs/bpf/dispatch
+  bpftool map update name jt key 6 0 0 0 \
+    value pinned /sys/fs/bpf/dispatch/tcp_handler
+  bpftool map update name jt key 17 0 0 0 \
+    value pinned /sys/fs/bpf/dispatch/udp_handler
+  ```
+
+### Inline session: compile, load, and trace from one file
+
+No intermediate `.bpf.o` file. The BPF program compiles at macroexpand
+time and loads at runtime, all from one Lisp form.
+
+```lisp
+(asdf:load-system "whistler/loader")
+
+(defpackage #:my-tracer
+  (:use #:cl #:whistler #:whistler/loader)
+  (:shadowing-import-from #:whistler #:incf #:decf)
+  (:shadowing-import-from #:cl #:case #:defstruct))
+
+(in-package #:my-tracer)
+
+(whistler:defstruct call-event
+  (pid u32) (comm (array u8 16)))
+
+(defun run ()
+  (with-bpf-session ()
+    ;; BPF side — compiled at macroexpand time
+    (bpf:map events :type :ringbuf :max-entries 16384)
+    (bpf:prog trace (:type :kprobe
+                      :section "kprobe/__x64_sys_execve"
+                      :license "GPL")
+      (with-ringbuf (evt events (sizeof call-event))
+        (fill-process-info evt
+          :pid-field call-event-pid
+          :comm-field call-event-comm-ptr))
+      0)
+
+    ;; CL side — runs at runtime
+    (bpf:attach trace "__x64_sys_execve")
+    (format t "Tracing execve. Ctrl-C to stop.~%")
+    (let ((ring (bpf:map-ref events)))
+      (handler-case
+          (loop (ring-poll ring :timeout-ms 1000))
+        (sb-sys:interactive-interrupt ()
+          (format t "~&Done.~%"))))))
+
+(run)
+```
+
+Key points:
+- `with-bpf-session` scopes the entire lifecycle: compile, load,
+  attach, and auto-cleanup on exit.
+- The `bpf:` prefix marks kernel-side declarations. Everything else
+  is normal CL that runs at runtime.
+- `(:shadowing-import-from #:whistler #:incf #:decf)` resolves the
+  CL/Whistler symbol conflict when embedding in your own package.
+- `fill-process-info` fills pid/uid/timestamp/comm from BPF helpers
+  in one form, using your struct's accessor names.
