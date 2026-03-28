@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install SBCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sbcl
+
+      - name: Install Quicklisp and FiveAM
+        run: |
+          curl -sL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp
+          sbcl --noinform --non-interactive \
+            --load /tmp/quicklisp.lisp \
+            --eval '(quicklisp-quickstart:install)' \
+            --eval '(ql:quickload "fiveam")' \
+            --eval '(ql:add-to-init-file)'
+
+      - name: Run tests
+        run: make test
+
+      - name: Compile all examples
+        run: |
+          for f in examples/*.lisp; do
+            name=$(basename "$f" .lisp)
+            # skip ffi-call-tracker (requires loader system)
+            if [ "$name" = "ffi-call-tracker" ]; then continue; fi
+            sbcl --noinform --non-interactive \
+              --eval '(require :asdf)' \
+              --eval '(push #p"./" asdf:*central-registry*)' \
+              --eval '(asdf:load-system "whistler")' \
+              --eval "(whistler::compile-file* \"$f\" \"/tmp/${name}.bpf.o\")"
+          done
+
+      - name: Build standalone binary
+        run: make
+
+      - name: Verify binary
+        run: |
+          ./whistler --version
+          ./whistler compile examples/count-xdp.lisp -o /tmp/count-xdp.bpf.o
