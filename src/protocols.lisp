@@ -596,6 +596,65 @@
   "Load XDP context data-end pointer."
   `(core-ctx-load u32 4 xdp-md data-end))
 
+;;; ---- TC (traffic control / sched_cls) packet parsing ----
+;;;
+;;; TC programs use __sk_buff as their context, where:
+;;;   data     is at byte offset 76
+;;;   data_end is at byte offset 80
+;;;
+;;; These macros mirror the XDP with-packet/with-tcp/with-udp family,
+;;; using TC context offsets and TC_ACT_OK as the early-return code.
+
+(defmacro tc-data ()
+  "Load TC (__sk_buff) context data pointer."
+  `(ctx-load u32 76))
+
+(defmacro tc-data-end ()
+  "Load TC (__sk_buff) context data-end pointer."
+  `(ctx-load u32 80))
+
+(defmacro with-tc-packet ((data data-end &key (min-len 0)) &body body)
+  "Bind DATA and DATA-END from the TC (__sk_buff) context, then check minimum length."
+  `(let ((,data     u64 (ctx-load u32 76))
+         (,data-end u64 (ctx-load u32 80)))
+     (if (> (+ ,data ,min-len) ,data-end)
+         (return TC_ACT_OK)
+         (progn ,@body))))
+
+(defmacro with-tc-eth ((data data-end) &body body)
+  "Parse ethernet header with bounds check in a TC program."
+  `(with-tc-packet (,data ,data-end :min-len ,+eth-hdr-len+)
+     ,@body))
+
+(defmacro with-tc-ipv4 ((data data-end ip-off) &body body)
+  "Parse IPv4 header with bounds check in a TC program."
+  `(with-tc-packet (,data ,data-end :min-len ,(+ +eth-hdr-len+ +ipv4-hdr-len+))
+     (when (= (eth-type ,data) ,+ethertype-ipv4+)
+       (let ((,ip-off u64 (+ ,data ,+eth-hdr-len+)))
+         ,@body))))
+
+(defmacro with-tc-tcp ((data data-end tcp-off) &body body)
+  "Parse TCP header with bounds check in a TC program."
+  (let ((ip-off (gensym "IP")))
+    `(with-tc-packet (,data ,data-end
+                      :min-len ,(+ +eth-hdr-len+ +ipv4-hdr-len+ +tcp-hdr-len+))
+       (when (= (eth-type ,data) ,+ethertype-ipv4+)
+         (let ((,ip-off u64 (+ ,data ,+eth-hdr-len+)))
+           (when (= (ipv4-protocol ,ip-off) ,+ip-proto-tcp+)
+             (let ((,tcp-off u64 (+ ,ip-off ,+ipv4-hdr-len+)))
+               ,@body)))))))
+
+(defmacro with-tc-udp ((data data-end udp-off) &body body)
+  "Parse UDP header with bounds check in a TC program."
+  (let ((ip-off (gensym "IP")))
+    `(with-tc-packet (,data ,data-end
+                      :min-len ,(+ +eth-hdr-len+ +ipv4-hdr-len+ +udp-hdr-len+))
+       (when (= (eth-type ,data) ,+ethertype-ipv4+)
+         (let ((,ip-off u64 (+ ,data ,+eth-hdr-len+)))
+           (when (= (ipv4-protocol ,ip-off) ,+ip-proto-udp+)
+             (let ((,udp-off u64 (+ ,ip-off ,+ipv4-hdr-len+)))
+               ,@body)))))))
+
 ;;; ================================================================
 ;;; Tracepoint support
 ;;; ================================================================

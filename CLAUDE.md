@@ -83,7 +83,7 @@ Pure CL BPF loader — no libbpf, no CFFI. ASDF system `whistler/loader`. Key AP
 
 Permissions: `CAP_BPF` + `CAP_PERFMON` for loading/attaching. Use `sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/sbcl` instead of root. Tracepoint format files need `chmod a+r`.
 
-Protocol headers: Ethernet, IPv4, IPv6, TCP, UDP, ICMP with constants and `with-packet`/`with-tcp`/`with-udp` parsing macros.
+Protocol headers: Ethernet, IPv4, IPv6, TCP, UDP, ICMP with constants and `with-packet`/`with-tcp`/`with-udp` parsing macros. TC (sched_cls) programs use `with-tc-packet`/`with-tc-tcp`/`with-tc-udp` (same API, `__sk_buff` offsets, `TC_ACT_OK`/`TC_ACT_SHOT` return codes).
 
 Types: `u8`, `u16`, `u32`, `u64`. The `whistler` package shadows `case`, `defstruct`, `incf`, and `decf` from CL. Standalone BPF source files use `(in-package #:whistler)` which avoids conflicts. To use Whistler from another package, add `:shadowing-import-from`:
 
