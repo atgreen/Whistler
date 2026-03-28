@@ -69,7 +69,7 @@ Key forms: `let` (parallel bindings, standard CL), `let*` (sequential bindings),
 
 `with-ringbuf` handles reserve/null-check/submit: `(with-ringbuf (var map size) body...)`. `fill-process-info` fills pid/uid/timestamp/comm from BPF helpers using struct accessor names.
 
-Memory ops: `(memset ptr off val n)` with widened stores, `(memcpy dst doff src soff n)` with wide load/store pairs. `(pt-regs-parm1)` through `(pt-regs-parm6)` and `(pt-regs-ret)` for x86-64 uprobe/kprobe context access.
+Memory ops: `(memset ptr off val n)` with widened stores, `(memcpy dst doff src soff n)` with wide load/store pairs. `(pt-regs-parm1)` through `(pt-regs-parm6)` and `(pt-regs-ret)` for uprobe/kprobe context access (x86-64 and aarch64; compile-time error on unsupported architectures).
 
 ## Userspace Loader (whistler/loader)
 

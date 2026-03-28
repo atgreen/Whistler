@@ -14,18 +14,43 @@
 ;;; BPF-shaped details behind Lisp-idiomatic forms. They all expand
 ;;; to primitive Whistler forms at compile time — zero runtime cost.
 
-;;; ---- pt_regs access (x86-64) ----
+;;; ---- pt_regs access ----
 ;;;
 ;;; These match the C macros PT_REGS_PARM1() etc. from bpf_tracing.h.
-;;; x86-64 System V ABI: rdi, rsi, rdx, rcx, r8, r9
+;;; Offsets are architecture-specific; detected from the host at compile time.
+;;; Currently supports x86-64 and aarch64.
 
-(defmacro pt-regs-parm1 () "First function arg (rdi)."  '(ctx-load u64 112))
-(defmacro pt-regs-parm2 () "Second function arg (rsi)." '(ctx-load u64 104))
-(defmacro pt-regs-parm3 () "Third function arg (rdx)."  '(ctx-load u64 96))
-(defmacro pt-regs-parm4 () "Fourth function arg (rcx)." '(ctx-load u64 88))
-(defmacro pt-regs-parm5 () "Fifth function arg (r8)."   '(ctx-load u64 72))
-(defmacro pt-regs-parm6 () "Sixth function arg (r9)."   '(ctx-load u64 64))
-(defmacro pt-regs-ret ()   "Return value (rax)."        '(ctx-load u64 80))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun pt-regs-offsets ()
+    "Return an alist of pt_regs offsets for the host architecture.
+     Each entry is (name . offset) for ctx-load u64."
+    #+x86-64
+    ;; x86-64 System V ABI: rdi, rsi, rdx, rcx, r8, r9, rax
+    '((:parm1 . 112) (:parm2 . 104) (:parm3 . 96)
+      (:parm4 .  88) (:parm5 .  72) (:parm6 . 64)
+      (:ret   .  80))
+    #+arm64
+    ;; aarch64: x0-x5 at offsets 0-40, x0 also used for return value
+    '((:parm1 .  0) (:parm2 .  8) (:parm3 . 16)
+      (:parm4 . 24) (:parm5 . 32) (:parm6 . 40)
+      (:ret   .  0))
+    #-(or x86-64 arm64)
+    (error "pt-regs-parm1..6 and pt-regs-ret require x86-64 or aarch64. ~
+            Current architecture is not supported. ~
+            See bpf_tracing.h for your platform's pt_regs layout.")))
+
+(cl:macrolet ((def-pt-regs-accessor (name key docstring)
+                `(defmacro ,name ()
+                   ,docstring
+                   (let ((offset (cdr (assoc ,key (pt-regs-offsets)))))
+                     `(ctx-load u64 ,offset)))))
+  (def-pt-regs-accessor pt-regs-parm1 :parm1 "First function argument from pt_regs.")
+  (def-pt-regs-accessor pt-regs-parm2 :parm2 "Second function argument from pt_regs.")
+  (def-pt-regs-accessor pt-regs-parm3 :parm3 "Third function argument from pt_regs.")
+  (def-pt-regs-accessor pt-regs-parm4 :parm4 "Fourth function argument from pt_regs.")
+  (def-pt-regs-accessor pt-regs-parm5 :parm5 "Fifth function argument from pt_regs.")
+  (def-pt-regs-accessor pt-regs-parm6 :parm6 "Sixth function argument from pt_regs.")
+  (def-pt-regs-accessor pt-regs-ret   :ret   "Return value from pt_regs."))
 
 ;;; ---- Control flow ----
 
