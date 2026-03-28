@@ -223,6 +223,13 @@
   (let ((spec (map-spec-for map-name)))
     (if spec (getf (rest spec) :value-size) 8)))
 
+(defun struct-value-map-p (map-name)
+  "Check if MAP-NAME was declared with :value-type (a struct).
+   When true, getmap returns the map_value pointer directly instead of
+   dereferencing it as a scalar."
+  (let ((spec (map-spec-for map-name)))
+    (and spec (getf (rest spec) :value-type))))
+
 (defmacro incf-map (map key-form &optional (delta 1))
   "Atomically increment a map value. For array maps where the key always exists,
    this is just a lookup + atomic-add. For hash maps, initializes to DELTA if
@@ -258,25 +265,41 @@
                        (map-update ,map ,k ,init 0)))))))))
 
 (defmacro getmap (map key-form)
-  "Look up a map value and dereference the pointer. Returns the value
-   using the map's value-size type, or 0 if the key is not found.
+  "Look up a map value. For scalar values (≤8 bytes), dereferences the
+   pointer and returns the value. For struct values (>8 bytes), returns
+   the map_value pointer directly so fields can be accessed with struct
+   accessors. Returns 0/nil if the key is not found.
    Automatically uses -ptr operations for struct key maps."
   (let ((p (gensym "P"))
         (vtype (map-value-type map))
         (lookup (if (struct-key-map-p map) 'map-lookup-ptr 'map-lookup)))
-    `(let ((,p u64 (,lookup ,map ,key-form)))
-       (if ,p (load ,vtype ,p 0) 0))))
+    (if (struct-value-map-p map)
+        ;; Struct value: return the pointer directly
+        `(,lookup ,map ,key-form)
+        ;; Scalar value: dereference
+        `(let ((,p u64 (,lookup ,map ,key-form)))
+           (if ,p (load ,vtype ,p 0) 0)))))
 
 (defmacro set-getmap! (map key-form val-form)
-  "Writer macro for (setf (getmap map key) val)."
+  "Writer macro for (setf (getmap map key) val).
+   For struct-valued maps, val-form should be a pointer to a stack-allocated
+   struct (e.g., from make-<struct>). For scalar maps, val-form is a value."
   (let ((v (gensym "V"))
         (vtype (map-value-type map)))
-    (if (struct-key-map-p map)
-        `(let ((,v (struct-alloc ,(map-value-size-bytes map))))
-           (store ,vtype ,v 0 ,val-form)
-           (map-update-ptr ,map ,key-form ,v 0))
-        `(let ((,v ,vtype ,val-form))
-           (map-update ,map ,key-form ,v 0)))))
+    (cond
+      ((struct-value-map-p map)
+       ;; Struct value: val-form is a pointer, use map-update-ptr or map-update
+       ;; with the struct pointer directly
+       (if (struct-key-map-p map)
+           `(map-update-ptr ,map ,key-form ,val-form 0)
+           `(map-update ,map ,key-form ,val-form 0)))
+      ((struct-key-map-p map)
+       `(let ((,v (struct-alloc ,(map-value-size-bytes map))))
+          (store ,vtype ,v 0 ,val-form)
+          (map-update-ptr ,map ,key-form ,v 0)))
+      (t
+       `(let ((,v ,vtype ,val-form))
+          (map-update ,map ,key-form ,v 0))))))
 
 (cl:defsetf getmap set-getmap!)
 
