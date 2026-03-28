@@ -37,6 +37,8 @@
 (defconstant +bpf-map-delete-elem+ 3)
 (defconstant +bpf-map-get-next-key+ 4)
 (defconstant +bpf-prog-load+ 5)
+(defconstant +bpf-obj-pin+ 6)
+(defconstant +bpf-obj-get+ 7)
 
 ;;; ========== BPF map types ==========
 
