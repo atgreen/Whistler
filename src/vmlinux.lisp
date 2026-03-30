@@ -141,7 +141,8 @@
                 ;; For now, treat as opaque bytes
                 (return (values nil (getf rec :size) "array")))
                (#.+btf-kind-struct+ #.+btf-kind-union+
-                (return (values nil (getf rec :size) "struct")))
+                (let ((name (btf-string strtab (getf rec :name-off))))
+                  (return (values nil (getf rec :size) name))))
                (t (return (values 'u64 8 "unknown")))))))
 
 (defun btf-struct-fields (vmbtf struct-type-id)
@@ -175,10 +176,10 @@
                           (fname (btf-string strtab name-off)))
                      (if (plusp (length fname))
                          ;; Named field: resolve type and collect
-                         (multiple-value-bind (bpf-type size)
+                         (multiple-value-bind (bpf-type size resolved-name)
                              (btf-resolve-type vmbtf member-type-id)
-                           (when bpf-type
-                             (push (list fname bpf-type byte-offset size) fields)))
+                           (push (list fname bpf-type byte-offset size resolved-name)
+                                 fields))
                          ;; Anonymous member: recurse into it if struct/union
                          (let ((member-rec (when (< member-type-id (length types))
                                              (aref types member-type-id))))
@@ -190,6 +191,32 @@
                                           fields)))))))
                  (nreverse fields))))
       (collect-fields struct-type-id 0))))
+
+;;; ========== Typed pointer support ==========
+
+(defmacro typed-ptr (struct-type expr)
+  "Compile-time struct pointer tag. Erased before lowering — zero cost.
+   Accessor macros check this tag and propagate it for embedded structs."
+  (declare (ignore struct-type))
+  expr)
+
+(defun strip-typed-ptr (form)
+  "If FORM is (typed-ptr TYPE EXPR), return EXPR. Otherwise return FORM."
+  (if (and (consp form) (eq (car form) 'typed-ptr))
+      (third form)
+      form))
+
+(defun check-struct-ptr-type (expected-struct ptr-form accessor-name)
+  "At macroexpand time, verify a typed-ptr tag matches the expected struct.
+   Bare (untagged) pointers pass through unchecked for backward compatibility."
+  (when (and (consp ptr-form) (eq (car ptr-form) 'typed-ptr))
+    (let ((actual-struct (second ptr-form)))
+      (unless (eq actual-struct expected-struct)
+        (whistler-error
+         :what (format nil "~a expects a ~a pointer, got ~a"
+                       accessor-name expected-struct actual-struct)
+         :hint (format nil "use (as-~(~a~) ptr) to cast if intentional"
+                       expected-struct))))))
 
 ;;; ========== The macro ==========
 
@@ -203,14 +230,15 @@
 
 (defmacro import-kernel-struct (struct-name &rest field-names)
   "Import a kernel struct from vmlinux BTF at macroexpand time.
-   Generates ctx-load accessors for accessing the struct fields.
+   For scalar/pointer fields, generates kernel-load accessors.
+   For all fields (including embedded structs), generates offset constants.
    FIELD-NAMES optionally restricts which fields to import.
 
    Example:
-     (import-kernel-struct task_struct pid comm)
+     (import-kernel-struct msghdr msg_name msg_iter)
 
-   Generates: (task-struct-pid ptr) → (load u32 ptr OFFSET)
-              (task-struct-comm ptr idx) → array access"
+   Generates: (msghdr-msg-name ptr)  → (kernel-load u64 ptr OFFSET)  ; pointer field
+              (msghdr-msg-iter ptr)  → (+ ptr OFFSET)                ; embedded struct"
   (let* ((vmbtf (ensure-vmlinux-btf))
          (c-name (substitute #\_ #\- (string-downcase (symbol-name struct-name)))))
     (multiple-value-bind (type-id rec) (btf-find-struct vmbtf c-name)
@@ -238,17 +266,43 @@
              (lisp-struct-name (intern (string-upcase
                                         (substitute #\- #\_ c-name))
                                        (symbol-package struct-name))))
-        ;; Generate accessors
+        ;; Generate as-STRUCT cast macro
+        (let ((cast-name (intern (format nil "AS-~a" (symbol-name lisp-struct-name))
+                                 (symbol-package struct-name))))
+          (push `(defmacro ,cast-name (ptr)
+                   (list 'typed-ptr ',lisp-struct-name ptr))
+                forms))
+        ;; Generate accessors with type checking
         (dolist (field fields)
-          (destructuring-bind (c-fname bpf-type byte-offset size) field
+          (destructuring-bind (c-fname bpf-type byte-offset size resolved-name) field
+            (declare (ignore size))
             (let* ((lisp-fname (substitute #\- #\_ c-fname))
                    (accessor (intern (format nil "~a-~a"
                                             (symbol-name lisp-struct-name)
                                             (string-upcase lisp-fname))
                                      (symbol-package struct-name))))
-              (push `(defmacro ,accessor (ptr)
-                       (list 'kernel-load ',bpf-type ptr ,byte-offset))
-                    forms))))
+              (if bpf-type
+                  ;; Scalar/pointer: check type, strip tag, kernel-load
+                  (push `(defmacro ,accessor (ptr)
+                           (check-struct-ptr-type ',lisp-struct-name ptr ',accessor)
+                           (list 'kernel-load ',bpf-type (strip-typed-ptr ptr)
+                                 ,byte-offset))
+                        forms)
+                  ;; Embedded struct: check type, strip tag, return typed address
+                  (let ((embedded-name
+                          (when (and resolved-name (plusp (length resolved-name)))
+                            (intern (string-upcase (substitute #\- #\_ resolved-name))
+                                    (symbol-package struct-name)))))
+                    (if embedded-name
+                        (push `(defmacro ,accessor (ptr)
+                                 (check-struct-ptr-type ',lisp-struct-name ptr ',accessor)
+                                 (list 'typed-ptr ',embedded-name
+                                       (list '+ (strip-typed-ptr ptr) ,byte-offset)))
+                              forms)
+                        (push `(defmacro ,accessor (ptr)
+                                 (check-struct-ptr-type ',lisp-struct-name ptr ',accessor)
+                                 (list '+ (strip-typed-ptr ptr) ,byte-offset))
+                              forms)))))))
         ;; Generate sizeof constant
         (let ((sizeof-name (intern (format nil "+~a-SIZE+"
                                           (symbol-name lisp-struct-name))

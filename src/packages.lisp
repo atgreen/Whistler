@@ -155,4 +155,6 @@
            #:pt-regs-parm4 #:pt-regs-parm5 #:pt-regs-parm6
            #:pt-regs-ret
            ;; Safe kernel memory access
-           #:kernel-load))
+           #:kernel-load
+           ;; Typed kernel struct pointers
+           #:typed-ptr #:strip-typed-ptr #:check-struct-ptr-type))
