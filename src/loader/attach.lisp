@@ -57,12 +57,14 @@
     (put-u64 buf 8 config)        ; config (offset 8)
     buf))
 
-(defun attach-perf-bpf (perf-attr prog-fd)
-  "Open perf events on all CPUs, attach BPF prog, and enable.
+(defun attach-perf-bpf (perf-attr prog-fd &key per-cpu)
+  "Open perf events, attach BPF prog, and enable.
+   When PER-CPU is true, opens one event per online CPU (for tracepoints).
+   Otherwise opens a single event on CPU 0 (for kprobe/uprobe PMU attachment).
    Returns list of perf event FDs."
-  (let ((ncpus (online-cpu-count))
+  (let ((cpus (if per-cpu (online-cpu-count) 1))
         (fds '()))
-    (dotimes (cpu ncpus)
+    (dotimes (cpu cpus)
       (let ((fd (%perf-event-open perf-attr -1 cpu -1 +perf-flag-fd-cloexec+)))
         (push fd fds)
         (%ioctl fd +perf-event-ioc-set-bpf+ prog-fd)
@@ -73,10 +75,11 @@
 
 (defun attach-kprobe (prog-fd function-name &key retprobe)
   "Attach a BPF program to a kprobe on FUNCTION-NAME.
+   If RETPROBE is true, attaches to the return point instead.
    Returns an attachment that can be passed to detach."
-  (declare (ignore retprobe))  ; TODO: retprobe support
   (let* ((pmu-type (read-file-int "/sys/bus/event_source/devices/kprobe/type"))
-         (attr (make-perf-attr (or pmu-type +perf-type-tracepoint+) 0))
+         (config (if retprobe 1 0))  ; bit 0 = retprobe
+         (attr (make-perf-attr (or pmu-type +perf-type-tracepoint+) config))
          (name-bytes (sb-ext:string-to-octets function-name :null-terminate t)))
     (sb-sys:with-pinned-objects (name-bytes)
       ;; config1 = function name pointer at offset 56
@@ -160,17 +163,17 @@
     (unless ifindex
       (error "Interface not found: ~a" interface-name))
     ;; Pin the program to bpffs
+    ;; BPF_OBJ_PIN attr: pathname (ptr) at offset 0, bpf_fd (u32) at offset 8
     (let ((buf (make-attr-buf)))
-      (put-u32 buf 0 prog-fd)
       (let ((path-bytes (sb-ext:string-to-octets pin-path :null-terminate t)))
         (sb-sys:with-pinned-objects (path-bytes)
-          (put-ptr buf 8 (sb-sys:vector-sap path-bytes))
-          (handler-case
-              (%bpf +bpf-obj-pin+ buf 32 "bpf-pin")
-            (bpf-error ()
-              ;; Already pinned, unpin first and retry
-              (delete-file pin-path)
-              (%bpf +bpf-obj-pin+ buf 32 "bpf-pin"))))))
+          (put-ptr buf 0 (sb-sys:vector-sap path-bytes))
+          (put-u32 buf 8 prog-fd)
+          ;; Remove stale pin if it exists
+          (when (probe-file pin-path)
+            (handler-case (delete-file pin-path)
+              (error () nil)))
+          (%bpf +bpf-obj-pin+ buf 32 "bpf-pin"))))
     ;; Set up clsact qdisc (idempotent)
     (sb-ext:run-program "tc" (list "qdisc" "add" "dev" interface-name "clsact")
                         :search t :wait t)
@@ -180,7 +183,7 @@
                            direction "bpf" "da" "pinned" pin-path)
                 :search t :wait t)))
       (unless (zerop (sb-ext:process-exit-code ret))
-        (delete-file pin-path)
+        (handler-case (delete-file pin-path) (error () nil))
         (error "Failed to attach TC (~a) to ~a" direction interface-name)))
     (make-attachment :type :tc :perf-fds nil :prog-fd prog-fd
                      :cleanup (lambda ()
