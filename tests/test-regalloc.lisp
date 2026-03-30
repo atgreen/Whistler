@@ -109,6 +109,92 @@
               (is (= 0 dst-reg)
                   (format nil "Inner null check should test R0, got R~d" dst-reg)))))))))
 
+(test probe-read-user-arg-order
+  "probe-read-user must set R1=dest R2=size R3=src without clobbering (issue #31).
+   When dest involves pointer arithmetic and src comes from a caller-saved
+   register, the argument setup must not clobber dest when loading the size
+   immediate into R2."
+  (let* ((maps '((events :type :ringbuf :max-entries 16384)))
+         (bytes (let ((whistler::*maps* maps))
+                  (w-body "(let ((buf (ctx-load u64 0)))
+                             (when buf
+                               (let ((dst (struct-alloc 64)))
+                                 (probe-read-user dst 64 buf)
+                                 (return 0)))
+                             (return 0))"
+                          :maps maps)))
+         (n (/ (length bytes) 8)))
+    ;; Find the probe_read_user call (helper 112)
+    (let ((call-idx
+           (loop for i below n
+                 when (and (= +jmp-call+ (nth-insn-opcode bytes i))
+                           (= 112 (nth-insn-imm bytes i)))
+                   return i)))
+      (is (not (null call-idx))
+          "Should contain a call to helper 112 (probe_read_user)")
+      (when call-idx
+        ;; Walk backward from the call to find the R2 = 64 immediate load.
+        ;; R2 must contain the size (64), not a clobbered pointer.
+        (let ((r2-imm-idx
+               (loop for i from (1- call-idx) downto 0
+                     when (and (= +alu64-mov-imm+ (nth-insn-opcode bytes i))
+                               (= 2 (logand (nth-insn-regs bytes i) #x0f))
+                               (= 64 (nth-insn-imm bytes i)))
+                       return i)))
+          (is (not (null r2-imm-idx))
+              "R2 should be loaded with immediate 64 (the size argument)")
+          (when r2-imm-idx
+            ;; Between R2=64 and the CALL, there must be no other write to R2
+            ;; (that was the clobbering bug: dest ptr was computed into R2,
+            ;; then size=64 overwrote it, then R1=R2 copied the wrong value)
+            (let ((r2-clobber
+                   (loop for i from (1+ r2-imm-idx) below call-idx
+                         for opcode = (nth-insn-opcode bytes i)
+                         for dst-reg = (logand (nth-insn-regs bytes i) #x0f)
+                         when (and (= dst-reg 2)
+                                   ;; Exclude the R2=64 itself
+                                   (not (= i r2-imm-idx)))
+                           return i)))
+              (is (null r2-clobber)
+                  (format nil "R2 clobbered at insn ~d between size load and call"
+                          r2-clobber)))))))))
+
+(test probe-read-user-branched-arg-order
+  "probe-read-user in else branch must not clobber args (issue #31).
+   This is the specific pattern from the bug report: probe-read-user
+   where src comes from a chain of pointer dereferences in a branch."
+  (let* ((maps '((events :type :ringbuf :max-entries 16384)))
+         (bytes (let ((whistler::*maps* maps))
+                  (w-body "(let ((ubuf (ctx-load u64 0))
+                                 (dst (struct-alloc 64)))
+                             (if ubuf
+                                 (probe-read-user dst 64 ubuf)
+                                 (let ((alt-src (ctx-load u64 8)))
+                                   (when alt-src
+                                     (probe-read-user dst 64 alt-src))))
+                             (return 0))"
+                          :maps maps)))
+         (n (/ (length bytes) 8)))
+    ;; Find ALL probe_read_user calls — there should be 2
+    (let ((call-indices
+           (loop for i below n
+                 when (and (= +jmp-call+ (nth-insn-opcode bytes i))
+                           (= 112 (nth-insn-imm bytes i)))
+                   collect i)))
+      (is (= 2 (length call-indices))
+          (format nil "Expected 2 probe_read_user calls, got ~d"
+                  (length call-indices)))
+      ;; For each call, verify R2=64 is set and not clobbered before the call
+      (dolist (call-idx call-indices)
+        (let ((r2-imm-idx
+               (loop for i from (1- call-idx) downto (max 0 (- call-idx 10))
+                     when (and (= +alu64-mov-imm+ (nth-insn-opcode bytes i))
+                               (= 2 (logand (nth-insn-regs bytes i) #x0f))
+                               (= 64 (nth-insn-imm bytes i)))
+                       return i)))
+          (is (not (null r2-imm-idx))
+              (format nil "R2=64 not found before call at insn ~d" call-idx)))))))
+
 (test phi-threading-getmap-without-helper-call
   "getmap without a preceding helper call in let* should still work correctly."
   (let* ((maps '((m :type :hash :key-size 4 :value-size 8 :max-entries 256)))

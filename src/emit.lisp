@@ -1154,28 +1154,70 @@
 
 ;;; ========== Helper call emission ==========
 
+(defun resolve-parallel-moves (ctx moves)
+  "Resolve a set of parallel register moves, emitting them in an order that
+   avoids clobbering.  Each move is (dst-reg . src), where src is one of:
+     (:imm value)    - immediate constant
+     (:reg phys-reg) - value in a physical register
+     (:stack offset) - value spilled to stack at [R10+offset]
+   Uses R0 as scratch to break cycles (safe: the upcoming CALL clobbers R0)."
+  (let ((pending (copy-list moves))
+        (tmp whistler/bpf:+bpf-reg-0+))
+    ;; A move is "safe" if its source won't be clobbered by other pending moves.
+    ;; Immediates and stack loads are always safe (no register conflict).
+    ;; A register source is safe if no pending move targets that register.
+    (loop
+      (let ((safe (find-if
+                   (lambda (m)
+                     (let ((src (cdr m)))
+                       (or (eq (car src) :imm)
+                           (eq (car src) :stack)
+                           (not (find (cadr src) pending :key #'car)))))
+                   pending)))
+        (cond
+          (safe
+           (setf pending (remove safe pending :test #'eq))
+           (destructuring-bind (dst . src) safe
+             (ecase (car src)
+               (:imm (ectx-emit ctx (whistler/bpf:emit-mov64-imm dst (cadr src))))
+               (:stack (ectx-emit ctx (whistler/bpf:emit-ldx-mem
+                                       whistler/bpf:+bpf-dw+ dst
+                                       whistler/bpf:+bpf-reg-10+ (cadr src))))
+               (:reg (unless (= dst (cadr src))
+                       (ectx-emit ctx (whistler/bpf:emit-mov64-reg dst (cadr src))))))))
+          ;; No safe move — must be a register cycle. Break via R0 temp.
+          (pending
+           (let* ((m (first pending))
+                  (src-reg (cadr (cdr m))))
+             ;; Save one source to R0, redirect all reads from that register
+             (ectx-emit ctx (whistler/bpf:emit-mov64-reg tmp src-reg))
+             (dolist (p pending)
+               (when (and (eq (car (cdr p)) :reg)
+                          (= (cadr (cdr p)) src-reg))
+                 (setf (cdr p) (list :reg tmp))))))
+          (t (return)))))))
+
 (defun emit-call-insn (ctx dst args)
-  "Emit a BPF helper call. Load arguments into R1-R5.
-   Args are loaded in REVERSE order (highest register first) to avoid
-   clobbering: if arg2 is in R1, loading arg1 into R1 first would
-   destroy arg2's value before we copy it to R2."
+  "Emit a BPF helper call. Load arguments into R1-R5 using parallel-move
+   resolution to avoid clobbering when argument registers overlap."
   (let ((func-id (helper-arg-id (first args)))
         (call-args (rest args)))
-    ;; Build (reg . vreg) pairs
-    (let ((pairs (loop for vreg in call-args
+    ;; Build move list: (target-reg . (:imm val) or (:reg src-reg))
+    ;; For stack-spilled vregs, load them first without using any target
+    ;; register — use allocate-vreg to find the source location.
+    (let ((moves (loop for vreg in call-args
                        for reg from whistler/bpf:+bpf-reg-1+
-                       collect (cons reg vreg))))
-      ;; Load in reverse order: R5/R4/R3 first, then R2, then R1
-      ;; This ensures lower regs aren't clobbered before higher regs read them
-      (dolist (pair (reverse pairs))
-        (let* ((reg (car pair))
-               (vreg (cdr pair))
-               (imm (vreg-imm-or-const ctx vreg)))
-          (if imm
-              (ectx-emit ctx (whistler/bpf:emit-mov64-imm reg imm))
-              (let ((src-reg (vreg-to-physical ctx vreg reg)))
-                (unless (= src-reg reg)
-                  (ectx-emit ctx (whistler/bpf:emit-mov64-reg reg src-reg))))))))
+                       collect (let ((imm (vreg-imm-or-const ctx vreg)))
+                                 (if imm
+                                     (cons reg (list :imm imm))
+                                     (let ((loc (allocate-vreg ctx vreg)))
+                                       (ecase (car loc)
+                                         (:reg (cons reg (list :reg (cadr loc))))
+                                         (:stack
+                                          ;; Stack spill: encode as (:stack offset)
+                                          ;; for resolve-parallel-moves to handle
+                                          (cons reg (list :stack (cadr loc)))))))))))
+      (resolve-parallel-moves ctx moves))
     (ectx-emit ctx (whistler/bpf:emit-call func-id))
     (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
 
