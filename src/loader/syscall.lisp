@@ -59,7 +59,7 @@
 
 ;;; ========== Perf event constants ==========
 
-(defconstant +perf-type-tracepoint+ 1)
+(defconstant +perf-type-tracepoint+ 2)
 (defconstant +perf-sample-raw+ 1024)
 (defconstant +perf-flag-fd-cloexec+ 8)
 (defconstant +perf-event-ioc-set-bpf+ #x40042408)

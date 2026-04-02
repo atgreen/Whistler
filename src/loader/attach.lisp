@@ -87,6 +87,38 @@
       (let ((fds (attach-perf-bpf attr prog-fd)))
         (make-attachment :type :kprobe :perf-fds fds :prog-fd prog-fd)))))
 
+;;; ========== Tracepoint attachment ==========
+
+(defun resolve-tracepoint-id (tracepoint-name)
+  "Resolve a tracepoint name like \"tracepoint/sched/sched-process-fork\"
+   or \"sched/sched-process-fork\" to its numeric event ID from tracefs.
+   Converts hyphens to underscores for the filesystem lookup."
+  (let* ((name (if (and (>= (length tracepoint-name) 11)
+                        (string= (subseq tracepoint-name 0 11) "tracepoint/"))
+                   (subseq tracepoint-name 11)
+                   tracepoint-name))
+         ;; Convert hyphens to underscores for tracefs paths
+         (fs-name (substitute #\_ #\- name))
+         (path (format nil "/sys/kernel/tracing/events/~a/id" fs-name))
+         (id (read-file-int path)))
+    (unless id
+      ;; Try debugfs fallback
+      (let ((alt-path (format nil "/sys/kernel/debug/tracing/events/~a/id" fs-name)))
+        (setf id (read-file-int alt-path))))
+    (unless id
+      (error "Cannot resolve tracepoint ID for ~a (tried ~a)" tracepoint-name path))
+    id))
+
+(defun attach-tracepoint (prog-fd tracepoint-name)
+  "Attach a BPF program to a tracepoint.
+   TRACEPOINT-NAME is e.g. \"tracepoint/sched/sched_process_fork\"
+   or \"sched/sched_process_fork\".
+   Returns an attachment that can be passed to detach."
+  (let* ((tp-id (resolve-tracepoint-id tracepoint-name))
+         (attr (make-perf-attr +perf-type-tracepoint+ tp-id))
+         (fds (attach-perf-bpf attr prog-fd :per-cpu t)))
+    (make-attachment :type :tracepoint :perf-fds fds :prog-fd prog-fd)))
+
 ;;; ========== Uprobe attachment ==========
 
 (defun vaddr-to-file-offset (bytes vaddr)

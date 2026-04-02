@@ -18,7 +18,7 @@
    #:map-lookup #:map-update #:map-delete #:map-get-next-key
    #:map-info-fd #:map-info-name
    ;; Attachment
-   #:attach-kprobe #:attach-uprobe #:attach-xdp #:attach-tc #:detach
+   #:attach-kprobe #:attach-uprobe #:attach-tracepoint #:attach-xdp #:attach-tc #:detach
    ;; Ring buffer
    #:open-ring-consumer #:ring-poll #:ring-consume #:close-ring-consumer
    ;; Conditions

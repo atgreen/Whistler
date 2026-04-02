@@ -225,7 +225,7 @@
            (unwind-protect
                 (macrolet
                     ((bpf:attach (prog-name target &rest args)
-                       ;; Detect kprobe vs uprobe from section name
+                       ;; Detect kprobe vs uprobe vs tracepoint from section name
                        (let* ((pname (string-downcase
                                       (substitute #\_ #\-
                                                   (symbol-name prog-name))))
@@ -233,24 +233,39 @@
                               (is-uprobe (and sec-name
                                               (>= (length sec-name) 7)
                                               (string= (subseq sec-name 0 7)
-                                                       "uprobe/"))))
-                         (if is-uprobe
-                             ;; uprobe: (bpf:attach prog binary-path symbol-name)
-                             `(let* ((prog-entry (assoc ,pname
-                                                        (bpf-session-progs *bpf-session*)
-                                                        :test #'string=))
-                                     (att (attach-uprobe (prog-info-fd (cdr prog-entry))
-                                                         ,target ,@args)))
-                                (push att (bpf-session-attachments *bpf-session*))
-                                att)
-                             ;; kprobe: (bpf:attach prog function-name)
-                             `(let* ((prog-entry (assoc ,pname
-                                                        (bpf-session-progs *bpf-session*)
-                                                        :test #'string=))
-                                     (att (attach-kprobe (prog-info-fd (cdr prog-entry))
-                                                         ,target ,@args)))
-                                (push att (bpf-session-attachments *bpf-session*))
-                                att))))
+                                                       "uprobe/")))
+                              (is-tracepoint (and sec-name
+                                                  (>= (length sec-name) 11)
+                                                  (string= (subseq sec-name 0 11)
+                                                           "tracepoint/"))))
+                         (cond
+                           (is-uprobe
+                            ;; uprobe: (bpf:attach prog binary-path symbol-name)
+                            `(let* ((prog-entry (assoc ,pname
+                                                       (bpf-session-progs *bpf-session*)
+                                                       :test #'string=))
+                                    (att (attach-uprobe (prog-info-fd (cdr prog-entry))
+                                                        ,target ,@args)))
+                               (push att (bpf-session-attachments *bpf-session*))
+                               att))
+                           (is-tracepoint
+                            ;; tracepoint: (bpf:attach prog tracepoint-name)
+                            `(let* ((prog-entry (assoc ,pname
+                                                       (bpf-session-progs *bpf-session*)
+                                                       :test #'string=))
+                                    (att (attach-tracepoint (prog-info-fd (cdr prog-entry))
+                                                            ,target)))
+                               (push att (bpf-session-attachments *bpf-session*))
+                               att))
+                           (t
+                            ;; kprobe: (bpf:attach prog function-name)
+                            `(let* ((prog-entry (assoc ,pname
+                                                       (bpf-session-progs *bpf-session*)
+                                                       :test #'string=))
+                                    (att (attach-kprobe (prog-info-fd (cdr prog-entry))
+                                                        ,target ,@args)))
+                               (push att (bpf-session-attachments *bpf-session*))
+                               att)))))
                      (bpf:map-ref (map-name key)
                        (let* ((mname (string-downcase
                                       (substitute #\_ #\-
