@@ -46,6 +46,7 @@
 (defconstant +bpf-map-type-array+ 2)
 (defconstant +bpf-map-type-percpu-hash+ 5)
 (defconstant +bpf-map-type-percpu-array+ 6)
+(defconstant +bpf-map-type-lru-hash+ 9)
 (defconstant +bpf-map-type-ringbuf+ 27)
 
 ;;; ========== BPF program types ==========

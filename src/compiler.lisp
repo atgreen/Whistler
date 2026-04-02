@@ -81,6 +81,7 @@
 (defun resolve-map-type (type-kw)
   (ecase type-kw
     (:hash          +bpf-map-type-hash+)
+    (:lru-hash      +bpf-map-type-lru-hash+)
     (:array         +bpf-map-type-array+)
     (:prog-array    +bpf-map-type-prog-array+)
     (:percpu-hash   +bpf-map-type-percpu-hash+)

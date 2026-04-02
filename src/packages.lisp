@@ -38,7 +38,7 @@
    ;; Sizes
    #:+bpf-w+ #:+bpf-h+ #:+bpf-b+ #:+bpf-dw+
    ;; Map types
-   #:+bpf-map-type-hash+ #:+bpf-map-type-array+
+   #:+bpf-map-type-hash+ #:+bpf-map-type-lru-hash+ #:+bpf-map-type-array+
    #:+bpf-map-type-prog-array+
    #:+bpf-map-type-lpm-trie+
    #:+bpf-map-type-percpu-hash+ #:+bpf-map-type-percpu-array+

@@ -87,6 +87,7 @@
 (defconstant +bpf-map-type-percpu-hash+   5)
 (defconstant +bpf-map-type-percpu-array+  6)
 (defconstant +bpf-map-type-prog-array+    3)
+(defconstant +bpf-map-type-lru-hash+      9)
 (defconstant +bpf-map-type-lpm-trie+      11)
 (defconstant +bpf-map-type-ringbuf+       27)
 
