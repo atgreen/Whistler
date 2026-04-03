@@ -53,25 +53,11 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
-### 6. Build Binary
+### 6. GitHub Release (Automated)
 
-```bash
-make clean && make
-./whistler --version   # verify: whistler X.Y.Z
-```
-
-### 7. Create GitHub Release
-
-Create a release at `https://github.com/atgreen/Whistler/releases/tag/vX.Y.Z`
-and attach the `whistler` binary.
-
-### 8. Test
-
-```bash
-./whistler compile examples/count-xdp.lisp
-./whistler compile examples/ringbuf-events.lisp --gen c
-./whistler --version
-```
+Pushing a tag triggers GitHub Actions, which automatically builds the
+binary, creates the GitHub release, and attaches the artifact. No
+manual steps required.
 
 ## Build Details
 

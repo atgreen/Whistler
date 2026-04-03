@@ -39,6 +39,7 @@
 (defconstant +bpf-prog-load+ 5)
 (defconstant +bpf-obj-pin+ 6)
 (defconstant +bpf-obj-get+ 7)
+(defconstant +bpf-link-create+ 29)
 
 ;;; ========== BPF map types ==========
 
@@ -56,6 +57,10 @@
 (defconstant +bpf-prog-type-sched-cls+ 3)
 (defconstant +bpf-prog-type-tracepoint+ 5)
 (defconstant +bpf-prog-type-xdp+ 6)
+
+;;; ========== BPF attach types ==========
+
+(defconstant +bpf-perf-event+ 41)
 
 ;;; ========== Perf event constants ==========
 
