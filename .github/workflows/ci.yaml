@@ -38,7 +38,8 @@ jobs:
           for f in examples/*.lisp; do
             name=$(basename "$f" .lisp)
             # skip ffi-call-tracker (requires loader system)
-            if [ "$name" = "ffi-call-tracker" ]; then continue; fi
+            # skip fork-tracker (requires tracefs access)
+            if [ "$name" = "ffi-call-tracker" ] || [ "$name" = "fork-tracker" ]; then continue; fi
             sbcl --noinform --non-interactive \
               --eval '(require :asdf)' \
               --eval '(push #p"./" asdf:*central-registry*)' \
