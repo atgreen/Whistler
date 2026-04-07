@@ -46,7 +46,7 @@
 
 (defsystem "whistler/tests"
   :description "Whistler test suite"
-  :depends-on ("whistler" "fiveam")
+  :depends-on ("whistler" "whistler/loader" "fiveam")
   :serial t
   :pathname "tests/"
   :components ((:file "package")
@@ -61,5 +61,6 @@
                (:file "test-protocol")
                (:file "test-optimization")
                (:file "test-maps")
+               (:file "test-percpu")
                (:file "test-programs")
                (:file "test-regalloc")))

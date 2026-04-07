@@ -47,6 +47,14 @@
             (when (plusp n) n))))
       1))
 
+(defun possible-cpu-count ()
+  "Return the number of possible CPUs. Used for percpu map value buffer sizing."
+  (or (let ((s (read-file-string "/sys/devices/system/cpu/possible")))
+        (when s
+          (let ((n (parse-cpu-range s)))
+            (when (plusp n) n))))
+      (online-cpu-count)))
+
 ;;; ========== Perf event helpers ==========
 
 (defun make-perf-attr (type config)

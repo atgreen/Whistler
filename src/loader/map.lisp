@@ -24,33 +24,91 @@
       (setf (map-info-fd info) fd)
       fd)))
 
+;;; ========== Percpu helpers ==========
+
+(defun percpu-map-p (info)
+  "Return true if INFO describes a percpu map type."
+  (member (map-info-type info)
+          (list +bpf-map-type-percpu-hash+ +bpf-map-type-percpu-array+)))
+
+(defun percpu-value-size (info)
+  "Return the total value buffer size needed for a map lookup.
+   For percpu maps, this is value-size * num_possible_cpus (rounded up to 8-byte
+   alignment per CPU slot, as the kernel requires). For regular maps, just value-size."
+  (if (percpu-map-p info)
+      (let ((aligned (logand (+ (map-info-value-size info) 7) (lognot 7))))
+        (* aligned (possible-cpu-count)))
+      (map-info-value-size info)))
+
+(defun split-percpu-values (buf value-size num-cpus)
+  "Split a percpu lookup buffer into a vector of per-CPU values."
+  (let ((aligned (logand (+ value-size 7) (lognot 7)))
+        (result (make-array num-cpus)))
+    (dotimes (i num-cpus result)
+      (let ((v (make-array value-size :element-type '(unsigned-byte 8))))
+        (replace v buf :start2 (* i aligned) :end2 (+ (* i aligned) value-size))
+        (setf (aref result i) v)))))
+
 ;;; ========== Map operations ==========
 
 (defun map-lookup (info key-bytes)
-  "Look up a key in a BPF map. Returns value bytes or nil if not found."
-  (let ((buf (make-attr-buf))
-        (value (make-array (map-info-value-size info)
-                           :element-type '(unsigned-byte 8)
-                           :initial-element 0)))
+  "Look up a key in a BPF map. Returns value bytes or nil if not found.
+   For percpu maps, returns a vector of per-CPU value byte arrays."
+  (let* ((buf (make-attr-buf))
+         (total-size (percpu-value-size info))
+         (value (make-array total-size
+                            :element-type '(unsigned-byte 8)
+                            :initial-element 0)))
     (put-u32 buf 0 (map-info-fd info))
     (sb-sys:with-pinned-objects (key-bytes value)
       (put-ptr buf 8 (sb-sys:vector-sap key-bytes))
       (put-ptr buf 16 (sb-sys:vector-sap value))
       (handler-case
           (progn (%bpf +bpf-map-lookup-elem+ buf 40 "map-lookup")
-                 value)
+                 (if (percpu-map-p info)
+                     (split-percpu-values value (map-info-value-size info)
+                                          (possible-cpu-count))
+                     value))
         (bpf-error (e)
           (if (= (bpf-error-errno e) 2)  ; ENOENT
               nil
               (error e)))))))
 
 (defun map-update (info key-bytes value-bytes &key (flags 0))
-  "Update a key/value pair in a BPF map."
-  (let ((buf (make-attr-buf)))
+  "Update a key/value pair in a BPF map.
+   For percpu maps, VALUE-BYTES must be a vector of per-CPU value byte arrays
+   (one per possible CPU), or a single byte array to set the same value on all CPUs."
+  (let ((buf (make-attr-buf))
+        (actual-value
+          (if (percpu-map-p info)
+              ;; Build the percpu value buffer
+              (let* ((vsize (map-info-value-size info))
+                     (aligned (logand (+ vsize 7) (lognot 7)))
+                     (ncpus (possible-cpu-count))
+                     (total (* aligned ncpus))
+                     (vbuf (make-array total :element-type '(unsigned-byte 8)
+                                             :initial-element 0)))
+                (etypecase value-bytes
+                  ;; Vector of per-CPU arrays
+                  (vector
+                   (if (and (plusp (length value-bytes))
+                            (typep (aref value-bytes 0) '(simple-array (unsigned-byte 8) (*))))
+                       (dotimes (i (min (length value-bytes) ncpus))
+                         (replace vbuf (aref value-bytes i)
+                                  :start1 (* i aligned)
+                                  :end1 (+ (* i aligned) vsize)))
+                       ;; Single flat byte array — replicate to all CPUs
+                       (dotimes (i ncpus)
+                         (replace vbuf value-bytes
+                                  :start1 (* i aligned)
+                                  :end1 (+ (* i aligned)
+                                           (min vsize (length value-bytes))))))))
+                vbuf)
+              value-bytes)))
     (put-u32 buf 0 (map-info-fd info))
-    (sb-sys:with-pinned-objects (key-bytes value-bytes)
+    (sb-sys:with-pinned-objects (key-bytes actual-value)
       (put-ptr buf 8 (sb-sys:vector-sap key-bytes))
-      (put-ptr buf 16 (sb-sys:vector-sap value-bytes))
+      (put-ptr buf 16 (sb-sys:vector-sap actual-value))
       (put-u64 buf 24 flags)
       (%bpf +bpf-map-update-elem+ buf 40 "map-update"))))
 
