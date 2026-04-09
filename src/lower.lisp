@@ -853,17 +853,34 @@
 
 ;;; ========== Map operations ==========
 
+(defun struct-alloc-expr-p (expr)
+  "Return T if EXPR is a struct-alloc form (make-NAME from defstruct)."
+  (and (consp expr)
+       (symbolp (car expr))
+       (let ((name (symbol-name (car expr))))
+         (and (> (length name) 5)
+              (string= (subseq name 0 5) "MAKE-")))))
+
 (defun lower-map-lookup (ctx map-name key-expr)
   (check-map-type-is-not ctx map-name whistler/bpf:+bpf-map-type-ringbuf+
                          "ringbuf" "map-lookup")
   (check-map-type-is-not ctx map-name whistler/bpf:+bpf-map-type-prog-array+
                          "prog-array" "map-lookup")
+  ;; Auto-redirect to map-lookup-ptr when key is a struct pointer
+  (when (struct-alloc-expr-p key-expr)
+    (return-from lower-map-lookup
+      (lower-map-lookup-ptr ctx map-name key-expr)))
   (let ((key-vreg (lower-expr ctx key-expr))
         (dst (ctx-fresh-vreg ctx)))
     (ctx-emit ctx :map-lookup dst (list `(:map ,map-name) key-vreg) 'u64)
     dst))
 
 (defun lower-map-update (ctx map-name key-expr val-expr flags)
+  ;; Auto-redirect to map-update-ptr when key or value is a struct pointer
+  (when (or (struct-alloc-expr-p key-expr) (struct-alloc-expr-p val-expr))
+    (return-from lower-map-update
+      (lower-map-update-ptr ctx map-name
+                            key-expr val-expr flags)))
   (let ((key-vreg (lower-expr ctx key-expr))
         (val-vreg (lower-expr ctx val-expr))
         (flags-vreg (lower-expr ctx flags))
@@ -872,6 +889,10 @@
     dst))
 
 (defun lower-map-delete (ctx map-name key-expr)
+  ;; Auto-redirect to map-delete-ptr when key is a struct pointer
+  (when (struct-alloc-expr-p key-expr)
+    (return-from lower-map-delete
+      (lower-map-delete-ptr ctx map-name key-expr)))
   (let ((key-vreg (lower-expr ctx key-expr))
         (dst (ctx-fresh-vreg ctx)))
     (ctx-emit ctx :map-delete dst (list `(:map ,map-name) key-vreg) 'u64)
