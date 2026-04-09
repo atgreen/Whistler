@@ -139,7 +139,9 @@
                (setf (aref insns (+ offset 5)) (logand (ash fd -8) #xff))
                (setf (aref insns (+ offset 6)) (logand (ash fd -16) #xff))
                (setf (aref insns (+ offset 7)) (logand (ash fd -24) #xff)))))
-         (let ((fd (load-program insns prog-type license)))
+         (let* ((eat (section-to-expected-attach-type sec-name))
+                (fd (load-program insns prog-type license
+                                  :expected-attach-type eat)))
            (cons name (make-prog-info :name name :section-name sec-name
                                       :type prog-type :insns insns :fd fd)))))
      prog-specs)))
@@ -237,8 +239,23 @@
                               (is-tracepoint (and sec-name
                                                   (>= (length sec-name) 11)
                                                   (string= (subseq sec-name 0 11)
-                                                           "tracepoint/"))))
+                                                           "tracepoint/")))
+                              (is-cgroup (and sec-name
+                                              (>= (length sec-name) 6)
+                                              (string= (subseq sec-name 0 6)
+                                                       "cgroup")))
+                              (cgroup-eat (and is-cgroup
+                                               (section-to-expected-attach-type sec-name))))
                          (cond
+                           (is-cgroup
+                            ;; cgroup: (bpf:attach prog cgroup-path)
+                            `(let* ((prog-entry (assoc ,pname
+                                                       (bpf-session-progs *bpf-session*)
+                                                       :test #'string=))
+                                    (att (attach-cgroup (prog-info-fd (cdr prog-entry))
+                                                        ,target ,cgroup-eat ,@args)))
+                               (push att (bpf-session-attachments *bpf-session*))
+                               att))
                            (is-uprobe
                             ;; uprobe: (bpf:attach prog binary-path symbol-name)
                             `(let* ((prog-entry (assoc ,pname

@@ -57,7 +57,9 @@
             (setf insns (patch-map-relocations insns rels symtab map-fds)))
 
           ;; Load program
-          (let ((fd (load-program insns prog-type license)))
+          (let* ((eat (section-to-expected-attach-type sec-name))
+                 (fd (load-program insns prog-type license
+                                   :expected-attach-type eat)))
             (format t "Loaded ~a: ~d insns, fd=~d, section=~a~%"
                     prog-name (/ (length insns) 8) fd sec-name)
             (push (make-prog-info :name prog-name
@@ -123,5 +125,15 @@
   (let ((prog (bpf-object-prog obj prog-name)))
     (unless prog (error "Program ~a not found" prog-name))
     (let ((att (attach-uprobe (prog-info-fd prog) binary-path symbol-name :retprobe retprobe)))
+      (push att (bpf-object-attachments obj))
+      att)))
+
+(defun attach-obj-cgroup (obj prog-name cgroup-path attach-type &key (flags 0))
+  "Attach a cgroup program from a loaded BPF object by program name.
+   CGROUP-PATH is the cgroup2 filesystem path.
+   ATTACH-TYPE is one of the +bpf-cgroup-*+ constants."
+  (let ((prog (bpf-object-prog obj prog-name)))
+    (unless prog (error "Program ~a not found" prog-name))
+    (let ((att (attach-cgroup (prog-info-fd prog) cgroup-path attach-type :flags flags)))
       (push att (bpf-object-attachments obj))
       att)))

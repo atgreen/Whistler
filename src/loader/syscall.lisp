@@ -57,10 +57,30 @@
 (defconstant +bpf-prog-type-sched-cls+ 3)
 (defconstant +bpf-prog-type-tracepoint+ 5)
 (defconstant +bpf-prog-type-xdp+ 6)
+(defconstant +bpf-prog-type-cgroup-skb+ 8)
+(defconstant +bpf-prog-type-cgroup-sock+ 9)
+(defconstant +bpf-prog-type-cgroup-sock-addr+ 18)
+(defconstant +bpf-prog-type-tracing+ 26)
+
+;;; ========== BPF commands (attach/detach) ==========
+
+(defconstant +bpf-prog-attach+ 8)
+(defconstant +bpf-prog-detach+ 9)
 
 ;;; ========== BPF attach types ==========
 
 (defconstant +bpf-perf-event+ 41)
+
+;;; ========== Cgroup attach types ==========
+
+(defconstant +bpf-cgroup-inet-ingress+ 0)
+(defconstant +bpf-cgroup-inet-egress+ 1)
+(defconstant +bpf-cgroup-inet-sock-create+ 2)
+(defconstant +bpf-cgroup-inet4-connect+ 10)
+(defconstant +bpf-cgroup-inet6-connect+ 11)
+(defconstant +bpf-cgroup-udp4-sendmsg+ 14)
+(defconstant +bpf-cgroup-udp6-sendmsg+ 15)
+(defconstant +bpf-cgroup-inet-sock-release+ 34)
 
 ;;; ========== Perf event constants ==========
 

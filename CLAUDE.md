@@ -75,7 +75,7 @@ Memory ops: `(memset ptr off val n)` with widened stores, `(memcpy dst doff src 
 
 ## Userspace Loader (whistler/loader)
 
-Pure CL BPF loader — no libbpf, no CFFI. ASDF system `whistler/loader`. Key APIs: `with-bpf-object` (load .bpf.o), `with-bpf-session` (inline compile+load), `map-lookup`/`map-update`/`map-get-next-key`, `attach-kprobe`/`attach-uprobe`, `open-ring-consumer`/`ring-poll`. `with-bpf-session` compiles BPF at macroexpand time using `bpf:map`, `bpf:prog`, `bpf:attach`, `bpf:map-ref`. The `bpf:` prefix separates kernel-side from userspace code. See `examples/ffi-call-tracker.lisp` for a complete inline example.
+Pure CL BPF loader — no libbpf, no CFFI. ASDF system `whistler/loader`. Key APIs: `with-bpf-object` (load .bpf.o), `with-bpf-session` (inline compile+load), `map-lookup`/`map-update`/`map-get-next-key`, `attach-kprobe`/`attach-uprobe`/`attach-tracepoint`/`attach-xdp`/`attach-tc`/`attach-cgroup`, `open-ring-consumer`/`ring-poll`. Cgroup programs (`cgroup_skb`, `cgroup/sock_*`, `cgroup/connect*`, `cgroup/sendmsg*`) are supported — the loader sets `expected_attach_type` automatically from the ELF section name and uses `BPF_PROG_ATTACH`/`BPF_PROG_DETACH` for cgroup attachment. `with-bpf-session` compiles BPF at macroexpand time using `bpf:map`, `bpf:prog`, `bpf:attach`, `bpf:map-ref`. The `bpf:` prefix separates kernel-side from userspace code. See `examples/ffi-call-tracker.lisp` for a complete inline example, or `examples/cgroup-skb-session.lisp` for cgroup usage.
 
 ## Kernel Integration
 

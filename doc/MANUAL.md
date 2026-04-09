@@ -136,7 +136,8 @@ for `(return ...)` unless returning early.
 Multiple `defprog` forms compile into a single ELF with separate sections.
 
 **Parameters:**
-- `:type` — Program type: `:xdp`, `:socket-filter`, `:tracepoint`, `:kprobe`
+- `:type` — Program type: `:xdp`, `:socket-filter`, `:tracepoint`, `:kprobe`,
+  `:cgroup-skb`, `:cgroup-sock`, `:cgroup-sock-addr`
 - `:section` — ELF section name (defaults to lowercase type name)
 - `:license` — License string (must be `"GPL"` for GPL-only helpers)
 
@@ -565,6 +566,9 @@ Arguments are loaded into R1–R5 (max 5). The return value is in R0.
 | `ringbuf-reserve` | 131 | Reserve ring buffer space |
 | `ringbuf-submit` | 132 | Submit ring buffer reservation |
 | `ringbuf-discard` | 133 | Discard ring buffer reservation |
+| `get-socket-cookie` | 47 | Socket cookie (takes ctx pointer) |
+| `get-current-task-btf` | 159 | Current task_struct (BTF pointer) |
+| `ktime-get-coarse-ns` | 161 | Coarse monotonic clock (faster, less precise) |
 
 ### Bounded loops
 
@@ -907,7 +911,23 @@ for direct syscall access.
 ```lisp
 (whistler/loader:attach-kprobe prog-fd function-name)
 (whistler/loader:attach-uprobe prog-fd binary-path symbol-name)
+(whistler/loader:attach-tracepoint prog-fd tracepoint-name)
 (whistler/loader:attach-xdp prog-fd interface-name)
+(whistler/loader:attach-tc prog-fd interface-name :direction "egress")
+(whistler/loader:attach-cgroup prog-fd cgroup-path attach-type)
+```
+
+Cgroup programs require an attach type constant:
+
+```lisp
++bpf-cgroup-inet-ingress+      ; cgroup_skb/ingress
++bpf-cgroup-inet-egress+       ; cgroup_skb/egress
++bpf-cgroup-inet-sock-create+  ; cgroup/sock_create
++bpf-cgroup-inet-sock-release+ ; cgroup/sock_release
++bpf-cgroup-inet4-connect+     ; cgroup/connect4
++bpf-cgroup-inet6-connect+     ; cgroup/connect6
++bpf-cgroup-udp4-sendmsg+      ; cgroup/sendmsg4
++bpf-cgroup-udp6-sendmsg+      ; cgroup/sendmsg6
 ```
 
 ### Map operations
@@ -946,6 +966,19 @@ Compile BPF code at macroexpand time and load at runtime — no files:
 The `bpf:` prefix separates kernel-side forms from userspace code. The
 compiler runs during macroexpansion; the expanded code contains the raw
 bytecode as a literal array. `unwind-protect` closes all resources on exit.
+
+Cgroup programs work the same way — `bpf:attach` detects the section name
+and calls `attach-cgroup` automatically:
+
+```lisp
+(whistler/loader:with-bpf-session ()
+  (bpf:map pkt-count :type :array :key-size 4 :value-size 8 :max-entries 1)
+  (bpf:prog count-egress (:type :cgroup-skb :section "cgroup_skb/egress" :license "GPL")
+    (incf (getmap pkt-count 0))
+    1)  ; SK_PASS
+  (bpf:attach count-egress "/sys/fs/cgroup")
+  (loop repeat 5 do (sleep 1) (format t "~d~%" (bpf:map-ref pkt-count 0))))
+```
 
 ## Cookbook
 

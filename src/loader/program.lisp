@@ -58,12 +58,50 @@
          (and (> (length section-name) 3)
               (string= (subseq section-name 0 3) "tc/")))
      +bpf-prog-type-sched-cls+)
+    ;; Cgroup program types
+    ((and (>= (length section-name) 10)
+          (string= (subseq section-name 0 10) "cgroup_skb"))
+     +bpf-prog-type-cgroup-skb+)
+    ((and (>= (length section-name) 7)
+          (string= (subseq section-name 0 7) "cgroup/")
+          (let ((rest (subseq section-name 7)))
+            (or (string= rest "sock_create")
+                (string= rest "sock_release")
+                (string= rest "post_bind4")
+                (string= rest "post_bind6"))))
+     +bpf-prog-type-cgroup-sock+)
+    ((and (>= (length section-name) 7)
+          (string= (subseq section-name 0 7) "cgroup/")
+          (let ((rest (subseq section-name 7)))
+            (or (string= rest "connect4")
+                (string= rest "connect6")
+                (string= rest "sendmsg4")
+                (string= rest "sendmsg6")
+                (string= rest "bind4")
+                (string= rest "bind6"))))
+     +bpf-prog-type-cgroup-sock-addr+)
     (t +bpf-prog-type-socket-filter+)))
+
+(defun section-to-expected-attach-type (section-name)
+  "Determine BPF expected attach type from ELF section name.
+   Returns nil for program types that don't require an expected attach type."
+  (cond
+    ((string= section-name "cgroup_skb/ingress") +bpf-cgroup-inet-ingress+)
+    ((string= section-name "cgroup_skb/egress")  +bpf-cgroup-inet-egress+)
+    ((string= section-name "cgroup/sock_create")  +bpf-cgroup-inet-sock-create+)
+    ((string= section-name "cgroup/sock_release") +bpf-cgroup-inet-sock-release+)
+    ((string= section-name "cgroup/connect4")     +bpf-cgroup-inet4-connect+)
+    ((string= section-name "cgroup/connect6")     +bpf-cgroup-inet6-connect+)
+    ((string= section-name "cgroup/sendmsg4")     +bpf-cgroup-udp4-sendmsg+)
+    ((string= section-name "cgroup/sendmsg6")     +bpf-cgroup-udp6-sendmsg+)
+    (t nil)))
 
 ;;; ========== Program loading ==========
 
-(defun load-program (insns prog-type license &key (log-level 0) (log-buf-size (ash 1 20)))
+(defun load-program (insns prog-type license &key (log-level 0) (log-buf-size (ash 1 20))
+                                                   expected-attach-type)
   "Load a BPF program into the kernel. Returns the prog FD.
+   EXPECTED-ATTACH-TYPE is required for cgroup program types.
    On failure, retries with logging and signals bpf-verifier-error."
   (let ((buf (make-attr-buf))
         (insn-count (/ (length insns) 8)))
@@ -75,6 +113,8 @@
           (put-ptr buf 8 (sb-sys:vector-sap insns))
           (put-ptr buf 16 (sb-sys:vector-sap license-bytes))
           (put-u32 buf 24 log-level)
+          (when expected-attach-type
+            (put-u32 buf 68 expected-attach-type))
           ;; Try without log first
           (handler-case
               (%bpf +bpf-prog-load+ buf 128 "prog-load")
@@ -92,6 +132,8 @@
                   (put-u32 buf 24 6)  ; log_level = stats + detailed
                   (put-u32 buf 28 log-buf-size)
                   (put-ptr buf 32 (sb-sys:vector-sap log-buf))
+                  (when expected-attach-type
+                    (put-u32 buf 68 expected-attach-type))
                   (handler-case
                       (%bpf +bpf-prog-load+ buf 128 "prog-load")
                     (bpf-error (e)

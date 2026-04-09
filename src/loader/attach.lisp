@@ -234,6 +234,42 @@
                                 (handler-case (delete-file pin-path)
                                   (error () nil))))))
 
+;;; ========== Cgroup attachment ==========
+
+(defun attach-cgroup (prog-fd cgroup-path attach-type &key (flags 0))
+  "Attach a BPF program to a cgroup.
+   CGROUP-PATH is the cgroup2 filesystem path (e.g. \"/sys/fs/cgroup\").
+   ATTACH-TYPE is one of the +bpf-cgroup-*+ constants.
+   FLAGS can include BPF_F_ALLOW_MULTI (2) or BPF_F_REPLACE (4).
+   Returns an attachment that can be passed to detach."
+  (let ((cgroup-fd (sb-posix:open cgroup-path sb-posix:o-rdonly 0)))
+    (when (< cgroup-fd 0)
+      (error 'bpf-error :context (format nil "open cgroup ~a" cgroup-path)
+                         :errno (sb-alien:get-errno)))
+    (handler-bind ((error (lambda (c)
+                            (declare (ignore c))
+                            (sb-posix:close cgroup-fd))))
+      ;; BPF_PROG_ATTACH: target_fd=0, attach_bpf_fd=4, attach_type=8, attach_flags=12
+      (let ((buf (make-attr-buf)))
+        (put-u32 buf 0 cgroup-fd)
+        (put-u32 buf 4 prog-fd)
+        (put-u32 buf 8 attach-type)
+        (put-u32 buf 12 flags)
+        (%bpf +bpf-prog-attach+ buf 32 "cgroup-attach")))
+    (make-attachment
+     :type :cgroup :perf-fds nil :prog-fd prog-fd
+     :cleanup (lambda ()
+                ;; BPF_PROG_DETACH
+                (let ((buf (make-attr-buf)))
+                  (put-u32 buf 0 cgroup-fd)
+                  (put-u32 buf 4 prog-fd)
+                  (put-u32 buf 8 attach-type)
+                  (handler-case
+                      (%bpf +bpf-prog-detach+ buf 32 "cgroup-detach")
+                    (error () nil)))
+                (handler-case (sb-posix:close cgroup-fd)
+                  (error () nil))))))
+
 ;;; ========== XDP attachment ==========
 
 (defun attach-xdp (prog-fd interface-name &key (mode "xdp"))

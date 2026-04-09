@@ -1,0 +1,8 @@
+[book]
+title = "The Whistler Book"
+authors = ["Anthony Green"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/atgreen/whistler"

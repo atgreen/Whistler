@@ -359,8 +359,8 @@ int synflood(struct xdp_md *ctx) {
 ## Userspace loader
 
 `whistler/loader` is a pure Common Lisp BPF loader — no libbpf, no CFFI.
-It loads `.bpf.o` files, creates maps, attaches probes, and consumes ring
-buffers from SBCL.
+It loads `.bpf.o` files, creates maps, attaches programs (kprobe, uprobe,
+tracepoint, XDP, TC, cgroup), and consumes ring buffers from SBCL.
 
 ### Inline BPF sessions
 
