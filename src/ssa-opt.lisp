@@ -394,26 +394,44 @@
    True when all ctx-loads are either in the entry block (before any
    side-effecting instruction) or are rematerializable from the entry
    block's ctx-loads. Checks conservatively: all ctx-loads must be
-   in the entry block before any side effect, OR there must be no
-   ctx-loads after any call-like operation in any block."
+   in the entry block before any side effect, AND the ctx vreg must
+   not be used as a direct argument to any helper call (since calls
+   clobber R1-R5)."
   (when *force-save-ctx*
     (return-from ctx-loads-early-p nil))
-  ;; Strategy: check if all ctx-loads are in the entry block before barriers
-  (let ((entry-block (first (ir-program-blocks prog)))
-        (seen-barrier nil)
-        (entry-ok t))
-    ;; Check entry block
-    (dolist (insn (basic-block-insns entry-block))
-      (when (and seen-barrier (eq (ir-insn-op insn) :ctx-load))
-        (setf entry-ok nil))
-      (when (ir-insn-side-effect-p insn)
-        (setf seen-barrier t)))
-    ;; Check non-entry blocks: any ctx-load disqualifies
-    (dolist (block (rest (ir-program-blocks prog)))
+  ;; Find the ctx vreg
+  (let ((ctx-vreg nil))
+    (dolist (block (ir-program-blocks prog))
       (dolist (insn (basic-block-insns block))
-        (when (eq (ir-insn-op insn) :ctx-load)
-          (return-from ctx-loads-early-p nil))))
-    entry-ok))
+        (when (eq (ir-insn-op insn) :arg0)
+          (setf ctx-vreg (ir-insn-dst insn)))))
+    ;; If ctx-vreg is passed as a direct argument to any helper call,
+    ;; it MUST be saved to R6 because helper calls clobber R1-R5.
+    (when ctx-vreg
+      (dolist (block (ir-program-blocks prog))
+        (dolist (insn (basic-block-insns block))
+          (when (eq (ir-insn-op insn) :call)
+            ;; Check if ctx-vreg is among the call arguments
+            ;; Args format: ((:helper N) arg1 arg2 ...) — skip the helper id
+            (dolist (arg (rest (ir-insn-args insn)))
+              (when (and (integerp arg) (eql arg ctx-vreg))
+                (return-from ctx-loads-early-p nil)))))))
+    ;; Strategy: check if all ctx-loads are in the entry block before barriers
+    (let ((entry-block (first (ir-program-blocks prog)))
+          (seen-barrier nil)
+          (entry-ok t))
+      ;; Check entry block
+      (dolist (insn (basic-block-insns entry-block))
+        (when (and seen-barrier (eq (ir-insn-op insn) :ctx-load))
+          (setf entry-ok nil))
+        (when (ir-insn-side-effect-p insn)
+          (setf seen-barrier t)))
+      ;; Check non-entry blocks: any ctx-load disqualifies
+      (dolist (block (rest (ir-program-blocks prog)))
+        (dolist (insn (basic-block-insns block))
+          (when (eq (ir-insn-op insn) :ctx-load)
+            (return-from ctx-loads-early-p nil))))
+      entry-ok)))
 
 ;;; ========== PHI-branch threading ==========
 ;;;
