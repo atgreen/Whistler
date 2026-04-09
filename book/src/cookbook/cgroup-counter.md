@@ -1,8 +1,10 @@
 # Cgroup Packet Counter
 
-Count egress packets for all processes in a cgroup using `cgroup_skb/egress`.
+Count egress packets for all processes in a cgroup using
+`cgroup_skb/egress`. Two approaches: standalone (compile to ELF) and
+inline (`with-bpf-session`).
 
-## Inline session
+## Approach 1: Inline session
 
 The simplest approach -- compile and load in one form:
 
@@ -17,27 +19,23 @@ The simplest approach -- compile and load in one form:
   (bpf:prog count-egress
       (:type :cgroup-skb :section "cgroup_skb/egress" :license "GPL")
     (incf (getmap pkt-count 0))
-    1)  ; 1 = allow (SK_PASS)
+    1)  ;; 1 = allow (SK_PASS for cgroup_skb)
 
   (bpf:attach count-egress "/sys/fs/cgroup")
-  (format t "Counting egress packets...~%")
+  (format t "Counting egress packets on /sys/fs/cgroup...~%")
   (loop repeat 10
         do (sleep 1)
            (format t "  packets: ~d~%" (or (bpf:map-ref pkt-count 0) 0))))
 ```
 
-Run with root:
-
-```sh
-sudo sbcl --load cgroup-counter.lisp
-```
-
 The `bpf:attach` macro detects the `cgroup_skb/egress` section name and
 automatically calls `attach-cgroup` with `+bpf-cgroup-inet-egress+`.
 
-## Standalone ELF
+## Approach 2: Standalone ELF
 
-Compile to an ELF file first, then load and attach separately:
+Compile to an ELF file first, then load and attach separately.
+
+### BPF source
 
 ```lisp
 (in-package #:whistler)
@@ -50,32 +48,62 @@ Compile to an ELF file first, then load and attach separately:
   (incf (getmap pkt-count 0))
   1)
 
-(compile-to-elf "cgroup-count.bpf.o")
+(compile-to-elf "/tmp/cgroup-count.bpf.o")
 ```
 
-Then load and attach:
+### Userspace loader
 
 ```lisp
-(whistler/loader:with-bpf-object (obj "cgroup-count.bpf.o")
-  (whistler/loader:attach-obj-cgroup
-   obj "count_egress" "/sys/fs/cgroup"
-   whistler/loader:+bpf-cgroup-inet-egress+)
+(asdf:load-system "whistler/loader")
+
+(whistler/loader:with-bpf-object (obj "/tmp/cgroup-count.bpf.o")
   (let ((map (whistler/loader:bpf-object-map obj "pkt_count")))
+    (whistler/loader:attach-obj-cgroup
+     obj "count_egress" "/sys/fs/cgroup"
+     whistler/loader:+bpf-cgroup-inet-egress+)
+
+    (format t "Counting egress packets on /sys/fs/cgroup...~%")
     (loop repeat 10
           do (sleep 1)
              (let ((val (whistler/loader:map-lookup
-                         map (whistler/loader:encode-int-key 0 4))))
+                         map
+                         (whistler/loader:encode-int-key 0 4))))
                (format t "  packets: ~d~%"
                        (if val (whistler/loader:decode-int-value val) 0))))))
 ```
 
 ## Key points
 
-- `cgroup_skb` programs return `1` to allow or `0` to drop. This counter
-  always returns `1`, so it observes without blocking.
-- The cgroup path `/sys/fs/cgroup` is the root cgroup on cgroup2 systems.
-  Use a more specific path to monitor only certain processes.
-- The loader sets `expected_attach_type` automatically from the ELF section
-  name -- no manual configuration needed.
-- Cleanup is automatic: `with-bpf-session` and `with-bpf-object` both
-  detach the program and close file descriptors on exit.
+- **Return value**: `cgroup_skb` programs return `1` to allow the packet
+  (SK_PASS) or `0` to drop it. This counter always returns `1`, so it
+  observes without blocking traffic.
+
+- **Cgroup path**: `/sys/fs/cgroup` is the root cgroup on cgroup2
+  systems, affecting all processes. Use a more specific path (e.g.,
+  `/sys/fs/cgroup/user.slice/...`) to monitor only certain processes.
+
+- **Auto-detection**: The loader infers `expected_attach_type`
+  automatically from the ELF section name (`cgroup_skb/egress` maps to
+  `+bpf-cgroup-inet-egress+`). In the inline session, `bpf:attach` does
+  this too -- no explicit constant needed.
+
+- **Cleanup**: Both `with-bpf-session` and `with-bpf-object` detach the
+  program and close file descriptors automatically on exit.
+
+## Running
+
+Requires root (or `CAP_BPF` + `CAP_NET_ADMIN`):
+
+```bash
+sudo sbcl --load cgroup-counter.lisp
+```
+
+Expected output:
+
+```
+Counting egress packets on /sys/fs/cgroup...
+  packets: 42
+  packets: 97
+  packets: 158
+  ...
+```
