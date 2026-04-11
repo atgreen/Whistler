@@ -129,6 +129,14 @@
                '("U8" "U16" "U32" "U64" "I8" "I16" "I32" "I64")
                :test #'string=)))
 
+(defun bpf-type-size (type-kw)
+  "Return the size in bytes of a BPF type keyword (u8=1, u16=2, u32=4, u64=8)."
+  (ecase (intern (string type-kw) :keyword)
+    ((:u8 :i8) 1)
+    ((:u16 :i16) 2)
+    ((:u32 :i32) 4)
+    ((:u64 :i64) 8)))
+
 (defun builtin-helper-p (sym)
   "Return the helper ID if SYM names a known BPF helper, or NIL."
   (and (symbolp sym)

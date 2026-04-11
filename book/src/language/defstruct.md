@@ -166,14 +166,12 @@ needed since the largest field alignment is 4).
 (defmap events :type :ringbuf
   :max-entries (* 256 1024))
 
-(defprog trace-exec (&key (type :tracepoint)
-                          (section "tracepoint/sched/sched_process_exec"))
-  (let ((e (ringbuf-reserve events (sizeof my-event))))
-    (when e
-      (setf (my-event-pid e) (get-current-pid-tgid))
-      (get-current-comm (my-event-comm-ptr e) 16)
-      (probe-read (my-event-data-ptr e) 64 some-source)
-      (ringbuf-submit e 0)))
+(defprog trace-exec (:type :tracepoint
+                     :section "tracepoint/sched/sched_process_exec")
+  (with-ringbuf (e events (sizeof my-event))
+    (setf (my-event-pid e) (get-current-pid-tgid))
+    (get-current-comm (my-event-comm-ptr e) 16)
+    (probe-read (my-event-data-ptr e) 64 some-source))
   0)
 ```
 

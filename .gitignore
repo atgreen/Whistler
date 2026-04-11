@@ -19,5 +19,8 @@ examples/*.h
 ocicl/
 !ocicl.csv
 
+# mdBook generated output
+book/book/
+
 # Local planning docs
 GPLAN.md

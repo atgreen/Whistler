@@ -2061,8 +2061,12 @@
   (eliminate-common-subexpressions prog)
   (forward-stores-to-loads prog)
 
-  ;; Phase 3b: SCCP — propagate constants through PHIs and fold branches
-  (sccp prog)
+  ;; Phase 3b: SCCP is currently disabled.
+  ;; Its PHI handling is not loop-aware enough and folds loop-header
+  ;; branches incorrectly in nested loops, producing malformed CFGs.
+  ;; Re-enable after fixing SCCP to reason over executable edges rather
+  ;; than just executable predecessor blocks.
+  ;; (sccp prog)
 
   ;; Phase 4: Clean up after transformations
   (dead-code-elimination prog)
@@ -2070,7 +2074,12 @@
   (dead-store-elimination prog)
 
   ;; Phase 5: Cross-block fusions and rewrites
-  (lookup-delete-fusion prog)
+  ;; NOTE: lookup-delete-fusion is disabled.  It tried to fuse map-lookup +
+  ;; map-delete into bpf_map_lookup_and_delete_elem (helper 46), but that
+  ;; helper does not exist — helper 46 is bpf_get_socket_cookie.  The
+  ;; lookup-and-delete operation is a userspace bpf() syscall command, not
+  ;; an in-kernel BPF helper callable from programs.
+  ;; (lookup-delete-fusion prog)
   (hoist-loads-before-calls prog)
   (phi-branch-threading prog)
   (bitmask-check-fusion prog)

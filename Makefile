@@ -1,7 +1,7 @@
 SBCL ?= sbcl
 SBCL_FLAGS = --noinform --non-interactive
 
-.PHONY: all test check clean examples repl
+.PHONY: all test test-torture check clean examples repl
 
 all: whistler
 
@@ -23,6 +23,14 @@ test:
 		--eval '(push #p"./" asdf:*central-registry*)' \
 		--eval '(asdf:load-system "whistler/tests")' \
 		--eval '(unless (whistler/tests:run-tests) (uiop:quit 1))'
+
+# Run torture tests with kernel verification (requires sudo for CAP_BPF)
+test-torture:
+	sudo env PATH="$(PATH)" $(SBCL) $(SBCL_FLAGS) \
+		--eval '(require :asdf)' \
+		--eval '(push #p"./" asdf:*central-registry*)' \
+		--eval '(asdf:load-system "whistler/tests")' \
+		--eval '(unless (fiveam:run! (quote whistler/tests::torture-suite)) (uiop:quit 1))'
 
 check: test
 

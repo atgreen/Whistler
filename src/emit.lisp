@@ -449,7 +449,6 @@
 ;;; ========== Per-instruction emission ==========
 
 (defun emit-ir-insn (ctx insn block-positions)
-  (declare (ignore block-positions))
   (let* ((op (ir-insn-op insn))
          (dst (ir-insn-dst insn))
          (args (ir-insn-args insn)))
@@ -496,28 +495,12 @@
 
      ((eq op :br)
       (let ((target (label-arg-name (first args))))
-        ;; Emit phi resolution moves before the jump
-        (let ((moves (gethash (cons (emit-ctx-current-block-label ctx) target)
-                              (emit-ctx-phi-moves ctx))))
-          (dolist (move moves)
-            (let* ((phi-dst (car move))
-                   (src-vreg (cdr move))
-                   (src-reg (vreg-to-physical ctx src-vreg whistler/bpf:+bpf-reg-0+))
-                   (dst-loc (gethash phi-dst (emit-ctx-vreg-map ctx))))
-              (when dst-loc
-                (cond
-                  ((and (eq (car dst-loc) :reg)
-                        (/= (cadr dst-loc) src-reg))
-                   (ectx-emit ctx (whistler/bpf:emit-mov64-reg (cadr dst-loc) src-reg)))
-                  ((eq (car dst-loc) :stack)
-                   (ectx-emit ctx (whistler/bpf:emit-stx-mem
-                                    whistler/bpf:+bpf-dw+
-                                    whistler/bpf:+bpf-reg-10+ src-reg (cadr dst-loc)))))))))
+        (emit-phi-moves ctx target)
         (push (list (ectx-current-idx ctx) target) (emit-ctx-fixups ctx))
         (ectx-emit ctx (whistler/bpf:emit-jmp-a 0))))
 
      ((eq op :br-cond)
-      (emit-br-cond-insn ctx args))
+      (emit-br-cond-insn ctx args block-positions))
 
      ((eq op :ret)
       (let ((val (first args)))
@@ -1295,7 +1278,67 @@
 
 ;;; ========== Branch condition emission ==========
 
-(defun emit-br-cond-insn (ctx args)
+(defun phi-moves-for-edge (ctx target)
+  "Return phi moves for the edge from the current block to TARGET.
+   Computes them from the target block's phi nodes so emission tracks the
+   post-optimization IR directly."
+  (let ((moves '())
+        (src-label (emit-ctx-current-block-label ctx))
+        (block (ir-find-block (emit-ctx-ir-prog ctx) target)))
+    (when block
+      (dolist (insn (basic-block-insns block))
+        (unless (eq (ir-insn-op insn) :phi)
+          (return))
+        (dolist (arg (ir-insn-args insn))
+          (when (and (consp arg)
+                     (integerp (first arg))
+                     (consp (second arg))
+                     (eq (car (second arg)) :label)
+                     (eql (cadr (second arg)) src-label))
+            (push (cons (ir-insn-dst insn) (first arg)) moves)))))
+    (nreverse moves)))
+
+(defun emit-phi-moves (ctx target)
+  "Emit phi resolution moves for the edge from the current block to TARGET.
+   Phi copies are parallel: capture all source locations first, then emit
+   stack stores and resolve register copies without clobbering sources."
+  (let ((moves (phi-moves-for-edge ctx target))
+        (reg-moves '()))
+    (dolist (move moves)
+      (let* ((phi-dst (car move))
+             (src-vreg (cdr move))
+             (src-loc (allocate-vreg ctx src-vreg))
+             (dst-loc (allocate-vreg ctx phi-dst)))
+        (ecase (car dst-loc)
+          (:reg
+           (push (cons (cadr dst-loc)
+                       (ecase (car src-loc)
+                         (:reg (list :reg (cadr src-loc)))
+                         (:stack (list :stack (cadr src-loc)))))
+                 reg-moves))
+          (:stack
+           (ecase (car src-loc)
+             (:reg
+              (ectx-emit ctx (whistler/bpf:emit-stx-mem
+                              whistler/bpf:+bpf-dw+
+                              whistler/bpf:+bpf-reg-10+
+                              (cadr src-loc)
+                              (cadr dst-loc))))
+             (:stack
+              (ectx-emit ctx (whistler/bpf:emit-ldx-mem
+                              whistler/bpf:+bpf-dw+
+                              whistler/bpf:+bpf-reg-0+
+                              whistler/bpf:+bpf-reg-10+
+                              (cadr src-loc)))
+              (ectx-emit ctx (whistler/bpf:emit-stx-mem
+                              whistler/bpf:+bpf-dw+
+                              whistler/bpf:+bpf-reg-10+
+                              whistler/bpf:+bpf-reg-0+
+                              (cadr dst-loc)))))))))
+    (when reg-moves
+      (resolve-parallel-moves ctx (nreverse reg-moves)))))
+
+(defun emit-br-cond-insn (ctx args block-positions)
   (let* ((cmp-op (cmp-arg-op (first args)))
          (bpf-jmp (ir-cmp-to-bpf-jmp cmp-op))
          (lhs (second args))
@@ -1304,18 +1347,50 @@
          (else-label (label-arg-name (fifth args)))
          (lhs-reg (if (integerp lhs)
                       (vreg-to-physical ctx lhs whistler/bpf:+bpf-reg-1+)
-                      whistler/bpf:+bpf-reg-1+)))
-    ;; Emit: if cond goto then; goto else
-    (let ((imm (imm-arg-value rhs)))
-      (if (and imm (typep imm '(signed-byte 32)))
-          (progn
-            (push (list (ectx-current-idx ctx) then-label) (emit-ctx-fixups ctx))
-            (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 0)))
-          (let ((rhs-reg (if (integerp rhs)
-                             (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-2+)
-                             whistler/bpf:+bpf-reg-2+)))
-            (push (list (ectx-current-idx ctx) then-label) (emit-ctx-fixups ctx))
-            (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 0)))))
-    ;; Unconditional jump to else
-    (push (list (ectx-current-idx ctx) else-label) (emit-ctx-fixups ctx))
-    (ectx-emit ctx (whistler/bpf:emit-jmp-a 0))))
+                      whistler/bpf:+bpf-reg-1+))
+         (then-moves (phi-moves-for-edge ctx then-label))
+         (else-moves (phi-moves-for-edge ctx else-label)))
+    (if (or then-moves else-moves)
+        ;; Phi moves needed: emit trampoline for then-edge.
+        ;;   if cond goto then_trampoline
+        ;;   [else-edge phi moves]
+        ;;   goto else_label
+        ;;   then_trampoline:
+        ;;   [then-edge phi moves]
+        ;;   goto then_label
+        (let ((trampoline-label (gensym "PHI_THEN_")))
+          ;; Conditional jump to trampoline (will be fixup'd)
+          (let ((imm (imm-arg-value rhs)))
+            (if (and imm (typep imm '(signed-byte 32)))
+                (progn
+                  (push (list (ectx-current-idx ctx) trampoline-label) (emit-ctx-fixups ctx))
+                  (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 0)))
+                (let ((rhs-reg (if (integerp rhs)
+                                   (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-2+)
+                                   whistler/bpf:+bpf-reg-2+)))
+                  (push (list (ectx-current-idx ctx) trampoline-label) (emit-ctx-fixups ctx))
+                  (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 0)))))
+          ;; Else path: phi moves + jump
+          (emit-phi-moves ctx else-label)
+          (push (list (ectx-current-idx ctx) else-label) (emit-ctx-fixups ctx))
+          (ectx-emit ctx (whistler/bpf:emit-jmp-a 0))
+          ;; Trampoline: then phi moves + jump
+          (setf (gethash trampoline-label block-positions)
+                (ectx-current-idx ctx))
+          (emit-phi-moves ctx then-label)
+          (push (list (ectx-current-idx ctx) then-label) (emit-ctx-fixups ctx))
+          (ectx-emit ctx (whistler/bpf:emit-jmp-a 0)))
+        ;; No phi moves: emit plain if/goto/goto as before
+        (progn
+          (let ((imm (imm-arg-value rhs)))
+            (if (and imm (typep imm '(signed-byte 32)))
+                (progn
+                  (push (list (ectx-current-idx ctx) then-label) (emit-ctx-fixups ctx))
+                  (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 0)))
+                (let ((rhs-reg (if (integerp rhs)
+                                   (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-2+)
+                                   whistler/bpf:+bpf-reg-2+)))
+                  (push (list (ectx-current-idx ctx) then-label) (emit-ctx-fixups ctx))
+                  (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 0)))))
+          (push (list (ectx-current-idx ctx) else-label) (emit-ctx-fixups ctx))
+          (ectx-emit ctx (whistler/bpf:emit-jmp-a 0))))))

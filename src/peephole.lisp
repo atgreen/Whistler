@@ -43,7 +43,7 @@
     (setf result (peephole-forward-cross-reg-imm result))
     (setf result (peephole-coalesce-copy result))
     ;; Final cleanup pass — iterate branch inversion + dead-jump removal
-    ;; since dead-jump removal can expose new inversion candidates
+    ;; since dead-jump removal can expose new cleanup candidates
     (setf result (peephole-eliminate-redundant-movs result))
     (setf result (peephole-fold-stack-addr result))
     (loop
@@ -129,13 +129,27 @@
   "Transform jCC +1; ja +N into j!CC +N."
   (let ((vec (coerce insns 'vector))
         (len (length insns))
+        (targets (make-hash-table))
         (to-delete (make-hash-table)))
+    ;; Only invert straight-line forward branches. If either instruction is a
+    ;; jump target, or the JA is a backedge/self-loop, this local rewrite is
+    ;; too aggressive and can change loop structure.
+    (loop for i from 0 below len
+          for insn = (aref vec i)
+          when (or (bpf-unconditional-jmp-p insn)
+                   (bpf-conditional-jmp-p insn))
+          do (let ((target (+ i 1 (whistler/bpf:bpf-insn-off insn))))
+               (when (and (>= target 0) (<= target len))
+                 (setf (gethash target targets) t))))
     (loop for i from 0 below (1- len)
           for insn = (aref vec i)
           for next = (aref vec (1+ i))
           when (and (bpf-conditional-jmp-p insn)
                     (= (whistler/bpf:bpf-insn-off insn) 1)
-                    (bpf-unconditional-jmp-p next))
+                    (bpf-unconditional-jmp-p next)
+                    (not (gethash i targets))
+                    (not (gethash (1+ i) targets))
+                    (> (whistler/bpf:bpf-insn-off next) 0))
           do (let ((inv-code (invert-jmp-code (whistler/bpf:bpf-insn-code insn))))
                (when inv-code
                  ;; Invert the condition and take the JA's target
@@ -748,17 +762,36 @@
   "Eliminate mov rA, rB; alu rC, rA when rA is dead after the ALU."
   (let ((vec (coerce insns 'vector))
         (len (length insns))
+        (targets (make-hash-table))
         (to-delete (make-hash-table))
         (changed nil))
+    ;; Mark jump targets so we don't propagate copies across merge points.
+    (loop for i from 0 below len
+          for insn = (aref vec i)
+          when (or (bpf-unconditional-jmp-p insn)
+                   (bpf-conditional-jmp-p insn))
+          do (let ((target (+ i 1 (whistler/bpf:bpf-insn-off insn))))
+               (when (and (>= target 0) (<= target len))
+                 (setf (gethash target targets) t))))
     (loop for i from 0 below (1- len)
           for mov = (aref vec i)
           for alu = (aref vec (1+ i))
           ;; Match: mov rA, rB (reg); alu rC, rA (reg-src)
           when (and (bpf-mov64-reg-p mov)
+                    ;; The consumer must be in the same straight-line path.
+                    (not (gethash (1+ i) targets))
                     (let ((c (whistler/bpf:bpf-insn-code alu)))
                       (and (or (= (logand c #x07) whistler/bpf:+bpf-alu64+)
                                (= (logand c #x07) whistler/bpf:+bpf-alu+))
-                           (= (logand c #x08) whistler/bpf:+bpf-x+)))
+                           (= (logand c #x08) whistler/bpf:+bpf-x+)
+                           ;; MOV is a copy, not an ALU use.  Treating it as
+                           ;; an ALU here deletes preserve-copies like
+                           ;;   mov r6, r0; mov r7, r6
+                           ;; even when r6 is still live later.
+                           (not (or (bpf-mov64-reg-p alu)
+                                    (= c (logior whistler/bpf:+bpf-alu+
+                                                 whistler/bpf:+bpf-mov+
+                                                 whistler/bpf:+bpf-x+))))))
                     ;; ALU src == mov dst (rA)
                     (= (whistler/bpf:bpf-insn-src alu)
                        (whistler/bpf:bpf-insn-dst mov))
@@ -772,6 +805,11 @@
                (loop for j from (+ i 2) below (min (+ i 18) len)
                      for insn = (aref vec j)
                      do (cond
+                          ;; Another predecessor can reach this point without
+                          ;; executing the copy, so the rewrite isn't local.
+                          ((gethash j targets)
+                           (setf dead nil)
+                           (return))
                           ;; rA is read → not dead
                           ((bpf-reg-read-p insn ra)
                            (setf dead nil)
@@ -1188,7 +1226,16 @@
   "Remove mov rX, IMM/reg when rX is overwritten before being read."
   (let* ((vec (coerce insns 'vector))
          (len (length vec))
+         (targets (make-hash-table))
          (to-delete (make-hash-table)))
+    ;; Mark jump targets so we don't reason across control-flow joins.
+    (loop for i from 0 below len
+          for insn = (aref vec i)
+          when (or (bpf-unconditional-jmp-p insn)
+                   (bpf-conditional-jmp-p insn))
+          do (let ((target (+ i 1 (whistler/bpf:bpf-insn-off insn))))
+               (when (and (>= target 0) (<= target len))
+                 (setf (gethash target targets) t))))
     (loop for i from 0 below len
           for insn = (aref vec i)
           when (or (bpf-mov64-imm-p insn) (bpf-mov64-reg-p insn))
@@ -1198,6 +1245,10 @@
                  (loop for j from (1+ i) below (min (+ i 20) len)
                        for next = (aref vec j)
                        do (cond
+                            ;; Reaching a jump target means another predecessor
+                            ;; can arrive here without executing the write.
+                            ((gethash j targets)
+                             (return-from scan))
                             ;; dst is read — mov is live
                             ((bpf-reg-read-p next dst)
                              (return-from scan))
@@ -1259,8 +1310,13 @@
                                (when (gethash j targets)
                                  (setf can-delete nil)
                                  (return))
-                               ;; If donor is overwritten, stop
+                               ;; If donor is overwritten before dst is, the
+                               ;; forwarded value is no longer available for
+                               ;; later uses of dst. We may still have safely
+                               ;; rewritten some early uses in this window, but
+                               ;; we cannot delete the original mov.
                                (when (bpf-reg-written-p next donor)
+                                 (setf can-delete nil)
                                  (return))
                                ;; If dst is written by this instruction, stop
                                (when (bpf-reg-written-p next dst)
@@ -1335,7 +1391,7 @@
 
 (defun coalesce-regs-dead-at (vec len start ra rb)
   "Check if registers RA and RB are both dead from position START onward.
-   Uses a limited forward scan, following unconditional jumps."
+   Uses a limited forward scan within straight-line code only."
   (let ((ra-dead nil)
         (rb-dead nil)
         (pos start)
@@ -1360,10 +1416,10 @@
                    (return-from scan
                      (and (or ra-dead (/= ra 0))
                           (or rb-dead (/= rb 0)))))
-                 ;; Unconditional jump: follow to target
+                 ;; Crossing a jump edge requires CFG-aware predecessor analysis.
+                 ;; This local peephole is only sound within straight-line code.
                  (when (bpf-unconditional-jmp-p insn)
-                   (setf pos (+ pos 1 (whistler/bpf:bpf-insn-off insn)))
-                   (setf followed t))
+                   (return-from scan nil))
                  ;; Conditional jump or call: conservative bail
                  (when (or (bpf-conditional-jmp-p insn)
                            (= (whistler/bpf:bpf-insn-code insn) #x85))
@@ -1435,13 +1491,13 @@
                                        (or (= dst ra) (= src ra)))
                               (setf safe nil)
                               (return-from check)))
-                          ;; At unconditional jump: end of block
+                          ;; At unconditional jump: stop. Even if the local
+                          ;; straight-line window looks safe, the destination
+                          ;; register can still be live in the successor block
+                          ;; via a merge/header phi. This peephole is not
+                          ;; CFG-aware enough to prove otherwise.
                           (when (bpf-unconditional-jmp-p next)
-                            (let ((target (+ j 1 (whistler/bpf:bpf-insn-off next))))
-                              (if (and (>= target 0) (< target len)
-                                       (coalesce-regs-dead-at vec len target ra rb))
-                                  (setf end-j j)
-                                  (setf safe nil)))
+                            (setf safe nil)
                             (return-from check))))
                ;; Phase 2: If safe, perform the rename
                (when (and safe end-j)

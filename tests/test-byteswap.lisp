@@ -10,7 +10,7 @@
 
 (test ntohs-compiles
   "ntohs (16-bit byte swap) should compile"
-  (let ((bytes (w-body "(let ((x (ctx-load u16 0)))
+  (let ((bytes (w-body "(let ((x (get-prandom-u32)))
                           (declare (type u16 x))
                           (return (ntohs x)))")))
     (is (has-opcode-p bytes +bpf-bswap+)
@@ -18,7 +18,7 @@
 
 (test htons-compiles
   "htons should compile identically to ntohs"
-  (let ((bytes (w-body "(let ((x (ctx-load u16 0)))
+  (let ((bytes (w-body "(let ((x (get-prandom-u32)))
                           (declare (type u16 x))
                           (return (htons x)))")))
     (is (has-opcode-p bytes +bpf-bswap+)
@@ -42,7 +42,7 @@
 
 (test ntohll-compiles
   "ntohll (64-bit byte swap) should compile"
-  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (get-prandom-u32)))
                           (declare (type u64 x))
                           (return (ntohll x)))")))
     (is (has-opcode-p bytes +bpf-bswap+)
@@ -50,7 +50,7 @@
 
 (test htonll-compiles
   "htonll should compile identically to ntohll"
-  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
+  (let ((bytes (w-body "(let ((x (get-prandom-u32)))
                           (declare (type u64 x))
                           (return (htonll x)))")))
     (is (has-opcode-p bytes +bpf-bswap+)

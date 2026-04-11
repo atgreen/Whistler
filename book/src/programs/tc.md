@@ -9,8 +9,7 @@ policies that XDP cannot cover (XDP only sees inbound packets).
 Use `"tc"` or `"tc/name"`:
 
 ```lisp
-(defprog my-tc-filter (&key (type :socket-filter)
-                            (section "tc/my_filter"))
+(defprog my-tc-filter (:type :xdp :section "tc/my_filter")
   TC_ACT_OK)
 ```
 
@@ -29,10 +28,10 @@ and `with-tc-udp` macros that mirror the XDP API but handle the `__sk_buff`
 layout:
 
 ```lisp
-(with-tc-packet ctx (eth-proto ip-src ip-dst ip-proto)
-  (with-tc-tcp ctx (src-port dst-port)
-    ;; same field names as the XDP macros
-    ...))
+(with-tc-tcp (data data-end tcp)
+  ;; Ethernet, IP, and TCP headers are bounds-checked
+  (tcp-dst-port tcp)
+  ...)
 ```
 
 ## Attachment
@@ -51,12 +50,9 @@ clsact qdisc. The typical steps from userspace:
 ## Example: Block Outbound Traffic to Port 4444
 
 ```lisp
-(defprog block-4444 (&key (type :socket-filter)
-                          (section "tc/block_4444"))
-  (with-tc-packet ctx (eth-proto ip-src ip-dst ip-proto)
-    (when (= ip-proto 6)  ;; IPPROTO_TCP
-      (with-tc-tcp ctx (src-port dst-port)
-        (when (= dst-port 4444)
-          TC_ACT_SHOT))))
+(defprog block-4444 (:type :xdp :section "tc/block_4444")
+  (with-tc-tcp (data data-end tcp)
+    (when (= (tcp-dst-port tcp) 4444)
+      (return TC_ACT_SHOT)))
   TC_ACT_OK)
 ```

@@ -32,10 +32,10 @@
 (test log2-intrinsic
   "log2 should emit unrolled binary search (15 instructions)"
   ;; log2 expands to: mov result,0 + 4×(jlt+rsh+add) + 1×jlt + 1×add = 15
-  (let ((n (w-count "(let ((x (ctx-load u64 0)))
+  (let ((n (w-count "(let ((x (get-prandom-u32)))
                        (declare (type u64 x))
                        (return (log2 x)))")))
-    ;; ctx-load + log2 (15) + exit = at least 17
+    ;; get-prandom-u32 + log2 (15) + exit = at least 17
     (is (>= n 17) "log2 should produce at least 17 instructions")))
 
 ;;; ========== cast ==========
@@ -49,7 +49,7 @@
 
 (test cast-u64-to-u32
   "Narrowing cast should compile"
-  (let ((n (w-count "(let ((x (ctx-load u64 0)))
+  (let ((n (w-count "(let ((x (get-prandom-u32)))
                        (declare (type u64 x))
                        (return (cast u32 x)))")))
     (is (> n 1) "narrowing cast should produce instructions")))
@@ -58,9 +58,9 @@
 
 (test logical-and
   "(and a b) should short-circuit — returns 0 if a is 0, else b"
-  (let ((n (w-count "(let ((x (ctx-load u64 0))
-                           (y (ctx-load u64 8)))
-                       (declare (type u64 x) (type u64 y))
+  (let ((n (w-count "(let ((x (get-prandom-u32))
+                           (y (get-prandom-u32)))
+                       (declare (type u32 x) (type u32 y))
                        (if (and (> x 0) (> y 0))
                            (return 1)
                            (return 0)))")))
@@ -68,9 +68,9 @@
 
 (test logical-or
   "(or a b) should short-circuit — returns non-zero if either is non-zero"
-  (let ((n (w-count "(let ((x (ctx-load u64 0))
-                           (y (ctx-load u64 8)))
-                       (declare (type u64 x) (type u64 y))
+  (let ((n (w-count "(let ((x (get-prandom-u32))
+                           (y (get-prandom-u32)))
+                       (declare (type u32 x) (type u32 y))
                        (if (or (> x 10) (> y 10))
                            (return 1)
                            (return 0)))")))
@@ -78,8 +78,8 @@
 
 (test logical-not
   "(not x) should negate a boolean"
-  (let ((n (w-count "(let ((x (ctx-load u64 0)))
-                       (declare (type u64 x))
+  (let ((n (w-count "(let ((x (get-prandom-u32)))
+                       (declare (type u32 x))
                        (if (not (= x 0))
                            (return 1)
                            (return 0)))")))
@@ -129,8 +129,8 @@
 
 (test cond-compiles
   "cond should compile multi-clause conditional"
-  (let ((n (w-count "(let ((x (ctx-load u64 0)))
-                       (declare (type u64 x))
+  (let ((n (w-count "(let ((x (get-prandom-u32)))
+                       (declare (type u32 x))
                        (cond
                          ((> x 100) (return 3))
                          ((> x 50)  (return 2))

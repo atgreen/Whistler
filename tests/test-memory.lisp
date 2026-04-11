@@ -10,17 +10,29 @@
 
 (test load-u8-emits-ldxb
   "Loading u8 should emit ldxb (opcode 0x71)"
-  (let ((bytes (w-body "(let ((x (ctx-load u8 0)))
-                          (declare (type u8 x))
-                          (return x))")))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((p (map-lookup m key)))
+                            (declare (type u64 p))
+                            (when p
+                              (return (load u8 p 0))))
+                          (return 0))"
+                       :maps '((m :type :array :key-size 4
+                                  :value-size 8 :max-entries 1)))))
     (is (has-opcode-p bytes +ldxb+)
         "Expected ldxb (0x71) for u8 load")))
 
 (test load-u16-emits-ldxh
   "Loading u16 should emit ldxh (opcode 0x69)"
-  (let ((bytes (w-body "(let ((x (ctx-load u16 0)))
-                          (declare (type u16 x))
-                          (return x))")))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((p (map-lookup m key)))
+                            (declare (type u64 p))
+                            (when p
+                              (return (load u16 p 0))))
+                          (return 0))"
+                       :maps '((m :type :array :key-size 4
+                                  :value-size 8 :max-entries 1)))))
     (is (has-opcode-p bytes +ldxh+)
         "Expected ldxh (0x69) for u16 load")))
 
@@ -34,9 +46,15 @@
 
 (test load-u64-emits-ldxdw
   "Loading u64 should emit ldxdw (opcode 0x79)"
-  (let ((bytes (w-body "(let ((x (ctx-load u64 0)))
-                          (declare (type u64 x))
-                          (return x))")))
+  (let ((bytes (w-body "(let ((key 0))
+                          (declare (type u32 key))
+                          (let ((p (map-lookup m key)))
+                            (declare (type u64 p))
+                            (when p
+                              (return (load u64 p 0))))
+                          (return 0))"
+                       :maps '((m :type :array :key-size 4
+                                  :value-size 8 :max-entries 1)))))
     (is (has-opcode-p bytes +ldxdw+)
         "Expected ldxdw (0x79) for u64 load")))
 

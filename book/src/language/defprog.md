@@ -6,7 +6,7 @@ program section in the output ELF object.
 ## Syntax
 
 ```lisp
-(defprog name (&key (type :xdp) (section nil) (license "GPL"))
+(defprog name (:type :xdp :section nil :license "GPL")
   body...)
 ```
 
@@ -36,7 +36,7 @@ return code. There is no explicit `return` form. For XDP programs, this is
 typically an XDP action constant:
 
 ```lisp
-(defprog drop-all (&key (type :xdp))
+(defprog drop-all (:type :xdp)
   XDP_DROP)
 ```
 
@@ -48,7 +48,7 @@ override this -- for instance, to attach to a specific kernel function --
 pass `:section` explicitly:
 
 ```lisp
-(defprog trace-exec (&key (type :kprobe) (section "kprobe/sys_execve"))
+(defprog trace-exec (:type :kprobe :section "kprobe/sys_execve")
   0)
 ```
 
@@ -71,15 +71,15 @@ for bundling related programs:
   :value-size 4
   :max-entries 4)
 
-(defprog handler-a (&key (type :xdp) (section "xdp/handler_a"))
+(defprog handler-a (:type :xdp :section "xdp/handler_a")
   ;; Handle protocol A
   XDP_PASS)
 
-(defprog handler-b (&key (type :xdp) (section "xdp/handler_b"))
+(defprog handler-b (:type :xdp :section "xdp/handler_b")
   ;; Handle protocol B
   XDP_DROP)
 
-(defprog main (&key (type :xdp))
+(defprog main (:type :xdp)
   ;; Dispatch to sub-programs via tail call
   (tail-call dispatch 0)
   XDP_PASS)
@@ -97,12 +97,10 @@ A minimal tracepoint program that records events to a ring buffer:
 (defmap events :type :ringbuf
   :max-entries (* 256 1024))
 
-(defprog trace-sched (&key (type :tracepoint)
-                           (section "tracepoint/sched/sched_process_exec"))
-  (let ((e (ringbuf-reserve events (sizeof event))))
-    (when e
-      (setf (event-pid e) (get-current-pid-tgid))
-      (setf (event-ts e) (ktime-get-ns))
-      (ringbuf-submit e 0)))
+(defprog trace-sched (:type :tracepoint
+                      :section "tracepoint/sched/sched_process_exec")
+  (with-ringbuf (e events (sizeof event))
+    (setf (event-pid e) (get-current-pid-tgid)
+          (event-ts e) (ktime-get-ns)))
   0)
 ```

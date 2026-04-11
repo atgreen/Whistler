@@ -9,8 +9,8 @@ Set the section name to `"kprobe/function_name"` to target a kernel
 function:
 
 ```lisp
-(defprog trace-exec (&key (type :kprobe)
-                          (section "kprobe/__x64_sys_execve"))
+(defprog trace-exec (:type :kprobe
+                     :section "kprobe/__x64_sys_execve")
   ;; runs each time execve is called
   0)
 ```
@@ -20,32 +20,32 @@ function:
 For userspace functions, use `"uprobe/path"`:
 
 ```lisp
-(defprog trace-malloc (&key (type :kprobe)
-                            (section "uprobe//lib64/libc.so.6"))
+(defprog trace-malloc (:type :kprobe
+                       :section "uprobe//lib64/libc.so.6")
   0)
 ```
 
 ## Return Probes
 
 To trace when a function returns rather than when it is entered, use
-`:retprobe t`:
+a `kretprobe` section:
 
 ```lisp
-(defprog trace-exec-ret (&key (type :kprobe)
-                              (section "kretprobe/__x64_sys_execve"))
+(defprog trace-exec-ret (:type :kprobe
+                         :section "kretprobe/__x64_sys_execve")
   0)
 ```
 
 ## Context: pt_regs
 
-The context argument provides access to CPU register state at the probe
-point. Use `pt-regs-parm1` through `pt-regs-parm6` for function arguments,
+The context is accessed implicitly. Use the zero-argument macros
+`pt-regs-parm1` through `pt-regs-parm6` for function arguments,
 and `pt-regs-ret` for the return value on return probes:
 
 ```lisp
-(defprog trace-exec (&key (type :kprobe)
-                          (section "kprobe/__x64_sys_execve"))
-  (let ((filename-ptr (pt-regs-parm1 ctx)))
+(defprog trace-exec (:type :kprobe
+                     :section "kprobe/__x64_sys_execve")
+  (let ((filename-ptr (pt-regs-parm1)))
     ;; filename-ptr holds the first argument to execve
     0))
 ```
@@ -67,12 +67,10 @@ Record the PID of every process that calls execve:
 (defmap events :type :ringbuf
   :max-entries (* 256 1024))
 
-(defprog trace-exec (&key (type :kprobe)
-                          (section "kprobe/__x64_sys_execve"))
-  (let ((e (ringbuf-reserve events (sizeof exec-event))))
-    (when e
-      (setf (exec-event-pid e) (u32 (get-current-pid-tgid)))
-      (setf (exec-event-ts e) (ktime-get-ns))
-      (ringbuf-submit e 0)))
+(defprog trace-exec (:type :kprobe
+                     :section "kprobe/__x64_sys_execve")
+  (with-ringbuf (e events (sizeof exec-event))
+    (setf (exec-event-pid e) (cast u32 (get-current-pid-tgid))
+          (exec-event-ts e) (ktime-get-ns)))
   0)
 ```

@@ -63,4 +63,5 @@
                (:file "test-maps")
                (:file "test-percpu")
                (:file "test-programs")
-               (:file "test-regalloc")))
+               (:file "test-regalloc")
+               (:file "test-torture")))

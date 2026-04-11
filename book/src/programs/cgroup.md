@@ -17,8 +17,8 @@ drop.
 | `"cgroup_skb/egress"` | Outbound packets |
 
 ```lisp
-(defprog count-egress (&key (type :cgroup-skb)
-                            (section "cgroup_skb/egress"))
+(defprog count-egress (:type :cgroup-skb
+                     :section "cgroup_skb/egress")
   ;; allow all, but could inspect and drop
   1)
 ```
@@ -33,8 +33,8 @@ Socket lifecycle hooks. Return 1 to allow, 0 to deny.
 | `"cgroup/sock_release"` | Socket close |
 
 ```lisp
-(defprog audit-sock (&key (type :cgroup-sock)
-                          (section "cgroup/sock_create"))
+(defprog audit-sock (:type :cgroup-sock
+                     :section "cgroup/sock_create")
   ;; allow all socket creation
   1)
 ```
@@ -51,8 +51,8 @@ Connection and message authorization. Return 1 to allow, 0 to block.
 | `"cgroup/sendmsg6"` | IPv6 UDP sendmsg |
 
 ```lisp
-(defprog filter-connect (&key (type :cgroup-sock-addr)
-                              (section "cgroup/connect4"))
+(defprog filter-connect (:type :cgroup-sock-addr
+                         :section "cgroup/connect4")
   ;; allow all IPv4 connections
   1)
 ```
@@ -116,8 +116,8 @@ A complete program that counts outbound packets for the root cgroup.
   :value-size 8
   :max-entries 1)
 
-(defprog count-egress (&key (type :cgroup-skb)
-                            (section "cgroup_skb/egress"))
+(defprog count-egress (:type :cgroup-skb
+                     :section "cgroup_skb/egress")
   (let ((key (u32 0))
         (val (map-lookup pkt-count key)))
     (when val

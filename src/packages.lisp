@@ -77,7 +77,7 @@
            #:bpf-map #:bpf-map-name #:bpf-map-type #:bpf-map-key-size
            #:bpf-map-value-size #:bpf-map-max-entries #:bpf-map-flags #:bpf-map-index
            #:make-bpf-map
-           #:sym= #:bpf-type-p #:builtin-helper-p
+           #:sym= #:bpf-type-p #:bpf-type-size #:builtin-helper-p
            #:*builtin-helpers* #:*builtin-constants* #:*whistler-builtins*))
 
 (defpackage #:whistler/ir

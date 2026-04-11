@@ -104,10 +104,11 @@
           (when first-cond-idx
             (let* ((reg-byte (nth-insn-regs bytes first-cond-idx))
                    (dst-reg (logand reg-byte #x0f)))
-              ;; The null check must test R0 (map_lookup_elem return value),
-              ;; not R7 (ktime-get-ns result stashed in callee-saved)
-              (is (= 0 dst-reg)
-                  (format nil "Inner null check should test R0, got R~d" dst-reg)))))))))
+              ;; The null check must test the map_lookup_elem return value
+              ;; (R0 or a caller-saved reg it was moved to), not R7
+              ;; (ktime-get-ns result stashed in callee-saved).
+              (is (<= dst-reg 5)
+                  (format nil "Inner null check should use caller-saved reg, got R~d" dst-reg)))))))))
 
 (test probe-read-user-arg-order
   "probe-read-user must set R1=dest R2=size R3=src without clobbering (issue #31).
@@ -116,7 +117,8 @@
    immediate into R2."
   (let* ((maps '((events :type :ringbuf :max-entries 16384)))
          (bytes (let ((whistler::*maps* maps))
-                  (w-body "(let ((buf (ctx-load u64 0)))
+                  (w-body "(let ((buf (get-prandom-u32)))
+                             (declare (type u64 buf))
                              (when buf
                                (let ((dst (struct-alloc 64)))
                                  (probe-read-user dst 64 buf)
@@ -165,11 +167,13 @@
    where src comes from a chain of pointer dereferences in a branch."
   (let* ((maps '((events :type :ringbuf :max-entries 16384)))
          (bytes (let ((whistler::*maps* maps))
-                  (w-body "(let ((ubuf (ctx-load u64 0))
+                  (w-body "(let ((ubuf (get-prandom-u32))
                                  (dst (struct-alloc 64)))
+                             (declare (type u64 ubuf))
                              (if ubuf
                                  (probe-read-user dst 64 ubuf)
-                                 (let ((alt-src (ctx-load u64 8)))
+                                 (let ((alt-src (get-prandom-u32)))
+                                   (declare (type u64 alt-src))
                                    (when alt-src
                                      (probe-read-user dst 64 alt-src))))
                              (return 0))"

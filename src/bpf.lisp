@@ -103,7 +103,9 @@
 (defconstant +bpf-func-get-prandom-u32+      7)
 (defconstant +bpf-func-get-smp-processor-id+ 8)
 (defconstant +bpf-func-redirect+             23)
-(defconstant +bpf-func-map-lookup-and-delete-elem+ 46)
+;; NOTE: +bpf-func-map-lookup-and-delete-elem+ was removed.  Helper 46 is
+;; bpf_get_socket_cookie, NOT map_lookup_and_delete_elem.  The latter is a
+;; userspace bpf() syscall command, not a BPF helper.
 
 ;; XDP return codes
 (defconstant +xdp-aborted+  0)

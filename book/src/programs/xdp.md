@@ -10,7 +10,7 @@ Use `"xdp"` for a single program or `"xdp/name"` to distinguish multiple
 XDP programs in the same ELF:
 
 ```lisp
-(defprog my-filter (&key (type :xdp) (section "xdp/my_filter"))
+(defprog my-filter (:type :xdp :section "xdp/my_filter")
   XDP_PASS)
 ```
 
@@ -26,13 +26,13 @@ XDP programs in the same ELF:
 
 ## Packet Context
 
-The program receives an `xdp_md` pointer. Use `xdp-data` and
-`xdp-data-end` to get the packet boundaries:
+The program receives an `xdp_md` pointer implicitly. Use the zero-argument
+macros `xdp-data` and `xdp-data-end` to get the packet boundaries:
 
 ```lisp
-(defprog check-len (&key (type :xdp))
-  (let ((data (xdp-data ctx))
-        (data-end (xdp-data-end ctx)))
+(defprog check-len (:type :xdp)
+  (let ((data (xdp-data))
+        (data-end (xdp-data-end)))
     (if (< (- data-end data) 14)
         XDP_DROP
         XDP_PASS)))
@@ -43,33 +43,32 @@ The program receives an `xdp_md` pointer. Use `xdp-data` and
 Whistler provides `with-packet`, `with-tcp`, and `with-udp` to safely
 parse protocol headers with automatic bounds checking.
 
-`with-packet` binds Ethernet and IP header fields:
+`with-packet` binds `data` and `data-end` from the XDP context and
+checks a minimum packet length:
 
 ```lisp
-(with-packet ctx (eth-proto ip-src ip-dst ip-proto)
+(with-packet (data data-end :min-len 14)
   ;; headers are bounds-checked; body only runs if valid
   ...)
 ```
 
-`with-tcp` and `with-udp` nest inside `with-packet` to access transport
-layer fields:
+`with-tcp` and `with-udp` build on `with-packet` to also parse
+transport layer headers:
 
 ```lisp
-(with-packet ctx (eth-proto ip-src ip-dst ip-proto)
-  (with-tcp ctx (src-port dst-port)
-    ;; TCP header fields available here
-    ...))
+(with-tcp (data data-end tcp)
+  ;; Ethernet, IP, and TCP headers are bounds-checked
+  (tcp-dst-port tcp)
+  ...)
 ```
 
 ## Example: Drop TCP Port 9999
 
 ```lisp
-(defprog drop-9999 (&key (type :xdp) (section "xdp/drop_9999"))
-  (with-packet ctx (eth-proto ip-src ip-dst ip-proto)
-    (when (= ip-proto 6)  ;; IPPROTO_TCP
-      (with-tcp ctx (src-port dst-port)
-        (when (= dst-port 9999)
-          XDP_DROP))))
+(defprog drop-9999 (:type :xdp :section "xdp/drop_9999")
+  (with-tcp (data data-end tcp)
+    (when (= (tcp-dst-port tcp) 9999)
+      (return XDP_DROP)))
   XDP_PASS)
 ```
 

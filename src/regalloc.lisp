@@ -244,10 +244,11 @@
          (reserved-callee-count (or reserve-callee-count 0))
          (callee-free (subseq all-callee 0
                               (max 0 (- (length all-callee) reserved-callee-count))))
-         ;; When ctx-early, R1 holds the live ctx pointer — exclude it
+         ;; R0 is reserved for return values — never allocate it.
+         ;; When ctx-early, R1 holds the live ctx pointer — exclude it too.
          (caller-free (if (and ctx-vreg ctx-used ctx-early)
-                          '(0 2 3 4 5)
-                          '(0 1 2 3 4 5)))
+                          '(2 3 4 5)
+                          '(1 2 3 4 5)))
          ;; Reserve a callee-saved register for map-fd caching when
          ;; the savings outweigh the cost of spilling one recomputable value.
          ;; Cost of spill: ~2 insns (recompute at each use, typically 1-2 uses).

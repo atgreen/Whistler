@@ -532,18 +532,19 @@
   (let* ((prog (lower-ctx-prog ctx))
          (then-label (ir-fresh-label prog "then"))
          (else-label (ir-fresh-label prog "else"))
-         (join-label (ir-fresh-label prog "join")))
+         (join-label (ir-fresh-label prog "join"))
+         ;; Snapshot env before branches to detect setf'd variables
+         (pre-env (mapcar (lambda (e) (list (car e) (cadr e) (cddr e)))
+                          (lower-ctx-env ctx))))
 
     ;; Emit conditional branch
     (if (and (consp test) (ir-jmp-op (car test)))
-        ;; Comparison test: emit br-cond with comparison args
         (let* ((jmp-op (ir-jmp-op (car test)))
                (lhs (lower-expr ctx (second test)))
                (rhs (lower-expr ctx (third test))))
           (ctx-emit ctx :br-cond nil
                     (list `(:cmp ,jmp-op) lhs rhs
                           `(:label ,then-label) `(:label ,else-label))))
-        ;; Value test: branch on non-zero
         (let ((test-vreg (lower-expr ctx test)))
           (ctx-emit ctx :br-cond nil
                     (list '(:cmp :jne) test-vreg `(:imm 0)
@@ -554,32 +555,72 @@
       (ctx-switch-block ctx then-block)
       (let ((then-val (when then-form (lower-expr ctx then-form))))
         (let ((then-exit-block (basic-block-label (lower-ctx-block ctx)))
-              (then-needs-br (not (bb-terminator-p (lower-ctx-block ctx)))))
+              (then-needs-br (not (bb-terminator-p (lower-ctx-block ctx))))
+              ;; Capture env after then-branch
+              (then-env (mapcar (lambda (e) (list (car e) (cadr e) (cddr e)))
+                                (lower-ctx-env ctx))))
+
+          ;; Restore env to pre-branch state for else
+          (dolist (pre pre-env)
+            (let ((entry (assoc (first pre) (lower-ctx-env ctx)
+                                :test (lambda (a b)
+                                        (string= (symbol-name a)
+                                                 (symbol-name b))))))
+              (when entry (setf (cddr entry) (third pre)))))
 
           ;; Else block
           (let ((else-block (make-basic-block :label else-label)))
             (ctx-switch-block ctx else-block)
             (let ((else-val (when else-form (lower-expr ctx else-form))))
               (let ((else-exit-block (basic-block-label (lower-ctx-block ctx)))
-                    (else-needs-br (not (bb-terminator-p (lower-ctx-block ctx)))))
+                    (else-needs-br (not (bb-terminator-p (lower-ctx-block ctx))))
+                    (else-env (mapcar (lambda (e) (list (car e) (cadr e) (cddr e)))
+                                     (lower-ctx-env ctx))))
 
-                ;; If both branches terminate (return), no join needed
                 (cond
                   ((and (not then-needs-br) (not else-needs-br))
-                   ;; Both branches return — no join block needed
                    nil)
                   (t
-                   ;; Add jumps to join
                    (when then-needs-br
-                     ;; Go back and add br to then-block's exit
                      (let ((tb (ir-find-block prog then-exit-block)))
                        (bb-emit tb (make-ir-insn :op :br :args (list `(:label ,join-label))))))
                    (when else-needs-br
                      (ctx-emit ctx :br nil (list `(:label ,join-label))))
 
-                   ;; Join block with phi if needed
                    (let ((join-block (make-basic-block :label join-label)))
                      (ctx-switch-block ctx join-block)
+
+                     ;; Insert phis for variables modified in either branch
+                     (dolist (pre pre-env)
+                       (let* ((vname (first pre))
+                              (pre-vreg (third pre))
+                              (then-entry (find (symbol-name vname) then-env
+                                                :key (lambda (e) (symbol-name (first e)))
+                                                :test #'string=))
+                              (else-entry (find (symbol-name vname) else-env
+                                                :key (lambda (e) (symbol-name (first e)))
+                                                :test #'string=))
+                              (then-vreg (when then-entry (third then-entry)))
+                              (else-vreg (when else-entry (third else-entry))))
+                         (when (and then-vreg else-vreg
+                                    (or (not (eql then-vreg pre-vreg))
+                                        (not (eql else-vreg pre-vreg))))
+                           (let ((phi-vr (ctx-fresh-vreg ctx)))
+                             (ctx-emit ctx :phi phi-vr
+                                       (list (list (if then-needs-br then-vreg pre-vreg)
+                                                   `(:label ,then-exit-block))
+                                             (list (if else-needs-br else-vreg pre-vreg)
+                                                   `(:label ,else-exit-block)))
+                                       (second pre))
+                             ;; Update env to use the merged phi
+                             (let ((env-entry (assoc vname (lower-ctx-env ctx)
+                                                     :test (lambda (a b)
+                                                             (string= (symbol-name a)
+                                                                      (symbol-name b))))))
+                               (when env-entry
+                                 (setf (cddr env-entry) phi-vr)))))))
+
+                     ;; Result phi for the if-expression value
                      (if (and then-val else-val then-needs-br else-needs-br)
                          (let ((phi-vreg (ctx-fresh-vreg ctx)))
                            (ctx-emit ctx :phi phi-vreg
@@ -1069,7 +1110,69 @@
 
 ;;; ========== Context load ==========
 
+;;; Context struct layouts for compile-time validation.
+;;; Each entry: (offset size-bytes type-kw pointer-p)
+;;; pointer-p indicates the field holds a pointer (packet data, packet end, etc.)
+;;; that the verifier will track — arithmetic on these is restricted.
+
+(defparameter *xdp-ctx-fields*
+  '((0  4 u32 :pkt)         ; data       — packet pointer
+    (4  4 u32 :pkt-end)     ; data_end   — packet end pointer
+    (8  4 u32 :scalar)      ; data_meta
+    (12 4 u32 :scalar)      ; ingress_ifindex
+    (16 4 u32 :scalar))     ; rx_queue_index
+  "xdp_md context fields: (offset size type pointer-kind)")
+
+(defparameter *skb-ctx-fields*
+  '((76 4 u32 :pkt)         ; data       — packet pointer
+    (80 4 u32 :pkt-end))    ; data_end   — packet end pointer
+  "Commonly accessed __sk_buff context fields for TC programs.")
+
+(defun section-to-ctx-fields (section)
+  "Return the context field layout for the given section, or NIL if unknown."
+  (cond
+    ((or (string= section "xdp")
+         (and (> (length section) 4)
+              (string= (subseq section 0 4) "xdp/")))
+     *xdp-ctx-fields*)
+    ((or (string= section "tc")
+         (and (> (length section) 3)
+              (string= (subseq section 0 3) "tc/"))
+         (string= section "classifier"))
+     *skb-ctx-fields*)
+    ;; kprobe/uprobe: pt_regs — all u64 fields, don't restrict
+    ;; tracepoint: variable layout, don't restrict
+    ;; cgroup: __sk_buff or bpf_sock, partial coverage
+    (t nil)))
+
+(defun ctx-field-lookup (fields offset)
+  "Find the field at OFFSET in FIELDS. Returns (offset size type pointer-kind) or NIL."
+  (find offset fields :key #'first))
+
+(defun validate-ctx-load (ctx type-kw offset)
+  "Validate a ctx-load against the known context struct layout.
+   Signals a compile-time error for invalid access widths.
+   Returns the pointer kind (:pkt, :pkt-end, :scalar) or NIL if unknown."
+  (let* ((section (ir-program-section (lower-ctx-prog ctx)))
+         (fields (section-to-ctx-fields section)))
+    (when fields
+      (let ((field (ctx-field-lookup fields offset)))
+        (cond
+          ;; Unknown offset — warn but allow (context structs may have fields we don't track)
+          ((null field) nil)
+          ;; Access size mismatch
+          ((/= (whistler/compiler:bpf-type-size type-kw)
+                (second field))
+           (whistler/compiler:whistler-error
+            :what (format nil "ctx-load ~a at offset ~d: wrong access size" type-kw offset)
+            :expected (format nil "~a (~d bytes) — the context field at this offset is ~d bytes wide"
+                              (third field) (second field) (second field))
+            :hint (format nil "use (ctx-load ~a ~d) instead" (third field) offset)))
+          ;; Valid — return pointer kind
+          (t (fourth field)))))))
+
 (defun lower-ctx-load (ctx type-kw offset)
+  (validate-ctx-load ctx type-kw offset)
   (let ((ctx-vreg (cdr (ctx-lookup-var ctx (intern "%%CTX" (find-package '#:whistler/ir)))))
         (dst (ctx-fresh-vreg ctx)))
     (ctx-emit ctx :ctx-load dst (list ctx-vreg `(:imm ,offset) `(:type ,type-kw)) type-kw)
@@ -1125,54 +1228,103 @@
          :expected "a non-negative integer"
          :hint "BPF loops require count >= 0"))
       (let* ((prog (lower-ctx-prog ctx))
-             (saved-env (lower-ctx-env ctx))
+             (saved-env (copy-list (lower-ctx-env ctx)))
              (header-label (ir-fresh-label prog "loop_hdr"))
              (body-label (ir-fresh-label prog "loop_body"))
              (exit-label (ir-fresh-label prog "loop_exit"))
-             ;; Init counter
-             (init-vreg (ctx-fresh-vreg ctx)))
-        (ctx-emit ctx :mov init-vreg (list '(:imm 0)) 'u32)
+             (init-vreg (ctx-fresh-vreg ctx))
+             (init-block-label (basic-block-label (lower-ctx-block ctx)))
+             (ctx-sym (intern "%%CTX" (find-package '#:whistler/ir)))
+             (loop-phis '()))
+        (ctx-emit ctx :mov init-vreg (list '(:imm 0)) 'u64)
         (ctx-emit ctx :br nil (list `(:label ,header-label)))
 
-        ;; Header block with phi for counter
+        ;; Header block
         (let ((header-block (make-basic-block :label header-label)))
           (ctx-switch-block ctx header-block)
+
+          ;; Phi for loop counter
           (let ((phi-vreg (ctx-fresh-vreg ctx)))
             (ctx-emit ctx :phi phi-vreg
-                      (list (list init-vreg `(:label ,(basic-block-label
-                                                       (first (ir-program-blocks prog)))))
-                            ;; back-edge phi arg filled later
-                            ))
-            (ctx-bind-var ctx var 'u32 phi-vreg)
-            ;; Bounds check
+                      (list (list init-vreg `(:label ,init-block-label))))
+            (ctx-bind-var ctx var 'u64 phi-vreg)
+
+            ;; Pre-insert phis for ALL in-scope variables (except counter and %%CTX).
+            ;; This is the standard SSA approach: create phis eagerly before the
+            ;; body so the body naturally uses the phi vregs through the env.
+            ;; DCE removes unused ones later.
             (let ((n-vreg (ctx-fresh-vreg ctx)))
-              (ctx-emit ctx :mov n-vreg (list `(:imm ,n)) 'u32)
+              (dolist (entry (lower-ctx-env ctx))
+                (let ((vname (car entry))
+                      (vtype (cadr entry))
+                      (vvreg (cddr entry)))
+                  (unless (or (string= (symbol-name vname) (symbol-name var))
+                              (eq vname ctx-sym))
+                    (let ((lphi (ctx-fresh-vreg ctx)))
+                      (ctx-emit ctx :phi lphi
+                                (list (list vvreg `(:label ,init-block-label)))
+                                vtype)
+                      (setf (cddr entry) lphi)
+                      (push (list vname lphi vvreg vtype) loop-phis)))))
+
+              ;; Bounds check
+              (ctx-emit ctx :mov n-vreg (list `(:imm ,n)) 'u64)
               (ctx-emit ctx :br-cond nil
                         (list '(:cmp :jge) phi-vreg n-vreg
-                              `(:label ,exit-label) `(:label ,body-label))))
+                              `(:label ,exit-label) `(:label ,body-label)))
 
-            ;; Body block
-            (let ((body-block (make-basic-block :label body-label)))
-              (ctx-switch-block ctx body-block)
-              (dolist (form body)
-                (lower-expr ctx form))
-              ;; Increment counter
-              (let* ((one (ctx-fresh-vreg ctx))
-                     (inc-vreg (ctx-fresh-vreg ctx)))
-                (ctx-emit ctx :mov one (list '(:imm 1)) 'u32)
-                (ctx-emit ctx :add inc-vreg (list phi-vreg one) 'u32)
-                ;; Update phi back-edge
-                (let ((phi-insn (first (basic-block-insns header-block))))
-                  (setf (ir-insn-args phi-insn)
-                        (list (first (ir-insn-args phi-insn))
-                              (list inc-vreg `(:label ,(basic-block-label
-                                                        (lower-ctx-block ctx)))))))
-                (ctx-emit ctx :br nil (list `(:label ,header-label)))))))
+              ;; Body block
+              (let ((body-block (make-basic-block :label body-label)))
+                (declare (ignore body-block))
+                (ctx-switch-block ctx (make-basic-block :label body-label))
+                (dolist (form body)
+                  (lower-expr ctx form))
+
+                ;; Fill back-edges for all loop-carried phis
+                (let ((back-lbl (basic-block-label (lower-ctx-block ctx))))
+                  ;; Variable phis
+                  (dolist (lp loop-phis)
+                    (let* ((vname (first lp))
+                           (phi-vr (second lp))
+                           (env-entry (assoc vname (lower-ctx-env ctx)
+                                             :test (lambda (a b)
+                                                     (string= (symbol-name a)
+                                                              (symbol-name b)))))
+                           (body-vr (when env-entry (cddr env-entry)))
+                           (phi-insn (find-if
+                                      (lambda (i)
+                                        (and (eq (ir-insn-op i) :phi)
+                                             (eql (ir-insn-dst i) phi-vr)))
+                                      (basic-block-insns header-block))))
+                      (when (and phi-insn body-vr)
+                        (setf (ir-insn-args phi-insn)
+                              (list (first (ir-insn-args phi-insn))
+                                    (list body-vr `(:label ,back-lbl)))))))
+
+                  ;; Increment counter and fill counter phi back-edge
+                  (let* ((inc-vreg (ctx-fresh-vreg ctx)))
+                    (ctx-emit ctx :add inc-vreg (list phi-vreg '(:imm 1)) 'u64)
+                    (let ((ctr-phi (first (basic-block-insns header-block))))
+                      (setf (ir-insn-args ctr-phi)
+                            (list (first (ir-insn-args ctr-phi))
+                                  (list inc-vreg `(:label ,back-lbl))))))
+                  (ctx-emit ctx :br nil (list `(:label ,header-label))))))))
 
         ;; Exit block
         (let ((exit-block (make-basic-block :label exit-label)))
           (ctx-switch-block ctx exit-block))
+        ;; Restore the outer scope, but keep loop-carried values for variables
+        ;; that survive the loop.  At loop exit those values are the header phis.
         (setf (lower-ctx-env ctx) saved-env)
+        (dolist (lp loop-phis)
+          (let* ((vname (first lp))
+                 (phi-vr (second lp))
+                 (env-entry (assoc vname (lower-ctx-env ctx)
+                                   :test (lambda (a b)
+                                           (string= (symbol-name a)
+                                                    (symbol-name b))))))
+            (when env-entry
+              (setf (cddr env-entry) phi-vr))))
         nil))))
 
 ;;; ========== Cast ==========
