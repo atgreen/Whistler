@@ -10,7 +10,7 @@ userspace through a ring buffer.
 
 ;;; Event struct -- shared between BPF and userspace.
 ;;; defstruct generates both BPF accessor macros and CL-side codec
-;;; (decode-conn-event -> conn-event struct).
+;;; (decode-conn-event -> conn-event-record struct).
 (defstruct conn-event
   (src-addr  u32)
   (dst-addr  u32)
@@ -72,6 +72,7 @@ userspace through a ring buffer.
   internal `when`).
 
 - **Dual struct**: `defstruct` generates both BPF accessor macros for
-  the kernel side (`conn-event-src-addr`, etc.) and a CL struct plus
-  `decode-conn-event` function for the userspace side. With `--gen c`,
+  the kernel side (`conn-event-src-addr`, etc.) and a CL record type
+  (`conn-event-record`) plus `decode-conn-event` for the userspace side.
+  With `--gen c`,
   you also get a matching C struct for non-Lisp consumers.

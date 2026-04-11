@@ -27,6 +27,7 @@ From an SBCL REPL:
 (require :asdf)
 (push #p"/path/to/whistler/" asdf:*central-registry*)
 (asdf:load-system "whistler")
+(in-package #:whistler-user)
 ```
 
 Or use the Makefile to start a REPL with Whistler already loaded:
@@ -35,7 +36,7 @@ Or use the Makefile to start a REPL with Whistler already loaded:
 make repl
 ```
 
-This drops you into the `whistler` package, ready to define maps and
+This drops you into the `whistler-user` package, ready to define maps and
 programs.
 
 ## Loading the userspace loader
@@ -44,10 +45,20 @@ The loader is a separate ASDF system that depends on the compiler:
 
 ```lisp
 (asdf:load-system "whistler/loader")
+(in-package #:whistler-loader-user)
 ```
 
 This gives you `with-bpf-session`, `with-bpf-object`, ring buffer
 consumers, and map accessors -- all in pure Common Lisp.
+
+Or use the Makefile:
+
+```bash
+make repl-loader
+```
+
+This is the most convenient day-to-day workflow for Lisp development:
+compiler, loader, and REPL in one image.
 
 ## Building the CLI binary
 
@@ -78,6 +89,15 @@ Use it to compile BPF source files from the shell:
 ./whistler compile examples/count-xdp.lisp -o count.bpf.o
 ```
 
+Check your local environment before trying to load programs:
+
+```bash
+./whistler doctor
+```
+
+This reports the local kernel version, tool availability, tracefs/BTF
+readability, and any obvious missing capabilities.
+
 ## Running the test suite
 
 Tests require [FiveAM](https://github.com/lispci/fiveam):
@@ -89,8 +109,7 @@ make test
 Or from a REPL:
 
 ```lisp
-(asdf:load-system "whistler/tests")
-(whistler/tests:run-tests)
+(asdf:test-system "whistler")
 ```
 
 The test suite covers ALU operations, memory access, branching, control flow,

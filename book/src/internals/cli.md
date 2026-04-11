@@ -53,9 +53,22 @@ whistler compile my-prog.lisp --gen all
 whistler disasm INPUT
 ```
 
-Disassemble a compiled BPF ELF object file, printing the BPF instructions
-in human-readable form.
+Load a Whistler source file, compile its first program, and print the BPF
+instructions in human-readable form.
 
 ```bash
-whistler disasm my-prog.bpf.o
+whistler disasm my-prog.lisp
 ```
+
+### Doctor
+
+```
+whistler doctor
+```
+
+Run a local environment check for Whistler development. The report includes:
+
+- kernel version
+- whether `sbcl`, `ip`, and `tc` are available
+- whether tracefs and `/sys/kernel/btf/vmlinux` are readable
+- whether `sbcl` or `./whistler` appear to have useful Linux capabilities set

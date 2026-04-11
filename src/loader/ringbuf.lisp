@@ -66,6 +66,25 @@
      :consumer-ptr consumer-ptr :producer-ptr producer-ptr
      :data-ptr data-ptr :epoll-fd epoll-fd :callback callback)))
 
+(defun open-decoding-ring-consumer (map-info decoder callback)
+  "Create a ring buffer consumer that decodes each event before CALLBACK.
+   DECODER receives an octet vector and returns a decoded event object.
+   CALLBACK receives the decoded event."
+  (open-ring-consumer
+   map-info
+   (lambda (sap len)
+     (let ((buf (make-array len :element-type '(unsigned-byte 8))))
+       (dotimes (i len)
+         (setf (aref buf i) (sb-sys:sap-ref-8 sap i)))
+       (funcall callback (funcall decoder buf))))))
+
+(defmacro with-decoding-ring-consumer ((var map-info decoder callback) &body body)
+  "Bind VAR to a decoding ring consumer and ensure it is closed on exit."
+  `(let ((,var (open-decoding-ring-consumer ,map-info ,decoder ,callback)))
+     (unwind-protect
+          (progn ,@body)
+       (close-ring-consumer ,var))))
+
 (defun ring-poll (consumer &key (timeout-ms 100))
   "Wait for ring buffer events, then consume them. Returns event count."
   (let ((event-buf (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)))

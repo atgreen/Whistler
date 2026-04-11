@@ -41,7 +41,7 @@ The program body does two things:
 (require :asdf)
 (push #p"/path/to/whistler/" asdf:*central-registry*)
 (asdf:load-system "whistler")
-(in-package #:whistler)
+(in-package #:whistler-user)
 
 (load "count-xdp.lisp")
 (compile-to-elf "count.bpf.o")
@@ -86,21 +86,25 @@ using `whistler/loader`:
 
 ```lisp
 (asdf:load-system "whistler/loader")
+(in-package #:whistler-loader-user)
 
-(whistler/loader:with-bpf-object ("count.bpf.o")
-  (whistler/loader:attach-xdp "eth0")
+(with-bpf-object (obj "count.bpf.o")
+  (attach-obj-xdp obj "count_packets" "eth0")
+  (let ((counter (bpf-object-map obj "pkt_count")))
   (loop repeat 5
         do (sleep 1)
            (format t "packets: ~d~%"
-                   (whistler/loader:map-lookup "pkt_count" 0))))
+                   (or (map-lookup-int counter 0) 0)))))
 ```
 
 ### Inline session (no intermediate file)
 
-The most concise approach compiles and loads in one form:
+The most Lisp-native approach compiles and loads in one form:
 
 ```lisp
-(whistler/loader:with-bpf-session ()
+(in-package #:whistler-loader-user)
+
+(with-bpf-session ()
   (bpf:map pkt-count :type :array
     :key-size 4 :value-size 8 :max-entries 1)
   (bpf:prog count-packets (:type :xdp :section "xdp" :license "GPL")
@@ -115,6 +119,9 @@ The most concise approach compiles and loads in one form:
 
 The `bpf:` forms compile to eBPF at macroexpand time. The rest is ordinary
 Common Lisp that runs at load time.
+
+For interactive development, prefer this inline-session workflow. Use file
+compilation when you specifically want a `.bpf.o` artifact.
 
 ## What the compiler produces
 

@@ -128,6 +128,22 @@
       (push att (bpf-object-attachments obj))
       att)))
 
+(defun attach-obj-xdp (obj prog-name interface-name &key (mode "xdp"))
+  "Attach an XDP program from a loaded BPF object by program name."
+  (let ((prog (bpf-object-prog obj prog-name)))
+    (unless prog (error "Program ~a not found" prog-name))
+    (let ((att (attach-xdp (prog-info-fd prog) interface-name :mode mode)))
+      (push att (bpf-object-attachments obj))
+      att)))
+
+(defun attach-obj-tc (obj prog-name interface-name &key (direction "ingress"))
+  "Attach a TC program from a loaded BPF object by program name."
+  (let ((prog (bpf-object-prog obj prog-name)))
+    (unless prog (error "Program ~a not found" prog-name))
+    (let ((att (attach-tc (prog-info-fd prog) interface-name :direction direction)))
+      (push att (bpf-object-attachments obj))
+      att)))
+
 (defun attach-obj-cgroup (obj prog-name cgroup-path attach-type &key (flags 0))
   "Attach a cgroup program from a loaded BPF object by program name.
    CGROUP-PATH is the cgroup2 filesystem path.

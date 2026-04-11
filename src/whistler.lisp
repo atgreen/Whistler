@@ -192,29 +192,32 @@
                           accessor-forms)
                     (push `(cl:defsetf ,accessor-name ,writer-name)
                           accessor-forms)))))))
-      ;; Generate CL struct + decoder for userspace byte handling.
-      ;; The CL struct uses the same name as the BPF struct — the CL
-      ;; defstruct accessors (functions) replace the BPF accessors (macros)
-      ;; on the same symbols, which is fine: BPF macros are only used inside
-      ;; bpf:prog bodies compiled at macroexpand time.
-      (let* ((cl-struct-name name)
-             (cl-make-name (intern (format nil "MAKE-~a" (symbol-name name))
-                                   (symbol-package name)))
+      ;; Generate a separate CL record type for userspace byte handling.
+      ;; Keeping the host-side record accessors distinct avoids redefining
+      ;; the BPF accessor macros during normal REPL development.
+      (let* ((cl-struct-name (intern (format nil "~a-RECORD" (symbol-name name))
+                                     (symbol-package name)))
+             (cl-make-name (intern (format nil "MAKE-~a" (symbol-name cl-struct-name))
+                                   (symbol-package cl-struct-name)))
              (decode-name (intern (format nil "DECODE-~a" (symbol-name name))
                                   (symbol-package name)))
              (encode-name (intern (format nil "ENCODE-~a" (symbol-name name))
                                   (symbol-package name)))
-             (cl-slots (mapcar (lambda (f)
-                                 (destructuring-bind (fname ftype foffset fsize) f
-                                   (declare (ignore foffset fsize))
-                                   (multiple-value-bind (elem-type count is-array)
-                                       (parse-field-type ftype)
-                                     (declare (ignore elem-type))
-                                     (let ((slot-name fname))
-                                       (if is-array
-                                           `(,slot-name nil)
-                                           `(,slot-name 0))))))
-                               fields-rev))
+             (cl-slots
+              (mapcar (lambda (f)
+                        (destructuring-bind (fname ftype foffset fsize) f
+                          (declare (ignore foffset fsize))
+                          (multiple-value-bind (elem-type count is-array)
+                              (parse-field-type ftype)
+                            (declare (ignore elem-type count))
+                            (let ((kw (intern (string fname) :keyword))
+                                  (accessor (intern (format nil "~a-~a"
+                                                            (symbol-name cl-struct-name)
+                                                            (symbol-name fname))
+                                                    (symbol-package cl-struct-name))))
+                              `(,fname :initarg ,kw :initform ,(if is-array nil 0)
+                                       :accessor ,accessor)))))
+                      fields-rev))
              (decode-fields
               (mapcar (lambda (f)
                         (destructuring-bind (fname ftype foffset fsize) f
@@ -242,7 +245,7 @@
                             (let ((accessor (intern (format nil "~a-~a"
                                                            (symbol-name cl-struct-name)
                                                            (symbol-name fname))
-                                                   (symbol-package name))))
+                                                   (symbol-package cl-struct-name))))
                               (if is-array
                                   (let ((byte-len (* count (struct-type-byte-size
                                                             (second ftype)))))
@@ -263,8 +266,16 @@
            (cl:defmacro ,make-name ()
              '(struct-alloc ,total))
            ,@(nreverse accessor-forms)
-           ;; CL struct for userspace
-           (cl:defstruct ,cl-struct-name ,@cl-slots)
+           ;; CL record type for userspace
+           (cl:defclass ,cl-struct-name ()
+             ,cl-slots)
+           (cl:defun ,cl-make-name (&key ,@(mapcar #'first fields-rev))
+             (make-instance ',cl-struct-name
+                            ,@(mapcan (lambda (f)
+                                        (let ((kw (intern (string (first f)) :keyword))
+                                              (slot (first f)))
+                                          `(,kw ,slot)))
+                                      fields-rev)))
            ;; Decoder: bytes → CL struct
            (cl:defun ,decode-name (bytes)
              (,cl-make-name ,@(mapcan #'identity decode-fields)))
@@ -648,6 +659,104 @@
       (format stream ";   insn-byte-offset=~d map-index=~d~%"
               (first r) (second r)))))
 
+(defun split-lines (string)
+  "Split STRING into lines."
+  (with-input-from-string (in string)
+    (loop for line = (read-line in nil nil)
+          while line
+          collect line)))
+
+(defun command-output (program args)
+  "Run PROGRAM with ARGS and return trimmed stdout, or nil on failure."
+  (handler-case
+      (string-trim '(#\Space #\Newline #\Return #\Tab)
+                   (with-output-to-string (s)
+                     (uiop:run-program (cons program args)
+                                       :output s
+                                       :ignore-error-status t)))
+    (error () nil)))
+
+(defun file-readable-p (path)
+  "Return true if PATH exists and can be opened for reading."
+  (and (probe-file path)
+       (handler-case
+           (with-open-file (in path :direction :input)
+             (read-char in nil nil)
+             t)
+         (error () nil))))
+
+(defun find-command-path (name)
+  "Return the resolved path for command NAME, or nil if not found."
+  (let ((out (command-output "sh" (list "-lc" (format nil "command -v ~a" name)))))
+    (and out (not (string= out "")) out)))
+
+(defun doctor-check (label ok &optional detail fix)
+  "Print a doctor check line."
+  (format t "~a ~a" (if ok "[ok]" "[warn]") label)
+  (when detail
+    (format t " - ~a" detail))
+  (terpri)
+  (when (and (not ok) fix)
+    (format t "       fix: ~a~%" fix)))
+
+(defun doctor ()
+  "Print local environment checks useful for Whistler development."
+  (let* ((kernel (string-trim '(#\Space #\Newline #\Return #\Tab)
+                              (or (command-output "uname" '("-r")) "unknown")))
+         (sbcl-path (or (find-command-path "sbcl")
+                        "sbcl"))
+         (sbcl-caps (command-output "getcap" (list sbcl-path)))
+         (whistler-caps (when (probe-file "./whistler")
+                          (command-output "getcap" '("./whistler"))))
+         (ip-path (find-command-path "ip"))
+         (tc-path (find-command-path "tc"))
+         (tracefs-dir (or (probe-file "/sys/kernel/tracing/events")
+                          (probe-file "/sys/kernel/debug/tracing/events")))
+         (vmlinux-path "/sys/kernel/btf/vmlinux"))
+    (format t "Whistler doctor~%")
+    (format t "version: ~a~%" *version*)
+    (format t "kernel: ~a~%~%" kernel)
+    (doctor-check "SBCL available"
+                  (not (null (find-command-path "sbcl")))
+                  sbcl-path
+                  "install SBCL and ensure it is on PATH")
+    (doctor-check "SBCL capabilities"
+                  (and sbcl-caps
+                       (or (search "cap_bpf" sbcl-caps :test #'char-equal)
+                           (search "cap_perfmon" sbcl-caps :test #'char-equal)))
+                  (or sbcl-caps "no capabilities found")
+                  (format nil "sudo setcap cap_bpf,cap_perfmon+ep ~a" sbcl-path))
+    (doctor-check "Whistler binary capabilities"
+                  (or (null whistler-caps)
+                      (search "cap_bpf" whistler-caps :test #'char-equal))
+                  (or whistler-caps "binary not built or no capabilities set")
+                  "sudo setcap cap_bpf,cap_perfmon+ep ./whistler")
+    (doctor-check "tracefs available"
+                  tracefs-dir
+                  (and tracefs-dir (namestring tracefs-dir))
+                  "mount tracefs, usually at /sys/kernel/tracing")
+    (doctor-check "vmlinux BTF readable"
+                  (file-readable-p vmlinux-path)
+                  vmlinux-path
+                  "sudo chmod a+r /sys/kernel/btf/vmlinux")
+    (doctor-check "`ip` available"
+                  ip-path
+                  (and ip-path (namestring ip-path))
+                  "install iproute2")
+    (doctor-check "`tc` available"
+                  tc-path
+                  (and tc-path (namestring tc-path))
+                  "install iproute2")
+    (when tracefs-dir
+      (let* ((sample (or (probe-file "/sys/kernel/tracing/events/sched/sched_switch/format")
+                         (probe-file "/sys/kernel/debug/tracing/events/sched/sched_switch/format")))
+             (readable (and sample (file-readable-p sample))))
+        (doctor-check "sample tracepoint format readable"
+                      readable
+                      (and sample (namestring sample))
+                      "sudo chmod a+r /sys/kernel/tracing/events/sched/sched_switch/format")))
+    (format t "~%doctor checks completed.~%")))
+
 ;;; CLI entry point
 
 (defun main ()
@@ -671,6 +780,7 @@
        (format t "~%   compile INPUT [-o OUTPUT] [--gen LANG...]~%")
        (format t "                                  Compile .lisp to .bpf.o ELF object~%")
        (format t "   disasm INPUT                   Disassemble to stdout~%")
+       (format t "   doctor                         Check local eBPF dev prerequisites~%")
        (format t "   version                        Show version information~%")
        (format t "~%Compile options:~%")
        (format t "   -o FILE                        Output .bpf.o path~%")
@@ -743,6 +853,9 @@
                (declare (ignore name))
                (let ((cu (compile-program section license maps body)))
                  (disassemble-cu cu)))))))
+
+      ((string= (first args) "doctor")
+       (doctor))
 
       (t
        (format *error-output* "Unknown command: ~a~%" (first args))

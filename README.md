@@ -53,6 +53,15 @@ around eBPF itself.
 
 ## Getting started
 
+For Common Lisp work, the intended default is the interactive loader workflow:
+
+1. `make repl-loader`
+2. Work in the `whistler-loader-user` package
+3. Use `with-bpf-session` to compile, load, attach, and inspect from one image
+
+Use the CLI when you want a `.bpf.o` artifact for CI, packaging, or external
+tooling.
+
 ### Requirements
 
 - [SBCL](http://www.sbcl.org/) (Steel Bank Common Lisp) 2.0+
@@ -64,7 +73,9 @@ around eBPF itself.
 ```sh
 make        # build standalone binary
 make test   # run test suite (requires FiveAM)
-make repl   # interactive REPL with Whistler loaded
+make repl   # compiler REPL in whistler-user
+make repl-loader  # compiler + loader REPL in whistler-loader-user
+./whistler doctor  # check local eBPF dev prerequisites
 ```
 
 ### Compile an example

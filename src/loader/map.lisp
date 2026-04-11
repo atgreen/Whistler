@@ -74,6 +74,58 @@
               nil
               (error e)))))))
 
+(defun map-lookup-int (info key)
+  "Look up integer KEY in INFO and decode the value as a little-endian integer."
+  (let ((result (map-lookup info (encode-int-key key (map-info-key-size info)))))
+    (when result
+      (decode-int-value result))))
+
+(defun struct-codec-function (prefix struct-name)
+  "Resolve PREFIX-STRUCT-NAME in the same package as STRUCT-NAME."
+  (let* ((pkg (or (and (symbolp struct-name) (symbol-package struct-name))
+                  *package*))
+         (sym-name (if (symbolp struct-name)
+                       (symbol-name struct-name)
+                       (string-upcase (string struct-name))))
+         (codec-name (format nil "~a-~a" prefix sym-name))
+         (sym (find-symbol codec-name pkg)))
+    (unless (and sym (fboundp sym))
+      (error "No ~a function found for ~a in package ~a"
+             prefix struct-name (package-name pkg)))
+    (symbol-function sym)))
+
+(defun map-lookup-struct (info key-bytes struct-name)
+  "Look up KEY-BYTES in INFO and decode the value using STRUCT-NAME's decoder."
+  (let ((result (map-lookup info key-bytes)))
+    (when result
+      (funcall (struct-codec-function "DECODE" struct-name) result))))
+
+(defun map-lookup-struct-int (info key struct-name)
+  "Look up integer KEY in INFO and decode the value using STRUCT-NAME's decoder."
+  (map-lookup-struct info
+                     (encode-int-key key (map-info-key-size info))
+                     struct-name))
+
+(defun map-update-int (info key value &key (flags 0))
+  "Update integer KEY with integer VALUE using INFO's declared sizes."
+  (map-update info
+              (encode-int-key key (map-info-key-size info))
+              (encode-int-key value (map-info-value-size info))
+              :flags flags))
+
+(defun map-update-struct (info key-bytes record struct-name &key (flags 0))
+  "Update KEY-BYTES in INFO with RECORD encoded via STRUCT-NAME's encoder."
+  (map-update info key-bytes
+              (funcall (struct-codec-function "ENCODE" struct-name) record)
+              :flags flags))
+
+(defun map-update-struct-int (info key record struct-name &key (flags 0))
+  "Update integer KEY in INFO with RECORD encoded via STRUCT-NAME's encoder."
+  (map-update-struct info
+                     (encode-int-key key (map-info-key-size info))
+                     record struct-name
+                     :flags flags))
+
 (defun map-update (info key-bytes value-bytes &key (flags 0))
   "Update a key/value pair in a BPF map.
    For percpu maps, VALUE-BYTES must be a vector of per-CPU value byte arrays
@@ -120,6 +172,15 @@
       (put-ptr buf 8 (sb-sys:vector-sap key-bytes))
       (%bpf +bpf-map-delete-elem+ buf 40 "map-delete"))))
 
+(defun map-delete-int (info key)
+  "Delete integer KEY from INFO."
+  (map-delete info (encode-int-key key (map-info-key-size info))))
+
+(defun map-delete-struct (info record struct-name)
+  "Delete RECORD encoded as a key using STRUCT-NAME's encoder."
+  (map-delete info
+              (funcall (struct-codec-function "ENCODE" struct-name) record)))
+
 (defun map-get-next-key (info key-bytes)
   "Get the next key after KEY-BYTES. If KEY-BYTES is nil, returns the first key.
    Returns nil when there are no more keys."
@@ -139,6 +200,23 @@
           (if (= (bpf-error-errno e) 2)  ; ENOENT
               nil
               (error e)))))))
+
+(defun map-get-next-key-int (info &optional key)
+  "Return the next integer key after KEY, or the first key if KEY is nil."
+  (let ((next (map-get-next-key info
+                                (when key
+                                  (encode-int-key key (map-info-key-size info))))))
+    (when next
+      (decode-int-value next))))
+
+(defun map-get-next-key-struct (info struct-name &optional key-record)
+  "Return the next struct key after KEY-RECORD decoded via STRUCT-NAME."
+  (let ((next (map-get-next-key info
+                                (when key-record
+                                  (funcall (struct-codec-function "ENCODE" struct-name)
+                                           key-record)))))
+    (when next
+      (funcall (struct-codec-function "DECODE" struct-name) next))))
 
 ;;; ========== Extract map definitions from ELF ==========
 

@@ -158,3 +158,7 @@
            #:kernel-load
            ;; Typed kernel struct pointers
            #:typed-ptr #:strip-typed-ptr #:check-struct-ptr-type))
+
+(defpackage #:whistler-user
+  (:use #:cl #:whistler)
+  (:shadowing-import-from #:whistler #:incf #:decf #:case #:defstruct))

@@ -98,8 +98,25 @@
 
 ;;; ========== Session runtime ==========
 
+(defvar *bpf-session* nil
+  "Dynamically bound to the active inline BPF session.")
+
 (defstruct bpf-session
   maps progs attachments)
+
+(defun bpf-session-map (name &optional (session *bpf-session*))
+  "Find a map by NAME in SESSION."
+  (cdr (assoc (string-downcase
+               (substitute #\_ #\- (string name)))
+              (bpf-session-maps session)
+              :test #'string=)))
+
+(defun bpf-session-prog (name &optional (session *bpf-session*))
+  "Find a program by NAME in SESSION."
+  (cdr (assoc (string-downcase
+               (substitute #\_ #\- (string name)))
+              (bpf-session-progs session)
+              :test #'string=)))
 
 (defun session-create-maps (map-specs)
   "Create all maps from compiled specs. Returns name→map-info alist."

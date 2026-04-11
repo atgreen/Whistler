@@ -120,10 +120,10 @@ On the Common Lisp userspace side, `defstruct` generates:
 ### Record Struct
 
 ```lisp
-NAME
+NAME-RECORD
 ```
 
-A standard CL `defstruct` with a slot for each field. Array fields become
+A standard CL record type with a slot for each field. Array fields become
 CL vectors.
 
 ### Decoder
@@ -133,7 +133,7 @@ CL vectors.
 ```
 
 Parses a byte vector (or a subrange starting at `offset`) into a
-`NAME` instance. This is used when reading data from maps or ring
+`NAME-RECORD` instance. This is used when reading data from maps or ring
 buffers.
 
 ### Encoder
@@ -183,13 +183,13 @@ needed since the largest field alignment is 4).
   (lambda (data size)
     (let ((evt (decode-my-event data)))
       (format t "pid=~A comm=~A~%"
-              (my-event-pid evt)
+              (my-event-record-pid evt)
               (map 'string #'code-char
-                   (my-event-comm evt))))))
+                   (my-event-record-comm evt))))))
 
 ;; Creating and encoding a record manually
-(let ((rec (make-my-event :pid 1234
-                                  :comm (make-array 16 :element-type '(unsigned-byte 8))
-                                  :data (make-array 64 :element-type '(unsigned-byte 8)))))
+(let ((rec (make-my-event-record :pid 1234
+                                 :comm (make-array 16 :element-type '(unsigned-byte 8))
+                                 :data (make-array 64 :element-type '(unsigned-byte 8)))))
   (encode-my-event rec))
 ```

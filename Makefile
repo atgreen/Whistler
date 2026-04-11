@@ -1,7 +1,7 @@
 SBCL ?= sbcl
 SBCL_FLAGS = --noinform --non-interactive
 
-.PHONY: all test test-torture check clean examples repl
+.PHONY: all test test-torture check clean examples repl repl-loader
 
 all: whistler
 
@@ -40,7 +40,15 @@ repl:
 		--eval '(require :asdf)' \
 		--eval '(push #p"./" asdf:*central-registry*)' \
 		--eval '(asdf:load-system "whistler")' \
-		--eval '(in-package #:whistler)'
+		--eval '(in-package #:whistler-user)'
+
+# Interactive REPL with compiler and loader loaded
+repl-loader:
+	$(SBCL) --noinform \
+		--eval '(require :asdf)' \
+		--eval '(push #p"./" asdf:*central-registry*)' \
+		--eval '(asdf:load-system "whistler/loader")' \
+		--eval '(in-package #:whistler-loader-user)'
 
 clean:
 	rm -f whistler

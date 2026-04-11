@@ -57,32 +57,22 @@ or `nil`:
 
 ## Package setup
 
-Since `bpf:prog` body forms are written in your package but need Whistler
-symbols, use `shadowing-import-from` to pull in Whistler's versions of
-shadowed CL symbols:
+The easiest setup is to work in `whistler-loader-user`, which already imports
+the compiler and loader entry points with the right shadowing in place:
 
 ```lisp
-(defpackage #:my-tracer
-  (:use #:cl #:whistler #:whistler/loader)
-  (:shadowing-import-from #:whistler #:incf #:decf)
-  (:shadowing-import-from #:cl #:case #:defstruct))
+(asdf:load-system "whistler/loader")
+(in-package #:whistler-loader-user)
 ```
 
-The session macro automatically re-interns symbols into the Whistler
-package where same-named symbols exist, so `incf`, `getmap`, etc. work
-correctly in `bpf:prog` bodies.
+If you want your own application package, use `whistler-loader-user` as the
+reference layout instead of rebuilding the package story from scratch.
 
 ## Kprobe example
 
 ```lisp
 (asdf:load-system "whistler/loader")
-
-(defpackage #:my-tracer
-  (:use #:cl #:whistler #:whistler/loader)
-  (:shadowing-import-from #:whistler #:incf #:decf)
-  (:shadowing-import-from #:cl #:case #:defstruct))
-
-(in-package #:my-tracer)
+(in-package #:whistler-loader-user)
 
 (whistler:defstruct call-event
   (pid u32)
@@ -101,17 +91,13 @@ correctly in `bpf:prog` bodies.
 
   (bpf:attach trace-exec "__x64_sys_execve")
 
-  (let ((consumer (open-ring-consumer
-                   (cdr (assoc "events" (bpf-session-maps *bpf-session*)
-                               :test #'string=))
-                   (lambda (sap len)
-                     (let ((buf (make-array len :element-type '(unsigned-byte 8))))
-                       (dotimes (i len)
-                         (setf (aref buf i) (sb-sys:sap-ref-8 sap i)))
-                       (let ((ev (decode-call-event buf)))
-                         (format t "exec pid=~d ts=~d~%"
-                                 (call-event-pid ev)
-                                 (call-event-ts ev))))))))
+  (let ((consumer (open-decoding-ring-consumer
+                   (bpf-session-map 'events)
+                   #'decode-call-event
+                   (lambda (ev)
+                     (format t "exec pid=~d ts=~d~%"
+                             (call-event-record-pid ev)
+                             (call-event-record-ts ev))))))
     (unwind-protect
          (loop (ring-poll consumer :timeout-ms 1000))
       (close-ring-consumer consumer))))

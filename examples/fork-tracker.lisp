@@ -18,12 +18,7 @@
 
 (asdf:load-system "whistler/loader")
 
-(defpackage #:fork-tracker
-  (:use #:cl #:whistler #:whistler/loader)
-  (:shadowing-import-from #:whistler #:incf #:decf)
-  (:shadowing-import-from #:cl #:case #:defstruct))
-
-(in-package #:fork-tracker)
+(in-package #:whistler-loader-user)
 
 (whistler:deftracepoint sched/sched-process-fork parent-pid child-pid)
 
@@ -45,8 +40,7 @@
     (handler-case
         (loop (sleep 1))
       (sb-sys:interactive-interrupt ()
-        (let ((m (cdr (assoc "ppid_map" (bpf-session-maps *bpf-session*)
-                             :test #'string=)))
+        (let ((m (bpf-session-map 'ppid-map))
               (count 0))
           (format t "~&~%~10a  ~10a~%" "CHILD PID" "PARENT PID")
           (format t "~10a  ~10a~%" "---------" "----------")

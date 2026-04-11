@@ -83,6 +83,30 @@
       (load (merge-pathnames "examples/runqlat.lisp"
                              (asdf:system-source-directory :whistler))))))
 
+(test session-name-lookup-helpers
+  "Session helpers should resolve Lisp and ELF-style names."
+  (let* ((map-info (whistler/loader::make-map-info :name "pkt_count"))
+         (prog-info (whistler/loader::make-prog-info :name "count_packets"))
+         (session (whistler/loader::make-bpf-session
+                   :maps (list (cons "pkt_count" map-info))
+                   :progs (list (cons "count_packets" prog-info)))))
+    (is (eq map-info (whistler/loader:bpf-session-map 'pkt-count session)))
+    (is (eq map-info (whistler/loader:bpf-session-map "pkt_count" session)))
+    (is (eq prog-info (whistler/loader:bpf-session-prog 'count-packets session)))
+    (is (eq prog-info (whistler/loader:bpf-session-prog "count_packets" session)))))
+
+(test with-decoding-ring-consumer-macroexpands
+  "with-decoding-ring-consumer should expand to open/close lifecycle code."
+  (let ((expansion (macroexpand-1
+                    '(whistler/loader:with-decoding-ring-consumer
+                         (consumer map-info #'decode-thing #'handle-thing)
+                       (ring-poll consumer)))))
+    (is (equal 'let (car expansion)))
+    (is (not (null (search "OPEN-DECODING-RING-CONSUMER"
+                           (prin1-to-string expansion)))))
+    (is (not (null (search "CLOSE-RING-CONSUMER"
+                           (prin1-to-string expansion)))))))
+
 ;;; ========== ELF structure validation ==========
 
 (test elf-has-license-section

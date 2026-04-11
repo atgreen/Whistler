@@ -4,6 +4,7 @@
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ()
+  :in-order-to ((test-op (test-op "whistler/tests")))
   :build-operation "program-op"
   :build-pathname "../whistler"
   :entry-point "whistler:main"

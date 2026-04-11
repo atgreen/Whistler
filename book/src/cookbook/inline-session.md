@@ -7,13 +7,7 @@ event consumption in a single Lisp file, with no separate compilation step.
 
 ```lisp
 (asdf:load-system "whistler/loader")
-
-(defpackage #:my-tracer
-  (:use #:cl #:whistler #:whistler/loader)
-  (:shadowing-import-from #:whistler #:incf #:decf)
-  (:shadowing-import-from #:cl #:case #:defstruct))
-
-(in-package #:my-tracer)
+(in-package #:whistler-loader-user)
 
 ;;; Struct definition -- generates both BPF and CL sides
 (whistler:defstruct call-event
@@ -37,23 +31,17 @@ event consumption in a single Lisp file, with no separate compilation step.
     ;; Userspace side (runs at runtime)
     (bpf:attach trace-exec "__x64_sys_execve")
 
-    (let ((consumer (open-ring-consumer
-                     (cdr (assoc "events" (bpf-session-maps *bpf-session*)
-                                 :test #'string=))
-                     (lambda (sap len)
-                       (let ((buf (make-array len :element-type '(unsigned-byte 8))))
-                         (dotimes (i len)
-                           (setf (aref buf i) (sb-sys:sap-ref-8 sap i)))
-                         (let ((ev (decode-call-event buf)))
-                           (format t "exec pid=~d ts=~d~%"
-                                   (call-event-pid ev)
-                                   (call-event-ts ev))))))))
-      (unwind-protect
-           (handler-case
-               (loop (ring-poll consumer :timeout-ms 1000))
-             (sb-sys:interactive-interrupt ()
-               (format t "~&Detaching.~%")))
-        (close-ring-consumer consumer)))))
+    (with-decoding-ring-consumer (consumer
+                                  (bpf-session-map 'events)
+                                  #'decode-call-event
+                                  (lambda (ev)
+                                    (format t "exec pid=~d ts=~d~%"
+                                            (call-event-record-pid ev)
+                                            (call-event-record-ts ev))))
+      (handler-case
+          (loop (ring-poll consumer :timeout-ms 1000))
+        (sb-sys:interactive-interrupt ()
+          (format t "~&Detaching.~%"))))))
 
 (run)
 ```
@@ -68,24 +56,21 @@ sudo sbcl --load my-tracer.lisp
 
 - **Lifecycle**: `with-bpf-session` manages the full BPF lifecycle. Maps,
   programs, and attachments are created on entry and cleaned up on exit.
-  The `unwind-protect` around the ring consumer ensures it is closed even
-  on Ctrl-C.
+  `with-decoding-ring-consumer` handles ring consumer cleanup even on Ctrl-C.
 
 - **bpf: prefix**: `bpf:map` and `bpf:prog` are compiled at macroexpand
   time. `bpf:attach` and `bpf:map-ref` expand to runtime loader calls.
   Everything else is plain CL code that runs at load time.
 
-- **Shadowing**: The package definition uses `shadowing-import-from` to
-  resolve symbol conflicts between CL and Whistler. Whistler redefines
-  `incf` (to support map atomic increment) and `decf`. The
-  `(:shadowing-import-from #:cl #:case #:defstruct)` keeps the CL
-  versions for userspace code, while the Whistler versions are used
-  inside `bpf:prog` bodies via automatic re-interning.
+- **Package setup**: `whistler-loader-user` is the intended default
+  package for interactive work. It already imports the compiler and
+  loader symbols with the right shadowing in place.
 
 - **Map access**: `*bpf-session*` is a special variable bound during the
-  session. Look up maps by name (underscored) with:
+  session. Use `bpf-session-map` for named lookup:
   ```lisp
-  (cdr (assoc "events" (bpf-session-maps *bpf-session*) :test #'string=))
+  (bpf-session-map 'events)
   ```
   For simple integer reads, `(bpf:map-ref map-name key)` is more
-  convenient.
+  convenient. For struct-valued maps, use `map-lookup-struct-int` and
+  `map-update-struct-int` with the generated record codecs.

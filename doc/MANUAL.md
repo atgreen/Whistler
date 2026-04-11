@@ -168,7 +168,7 @@ Generates for BPF:
 
 Generates for CL userspace:
 
-- `NAME-RECORD` — CL `defstruct` with matching slots.
+- `NAME-RECORD` — CL record type with matching slots.
 - `(decode-NAME bytes)` — Decode a byte array into a `NAME-RECORD` struct.
 - `(encode-NAME record)` — Encode a `NAME-RECORD` back to bytes.
 - `(NAME-RECORD-FIELD record)` — Standard CL struct accessors.
@@ -1033,7 +1033,8 @@ Key points:
   exit. If the reserve fails (buffer full), the body is skipped.
 - `sizeof` is a compile-time constant — no runtime cost.
 - The same `defstruct` drives both the BPF accessors and the CL-side
-  `decode-conn-event` for reading events in userspace.
+  `decode-conn-event` / `conn-event-record-*` accessors for reading
+  events in userspace.
 
 ### Kernel struct traversal
 

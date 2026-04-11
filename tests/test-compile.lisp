@@ -112,6 +112,34 @@
         (when (probe-file path)
           (delete-file path))))))
 
+(test defstruct-generates-distinct-host-record
+  "defstruct should keep host-side record accessors distinct from BPF accessors"
+  (let ((whistler::*struct-defs* (make-hash-table :test 'equal)))
+    (eval-whistler "(defstruct sample-event
+                      (pid u32)
+                      (port u16)
+                      (comm (array u8 4)))")
+    (is (not (null (macro-function 'whistler::sample-event-pid)))
+        "BPF accessor should remain a macro")
+    (is (fboundp 'whistler::decode-sample-event)
+        "Decoder should be defined")
+    (is (fboundp 'whistler::make-sample-event-record)
+        "Host-side record constructor should be defined")
+    (let* ((bytes #(42 0 0 0 57 48 65 66 67 68 0 0))
+           (decode (symbol-function 'whistler::decode-sample-event))
+           (encode (symbol-function 'whistler::encode-sample-event))
+           (pid (symbol-function 'whistler::sample-event-record-pid))
+           (port (symbol-function 'whistler::sample-event-record-port))
+           (comm (symbol-function 'whistler::sample-event-record-comm))
+           (rec (funcall decode bytes)))
+      (is (typep rec 'whistler::sample-event-record)
+          "Decoder should return the host-side record type")
+      (is (= 42 (funcall pid rec)))
+      (is (= 12345 (funcall port rec)))
+      (is (equalp #(65 66 67 68) (funcall comm rec)))
+      (is (equalp bytes (funcall encode rec))
+          "encode/decode should round-trip"))))
+
 ;;; ========== Integration: full program compilation ==========
 
 (test count-xdp-compiles
@@ -143,3 +171,80 @@
     (finishes
       (load (merge-pathnames "examples/synflood-xdp.lisp"
                              (asdf:system-source-directory :whistler))))))
+
+(test doctor-prints-report
+  "doctor should emit a recognizable report."
+  (let ((out (with-output-to-string (s)
+               (let ((*standard-output* s))
+                 (whistler::doctor)))))
+    (is (not (null (search "Whistler doctor" out))))
+    (is (not (null (search "doctor checks completed" out))))))
+
+(test typed-struct-map-helpers
+  "Struct-valued map helpers should use generated encode/decode functions."
+  (let ((whistler::*struct-defs* (make-hash-table :test 'equal)))
+    (eval-whistler "(defstruct stat-entry
+                      (packets u64)
+                      (drops u64))")
+    (let* ((map-info (whistler/loader::make-map-info
+                      :name "stats" :key-size 4 :value-size 16))
+           (record (whistler::make-stat-entry-record :packets 10 :drops 2))
+           (encoded (whistler::encode-stat-entry record))
+           (orig-update (symbol-function 'whistler/loader:map-update))
+           (orig-lookup (symbol-function 'whistler/loader:map-lookup)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'whistler/loader:map-update)
+                   (lambda (info key-bytes value-bytes &key (flags 0))
+                     (declare (ignore flags))
+                     (is (eq map-info info))
+                     (is (equalp #(0 0 0 0) key-bytes))
+                     (is (equalp encoded value-bytes))
+                     :ok))
+             (is (eq :ok (whistler/loader:map-update-struct-int
+                          map-info 0 record 'whistler::stat-entry)))
+             (setf (symbol-function 'whistler/loader:map-lookup)
+                   (lambda (info key-bytes)
+                     (is (eq map-info info))
+                     (is (equalp #(0 0 0 0) key-bytes))
+                     encoded))
+             (let ((decoded (whistler/loader:map-lookup-struct-int
+                             map-info 0 'whistler::stat-entry)))
+               (is (= 10 (whistler::stat-entry-record-packets decoded)))
+               (is (= 2 (whistler::stat-entry-record-drops decoded)))))
+        (setf (symbol-function 'whistler/loader:map-update) orig-update
+              (symbol-function 'whistler/loader:map-lookup) orig-lookup)))))
+
+(test typed-struct-key-helpers
+  "Struct-key helpers should use generated key codecs."
+  (let ((whistler::*struct-defs* (make-hash-table :test 'equal)))
+    (eval-whistler "(defstruct flow-key
+                      (src u32)
+                      (dst u32))")
+    (let* ((map-info (whistler/loader::make-map-info
+                      :name "flows" :key-size 8 :value-size 8))
+           (key-rec (whistler::make-flow-key-record :src 1 :dst 2))
+           (encoded-key (whistler::encode-flow-key key-rec))
+           (orig-delete (symbol-function 'whistler/loader:map-delete))
+           (orig-next (symbol-function 'whistler/loader:map-get-next-key)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'whistler/loader:map-delete)
+                   (lambda (info key-bytes)
+                     (is (eq map-info info))
+                     (is (equalp encoded-key key-bytes))
+                     :deleted))
+             (is (eq :deleted
+                     (whistler/loader:map-delete-struct
+                      map-info key-rec 'whistler::flow-key)))
+             (setf (symbol-function 'whistler/loader:map-get-next-key)
+                   (lambda (info key-bytes)
+                     (is (eq map-info info))
+                     (is (equalp encoded-key key-bytes))
+                     encoded-key))
+             (let ((decoded (whistler/loader:map-get-next-key-struct
+                             map-info 'whistler::flow-key key-rec)))
+               (is (= 1 (whistler::flow-key-record-src decoded)))
+               (is (= 2 (whistler::flow-key-record-dst decoded)))))
+        (setf (symbol-function 'whistler/loader:map-delete) orig-delete
+              (symbol-function 'whistler/loader:map-get-next-key) orig-next)))))

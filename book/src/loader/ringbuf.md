@@ -23,6 +23,26 @@ epoll for efficient waiting.
 
 ## API
 
+### open-decoding-ring-consumer
+
+```lisp
+(open-decoding-ring-consumer map-info decoder callback) -> ring-consumer
+```
+
+Creates a ring buffer consumer that copies each event into an octet vector,
+decodes it with `decoder`, and passes the decoded object to `callback`.
+Use this when your ring buffer holds `defstruct`-defined records.
+
+### with-decoding-ring-consumer
+
+```lisp
+(with-decoding-ring-consumer (consumer map-info decoder callback)
+  body...)
+```
+
+Convenience macro that opens a decoding ring consumer, binds it to
+`consumer`, and guarantees cleanup with `unwind-protect`.
+
 ### open-ring-consumer
 
 ```lisp
@@ -57,17 +77,16 @@ Unmaps memory and closes the epoll FD. Always call this on cleanup.
 ## Reading structured events
 
 When your BPF program writes a `defstruct`-defined struct to the ring
-buffer, use the auto-generated decoder:
+buffer, use the higher-level decoding helper:
 
 ```lisp
 ;; Given: (defstruct conn-event (src-addr u32) (dst-addr u32) (port u16))
-;; Whistler generates: decode-conn-event, conn-event-src-addr, etc.
+;; Whistler generates: decode-conn-event, conn-event-record-src-addr, etc.
 
-(open-ring-consumer map-info
-  (lambda (sap len)
-    (let ((buf (make-array len :element-type '(unsigned-byte 8))))
-      (dotimes (i len) (setf (aref buf i) (sb-sys:sap-ref-8 sap i)))
-      (let ((ev (decode-conn-event buf)))
-        (format t "~a:~d~%" (conn-event-src-addr ev)
-                             (conn-event-port ev))))))
+(open-decoding-ring-consumer
+ map-info
+ #'decode-conn-event
+ (lambda (ev)
+   (format t "~a:~d~%" (conn-event-record-src-addr ev)
+                        (conn-event-record-port ev))))
 ```
