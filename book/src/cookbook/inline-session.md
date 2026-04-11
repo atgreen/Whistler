@@ -46,8 +46,8 @@ event consumption in a single Lisp file, with no separate compilation step.
                            (setf (aref buf i) (sb-sys:sap-ref-8 sap i)))
                          (let ((ev (decode-call-event buf)))
                            (format t "exec pid=~d ts=~d~%"
-                                   (call-event-record-pid ev)
-                                   (call-event-record-ts ev))))))))
+                                   (call-event-pid ev)
+                                   (call-event-ts ev))))))))
       (unwind-protect
            (handler-case
                (loop (ring-poll consumer :timeout-ms 1000))

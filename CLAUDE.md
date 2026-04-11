@@ -67,7 +67,7 @@ Key forms: `let` (parallel bindings, standard CL), `let*` (sequential bindings),
 
 `setf` supports CL-style multi-pair: `(setf place1 val1 place2 val2 ...)`. `defmap` defaults `:key-size` and `:value-size` to 0 (omit for ringbuf maps).
 
-`defstruct` generates BPF accessors `(name-field ptr)`, `setf` expanders, indexed array access, and pointer accessors `(name-field-ptr ptr)`. Also generates CL-side: `name-record` struct, `decode-name` (bytes→struct), `encode-name` (struct→bytes). `(sizeof name)` returns compile-time struct size. Maps support `(getmap m k)` / `(setf (getmap m k) v)` / `(remmap m k)` — matching CL's gethash/remhash pattern.
+`defstruct` generates BPF accessors `(name-field ptr)`, `setf` expanders, indexed array access, and pointer accessors `(name-field-ptr ptr)`. Also generates CL-side: `name` struct with `(name-field instance)` accessors, `decode-name` (bytes→struct), `encode-name` (struct→bytes). The CL accessors use the same names as the BPF accessors. `(sizeof name)` returns compile-time struct size. Maps support `(getmap m k)` / `(setf (getmap m k) v)` / `(remmap m k)` — matching CL's gethash/remhash pattern.
 
 `with-ringbuf` handles reserve/null-check/submit: `(with-ringbuf (var map size) body...)`. `fill-process-info` fills pid/uid/timestamp/comm from BPF helpers using struct accessor names.
 

@@ -26,6 +26,6 @@ single ELF object.
 [defstruct](./defstruct.md) declares a C-compatible struct layout used on
 both the BPF side and the Common Lisp userspace side. On the BPF side the
 compiler generates constructors, field accessors, and `sizeof`. On the CL
-side it generates a corresponding record struct with `encode` and `decode`
+side it generates a corresponding CL struct with `encode` and `decode`
 functions, so you can pack and unpack data exchanged through maps or ring
 buffers without manual byte wrangling.

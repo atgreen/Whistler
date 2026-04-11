@@ -61,13 +61,13 @@ buffer, use the auto-generated decoder:
 
 ```lisp
 ;; Given: (defstruct conn-event (src-addr u32) (dst-addr u32) (port u16))
-;; Whistler generates: decode-conn-event, conn-event-record-src-addr, etc.
+;; Whistler generates: decode-conn-event, conn-event-src-addr, etc.
 
 (open-ring-consumer map-info
   (lambda (sap len)
     (let ((buf (make-array len :element-type '(unsigned-byte 8))))
       (dotimes (i len) (setf (aref buf i) (sb-sys:sap-ref-8 sap i)))
       (let ((ev (decode-conn-event buf)))
-        (format t "~a:~d~%" (conn-event-record-src-addr ev)
-                             (conn-event-record-port ev))))))
+        (format t "~a:~d~%" (conn-event-src-addr ev)
+                             (conn-event-port ev))))))
 ```

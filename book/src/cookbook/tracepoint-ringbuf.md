@@ -10,7 +10,7 @@ userspace through a ring buffer.
 
 ;;; Event struct -- shared between BPF and userspace.
 ;;; defstruct generates both BPF accessor macros and CL-side codec
-;;; (decode-conn-event -> conn-event-record struct).
+;;; (decode-conn-event -> conn-event struct).
 (defstruct conn-event
   (src-addr  u32)
   (dst-addr  u32)

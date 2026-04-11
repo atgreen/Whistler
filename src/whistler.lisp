@@ -192,10 +192,13 @@
                           accessor-forms)
                     (push `(cl:defsetf ,accessor-name ,writer-name)
                           accessor-forms)))))))
-      ;; Generate CL struct + decoder for userspace byte handling
-      (let* ((cl-struct-name (intern (format nil "~a-RECORD" (symbol-name name))
-                                     (symbol-package name)))
-             (cl-make-name (intern (format nil "MAKE-~a-RECORD" (symbol-name name))
+      ;; Generate CL struct + decoder for userspace byte handling.
+      ;; The CL struct uses the same name as the BPF struct — the CL
+      ;; defstruct accessors (functions) replace the BPF accessors (macros)
+      ;; on the same symbols, which is fine: BPF macros are only used inside
+      ;; bpf:prog bodies compiled at macroexpand time.
+      (let* ((cl-struct-name name)
+             (cl-make-name (intern (format nil "MAKE-~a" (symbol-name name))
                                    (symbol-package name)))
              (decode-name (intern (format nil "DECODE-~a" (symbol-name name))
                                   (symbol-package name)))
