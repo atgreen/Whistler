@@ -49,7 +49,7 @@
       ;; Map fd loads — helper setup, can be redone
       (:map-fd (values :helper-setup nil nil))
       ;; Map operations produce important results
-      ((:map-lookup :map-lookup-ptr :map-lookup-delete :ringbuf-reserve)
+      ((:map-lookup :map-lookup-ptr :ringbuf-reserve)
        (values :hot-scalar nil nil))
       ;; Add with immediate — recomputable if base is still live
       (:add
@@ -201,7 +201,7 @@
     (dolist (block (ir-program-blocks prog))
       (dolist (insn (basic-block-insns block))
         (when (member (ir-insn-op insn)
-                      '(:map-lookup :map-lookup-ptr :map-lookup-delete
+                      '(:map-lookup :map-lookup-ptr
                         :map-update :map-update-ptr :map-delete :map-delete-ptr))
           (let ((map-arg (first (ir-insn-args insn))))
             (declare (ignore map-arg))

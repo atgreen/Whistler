@@ -89,7 +89,7 @@
   (member (ir-insn-op insn)
           '(:call :tail-call :store :stack-store :atomic-add
             :map-update :map-update-ptr :map-delete :map-delete-ptr
-            :map-lookup-delete :struct-alloc :br :br-cond :ret
+            :struct-alloc :br :br-cond :ret
             :ringbuf-reserve :ringbuf-submit :ringbuf-discard)))
 
 ;;; ========== Call-like operations and helper-effect classification ==========
@@ -107,7 +107,7 @@
 
 (defun call-like-op-p (op)
   "Is OP a call-like operation that clobbers caller-saved registers?"
-  (member op '(:call :tail-call :map-lookup :map-lookup-delete
+  (member op '(:call :tail-call :map-lookup
                :map-update :map-update-ptr
                :map-delete :map-delete-ptr
                :map-lookup-ptr
@@ -128,9 +128,9 @@
                               (cadr first-arg)
                               first-arg))))
          (case helper-id
-           ;; Map helpers (1, 2, 3, 46): clobber caller-saved,
+           ;; Map helpers (1, 2, 3): clobber caller-saved,
            ;; invalidate map value pointers (lookup returns new ptr)
-           ((1 2 3 46)
+           ((1 2 3)
             '(:clobbers-caller-saved :invalidates-map-value-ptrs))
            ;; Packet-modifying helpers: also invalidate packet pointers
            ;; 44=xdp_adjust_head, 56=xdp_adjust_tail,
@@ -151,7 +151,7 @@
               :invalidates-map-value-ptrs)))))
       ;; Map-* IR ops: these lower to helper calls that clobber regs
       ;; and invalidate prior map value pointers
-      ((member op '(:map-lookup :map-lookup-delete
+      ((member op '(:map-lookup
                     :map-update :map-update-ptr
                     :map-delete :map-delete-ptr
                     :map-lookup-ptr))

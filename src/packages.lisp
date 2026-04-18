@@ -50,7 +50,7 @@
    #:+bpf-func-map-delete-elem+ #:+bpf-func-ktime-get-ns+
    #:+bpf-func-trace-printk+ #:+bpf-func-get-prandom-u32+
    #:+bpf-func-get-smp-processor-id+
-   #:+bpf-func-redirect+ #:+bpf-func-map-lookup-and-delete-elem+
+   #:+bpf-func-redirect+
    ;; XDP return codes
    #:+xdp-aborted+ #:+xdp-drop+ #:+xdp-pass+ #:+xdp-tx+ #:+xdp-redirect+
    ;; Instruction struct

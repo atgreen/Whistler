@@ -282,7 +282,7 @@
     (dolist (block (ir-program-blocks prog))
       (dolist (insn (basic-block-insns block))
         (when (member (ir-insn-op insn) '(:map-lookup :map-lookup-ptr
-                                          :map-lookup-delete :tail-call
+                                          :tail-call
                                           :map-update :map-update-ptr
                                           :map-delete :map-delete-ptr
                                           :ringbuf-reserve))
@@ -474,7 +474,6 @@
      ((eq op :map-lookup)(emit-map-lookup-insn ctx dst args))
      ((eq op :map-lookup-ptr)(emit-map-lookup-ptr-insn ctx dst args))
      ((eq op :struct-alloc)(emit-struct-alloc-insn ctx dst args))
-     ((eq op :map-lookup-delete)(emit-map-lookup-delete-insn ctx dst args))
      ((eq op :map-update)(emit-map-update-insn ctx dst args))
      ((eq op :map-update-ptr)(emit-map-update-ptr-insn ctx dst args))
      ((eq op :map-delete)(emit-map-delete-insn ctx dst args))
@@ -1032,16 +1031,6 @@
     (emit-map-fd ctx map-name whistler/bpf:+bpf-reg-1+)
     (emit-stack-ptr ctx key-offset whistler/bpf:+bpf-reg-2+)
     (ectx-emit ctx (whistler/bpf:emit-call whistler/bpf:+bpf-func-map-delete-elem+))
-    (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
-
-(defun emit-map-lookup-delete-insn (ctx dst args)
-  "Emit bpf_map_lookup_and_delete_elem — fused lookup + delete in one call."
-  (let* ((map-name (map-arg-name (first args)))
-         (key-vreg (second args))
-         (key-offset (emit-key-to-stack ctx key-vreg)))
-    (emit-map-fd ctx map-name whistler/bpf:+bpf-reg-1+)
-    (emit-stack-ptr ctx key-offset whistler/bpf:+bpf-reg-2+)
-    (ectx-emit ctx (whistler/bpf:emit-call whistler/bpf:+bpf-func-map-lookup-and-delete-elem+))
     (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
 
 ;;; ========== Ring buffer emission ==========

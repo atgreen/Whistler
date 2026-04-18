@@ -219,13 +219,6 @@
           (setf (ir-insn-dst insn) nil)))))
   prog)
 
-;;; ========== Map lookup-delete fusion ==========
-;;;
-;;; When a map-lookup is followed (in the same basic block or in dominated
-;;; blocks) by a map-delete on the SAME map and SAME key vreg, fuse them
-;;; into a single map-lookup-delete operation. This uses BPF helper 46
-;;; (bpf_map_lookup_and_delete_elem), saving 5 instructions per fusion.
-
 (defun compute-dominators (prog)
   "Compute immediate dominators for all blocks. Returns hash table: label → dominator label.
    Entry block dominates itself."
@@ -274,55 +267,6 @@
 (defun dominates-p (dom-map dominator-label target-label)
   "Does DOMINATOR-LABEL dominate TARGET-LABEL?"
   (member dominator-label (gethash target-label dom-map)))
-
-(defun lookup-delete-fusion (prog)
-  "Fuse map-lookup + map-delete on the same map/key into map-lookup-delete.
-   Only fuses when the lookup's block dominates the delete's block (ensuring
-   every path to the delete goes through the lookup), and only when the
-   delete's result vreg is unused."
-  (let ((dom-map (compute-dominators prog)))
-    ;; Collect all map-lookups with their blocks
-    (let ((lookups '()))
-      (dolist (block (ir-program-blocks prog))
-        (dolist (insn (basic-block-insns block))
-          (when (eq (ir-insn-op insn) :map-lookup)
-            (push (list insn block) lookups))))
-      ;; For each lookup, find the first matching delete in a dominated block.
-      ;; One lookup-and-delete can replace at most one delete, so stop after
-      ;; the first match.
-      (dolist (lookup-entry lookups)
-        (let* ((lookup-insn (first lookup-entry))
-               (lookup-block (second lookup-entry))
-               (map-name (second (first (ir-insn-args lookup-insn))))
-               (key-vreg (second (ir-insn-args lookup-insn)))
-               (fused nil))
-          (dolist (block (ir-program-blocks prog))
-            (when (and (not fused)
-                       (dominates-p dom-map (basic-block-label lookup-block)
-                                    (basic-block-label block)))
-              ;; When lookup and delete are in the same block, the delete
-              ;; must appear AFTER the lookup in instruction order
-              (let ((same-block-p (eq block lookup-block))
-                    (seen-lookup nil))
-                (dolist (insn (basic-block-insns block))
-                  (when (and same-block-p (eq insn lookup-insn))
-                    (setf seen-lookup t))
-                  (when (and (not fused)
-                             (eq (ir-insn-op insn) :map-delete)
-                             ;; In same block, only match deletes after the lookup
-                             (or (not same-block-p) seen-lookup)
-                             (let ((del-map (second (first (ir-insn-args insn))))
-                                   (del-key (second (ir-insn-args insn))))
-                               (and (string= (symbol-name map-name) (symbol-name del-map))
-                                    (eql key-vreg del-key)))
-                             ;; Only fuse if the delete's result is unused
-                             (null (ir-insn-dst insn)))
-                    ;; Fuse: change lookup to lookup-delete, remove the delete
-                    (setf (ir-insn-op lookup-insn) :map-lookup-delete)
-                    (setf (basic-block-insns block)
-                          (remove insn (basic-block-insns block)))
-                    (setf fused t))))))))))
-  prog)
 
 ;;; ========== Load hoisting ==========
 ;;;
@@ -993,7 +937,7 @@
         ;; ctx-load produces packet pointers (data, data_end)
         (:ctx-load :packet)
         ;; map-lookup and map-lookup-ptr produce map value pointers
-        ((:map-lookup :map-lookup-ptr :map-lookup-delete) :map-value)
+        ((:map-lookup :map-lookup-ptr) :map-value)
         ;; stack-addr and struct-alloc produce stack pointers
         ((:stack-addr :struct-alloc) :stack)
         ;; add with imm offset inherits kind from its base
@@ -2074,12 +2018,6 @@
   (dead-store-elimination prog)
 
   ;; Phase 5: Cross-block fusions and rewrites
-  ;; NOTE: lookup-delete-fusion is disabled.  It tried to fuse map-lookup +
-  ;; map-delete into bpf_map_lookup_and_delete_elem (helper 46), but that
-  ;; helper does not exist — helper 46 is bpf_get_socket_cookie.  The
-  ;; lookup-and-delete operation is a userspace bpf() syscall command, not
-  ;; an in-kernel BPF helper callable from programs.
-  ;; (lookup-delete-fusion prog)
   (hoist-loads-before-calls prog)
   (phi-branch-threading prog)
   (bitmask-check-fusion prog)
