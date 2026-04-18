@@ -18,19 +18,23 @@
 
 ;;; ========== CPU count ==========
 
-(defun parse-cpu-range (s)
-  "Parse a CPU range string like '0-3,8-11' into a count of CPUs."
-  (let ((count 0))
+(defun parse-cpu-ids (s)
+  "Parse a CPU range string like '0-3,8-11' into a sorted list of CPU IDs."
+  (let ((ids '()))
     (dolist (part (split-string s #\,))
       (let ((dash (position #\- part)))
         (if dash
             (let ((lo (parse-integer (subseq part 0 dash) :junk-allowed t))
                   (hi (parse-integer (subseq part (1+ dash)) :junk-allowed t)))
               (when (and lo hi)
-                (cl:incf count (1+ (- hi lo)))))
-            (when (parse-integer part :junk-allowed t)
-              (cl:incf count)))))
-    count))
+                (loop for cpu from lo to hi do (push cpu ids))))
+            (let ((n (parse-integer part :junk-allowed t)))
+              (when n (push n ids))))))
+    (sort ids #'<)))
+
+(defun parse-cpu-range (s)
+  "Parse a CPU range string like '0-3,8-11' into a count of CPUs."
+  (length (parse-cpu-ids s)))
 
 (defun split-string (s char)
   "Split string S by CHAR."
@@ -39,13 +43,17 @@
         collect (subseq s start (or end (length s)))
         while end))
 
-(defun online-cpu-count ()
-  "Return the number of online CPUs."
+(defun online-cpu-ids ()
+  "Return a sorted list of online CPU IDs."
   (or (let ((s (read-file-string "/sys/devices/system/cpu/online")))
         (when s
-          (let ((n (parse-cpu-range s)))
-            (when (plusp n) n))))
-      1))
+          (let ((ids (parse-cpu-ids s)))
+            (when ids ids))))
+      '(0)))
+
+(defun online-cpu-count ()
+  "Return the number of online CPUs."
+  (length (online-cpu-ids)))
 
 (defun possible-cpu-count ()
   "Return the number of possible CPUs. Used for percpu map value buffer sizing."
@@ -70,9 +78,9 @@
    When PER-CPU is true, opens one event per online CPU (for tracepoints).
    Otherwise opens a single event on CPU 0 (for kprobe/uprobe PMU attachment).
    Returns list of perf event FDs."
-  (let ((cpus (if per-cpu (online-cpu-count) 1))
+  (let ((cpu-ids (if per-cpu (online-cpu-ids) '(0)))
         (fds '()))
-    (dotimes (cpu cpus)
+    (dolist (cpu cpu-ids)
       (let ((fd (%perf-event-open perf-attr -1 cpu -1 +perf-flag-fd-cloexec+)))
         (push fd fds)
         (%ioctl fd +perf-event-ioc-set-bpf+ prog-fd)
@@ -125,7 +133,7 @@
    Returns an attachment that can be passed to detach."
   (let* ((tp-id (resolve-tracepoint-id tracepoint-name))
          (attr (make-perf-attr +perf-type-tracepoint+ tp-id))
-         (fds (attach-perf-bpf attr prog-fd)))
+         (fds (attach-perf-bpf attr prog-fd :per-cpu t)))
     (make-attachment :type :tracepoint :perf-fds fds :prog-fd prog-fd)))
 
 ;;; ========== Uprobe attachment ==========
@@ -229,7 +237,8 @@
     (make-attachment :type :tc :perf-fds nil :prog-fd prog-fd
                      :cleanup (lambda ()
                                 (sb-ext:run-program
-                                 "tc" (list "filter" "del" "dev" interface-name direction)
+                                 "tc" (list "filter" "del" "dev" interface-name
+                                            direction "bpf" "da" "pinned" pin-path)
                                  :search t :wait t)
                                 (handler-case (delete-file pin-path)
                                   (error () nil))))))

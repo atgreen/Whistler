@@ -94,6 +94,10 @@
     ((string= section-name "cgroup/connect6")     +bpf-cgroup-inet6-connect+)
     ((string= section-name "cgroup/sendmsg4")     +bpf-cgroup-udp4-sendmsg+)
     ((string= section-name "cgroup/sendmsg6")     +bpf-cgroup-udp6-sendmsg+)
+    ((string= section-name "cgroup/bind4")        +bpf-cgroup-inet4-bind+)
+    ((string= section-name "cgroup/bind6")        +bpf-cgroup-inet6-bind+)
+    ((string= section-name "cgroup/post_bind4")   +bpf-cgroup-inet4-post-bind+)
+    ((string= section-name "cgroup/post_bind6")   +bpf-cgroup-inet6-post-bind+)
     (t nil)))
 
 ;;; ========== Program loading ==========

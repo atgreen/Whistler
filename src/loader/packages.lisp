@@ -30,6 +30,8 @@
    ;; Cgroup constants
    #:+bpf-cgroup-inet-ingress+ #:+bpf-cgroup-inet-egress+
    #:+bpf-cgroup-inet-sock-create+ #:+bpf-cgroup-inet-sock-release+
+   #:+bpf-cgroup-inet4-bind+ #:+bpf-cgroup-inet6-bind+
+   #:+bpf-cgroup-inet4-post-bind+ #:+bpf-cgroup-inet6-post-bind+
    #:+bpf-cgroup-inet4-connect+ #:+bpf-cgroup-inet6-connect+
    #:+bpf-cgroup-udp4-sendmsg+ #:+bpf-cgroup-udp6-sendmsg+
    ;; Program type constants
