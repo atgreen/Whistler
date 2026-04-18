@@ -37,9 +37,10 @@ jobs:
         run: |
           for f in examples/*.lisp; do
             name=$(basename "$f" .lisp)
-            # skip ffi-call-tracker (requires loader system)
-            # skip fork-tracker (requires tracefs access)
-            if [ "$name" = "ffi-call-tracker" ] || [ "$name" = "fork-tracker" ]; then continue; fi
+            # skip examples that require the loader system or kernel access
+            case "$name" in
+              ffi-call-tracker|fork-tracker|cgroup-skb-count|cgroup-skb-session) continue ;;
+            esac
             sbcl --noinform --non-interactive \
               --eval '(require :asdf)' \
               --eval '(push #p"./" asdf:*central-registry*)' \
