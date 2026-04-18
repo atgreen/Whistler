@@ -40,12 +40,12 @@ Flags: `BPF_ANY` (0), `BPF_NOEXIST` (1), `BPF_EXIST` (2).
 ### Pointer-key variants
 
 When a map has a struct key (key-size > 8 bytes), use the `-ptr`
-variants. These take a pointer to the key on the stack instead of a
-scalar value:
+variants. These take pointers to data on the stack instead of
+scalar values:
 
 ```lisp
 (map-lookup-ptr map-name key-ptr)
-(map-update-ptr map-name key-ptr value flags)
+(map-update-ptr map-name key-ptr val-ptr flags)
 (map-delete-ptr map-name key-ptr)
 ```
 
