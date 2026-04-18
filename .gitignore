@@ -24,3 +24,7 @@ book/book/
 
 # Local planning docs
 GPLAN.md
+
+# Temp/log files
+*.log
+.codex
