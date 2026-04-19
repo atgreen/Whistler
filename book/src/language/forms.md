@@ -31,7 +31,7 @@ The following chapters document each category of form:
 - [Variables and Types](./variables.md) -- `let`, `let*`, `setf`, type inference
 - [Control Flow](./control-flow.md) -- `if`, `when`, `unless`, `cond`, `case`, `and`, `or`
 - [Arithmetic and Bitwise](./arithmetic.md) -- math, shifts, comparisons, casts, byte order
-- [Memory Access](./memory.md) -- `load`, `store`, `ctx-load`, `stack-addr`, `atomic-add`, `memset`, `memcpy`
+- [Memory Access](./memory.md) -- `load`, `store`, `ctx`, `stack-addr`, `atomic-add`, `memset`, `memcpy`
 - [Map Operations](./maps.md) -- low-level and high-level map access
 - [Ring Buffers](./ringbuf.md) -- `ringbuf-reserve`, `with-ringbuf`
 - [BPF Helpers](./helpers.md) -- kernel helper function calls

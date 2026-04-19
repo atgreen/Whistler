@@ -30,21 +30,35 @@ Write a value to memory:
 (store u8  event 10 proto)
 ```
 
-## ctx-load
+## ctx
 
-Read from the BPF program context (the `ctx` pointer passed by the
-kernel). The context structure varies by program type -- for XDP it
-contains `data`, `data_end`, and `data_meta` as `u32` offsets.
+Read from or write to the BPF program context (the `ctx` pointer
+passed by the kernel). The context structure varies by program type --
+for XDP it contains `data`, `data_end`, and `data_meta` as `u32`
+offsets.
+
+`ctx` is a setf-able place:
 
 ```lisp
-(ctx-load type offset)
+;; Read a context field
+(ctx type offset)
+
+;; Write a context field (e.g., to redirect connections in cgroup programs)
+(setf (ctx type offset) value)
 ```
 
 ```lisp
-(let ((data     (ctx-load u32 0))    ; xdp_md->data
-      (data-end (ctx-load u32 4)))   ; xdp_md->data_end
+;; XDP: read packet bounds
+(let ((data     (ctx u32 0))    ; xdp_md->data
+      (data-end (ctx u32 4)))   ; xdp_md->data_end
   ...)
+
+;; cgroup/connect4: redirect destination
+(setf (ctx u32 4) +localhost-nbo+)   ; bpf_sock_addr->user_ip4
 ```
+
+> **Note:** `ctx-load` is a deprecated alias for `ctx` (read-only).
+> Prefer `(ctx ...)` and `(setf (ctx ...) ...)` in new code.
 
 ## stack-addr
 

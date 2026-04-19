@@ -35,7 +35,7 @@ certain initializer forms:
 | Initializer | Inferred type |
 |-------------|---------------|
 | `(load u32 ...)` | `u32` |
-| `(ctx-load u32 ...)` | `u32` |
+| `(ctx u32 ...)` | `u32` |
 | `(cast u16 ...)` | `u16` |
 | `(ntohs ...)` | `u16` |
 | `(ntohl ...)` | `u32` |

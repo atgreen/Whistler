@@ -63,3 +63,4 @@
 - [XDP Tail Call Dispatch](./cookbook/tail-call-dispatch.md)
 - [Inline Session](./cookbook/inline-session.md)
 - [Cgroup Packet Counter](./cookbook/cgroup-counter.md)
+- [Cgroup Outbound Firewall](./cookbook/cgroup-firewall.md)
