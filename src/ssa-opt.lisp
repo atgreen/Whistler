@@ -366,14 +366,14 @@
           (entry-ok t))
       ;; Check entry block
       (dolist (insn (basic-block-insns entry-block))
-        (when (and seen-barrier (eq (ir-insn-op insn) :ctx-load))
+        (when (and seen-barrier (member (ir-insn-op insn) '(:ctx-load :ctx-store)))
           (setf entry-ok nil))
         (when (ir-insn-side-effect-p insn)
           (setf seen-barrier t)))
-      ;; Check non-entry blocks: any ctx-load disqualifies
+      ;; Check non-entry blocks: any ctx-load/ctx-store disqualifies
       (dolist (block (rest (ir-program-blocks prog)))
         (dolist (insn (basic-block-insns block))
-          (when (eq (ir-insn-op insn) :ctx-load)
+          (when (member (ir-insn-op insn) '(:ctx-load :ctx-store))
             (return-from ctx-loads-early-p nil))))
       entry-ok)))
 
@@ -643,8 +643,8 @@
     ;; For each load/ctx-load/store, chase the pointer through add-immediate chains
     (dolist (block (ir-program-blocks prog))
       (dolist (insn (basic-block-insns block))
-        ;; Case 1: load/ctx-load/store — fold add chain into offset
-        (when (member (ir-insn-op insn) '(:load :ctx-load :store))
+        ;; Case 1: load/ctx-load/store/ctx-store — fold add chain into offset
+        (when (member (ir-insn-op insn) '(:load :ctx-load :store :ctx-store))
           (let ((ptr-vreg (first (ir-insn-args insn)))
                 (load-off (second (second (ir-insn-args insn))))  ; from (:imm N)
                 (accumulated 0))
@@ -1141,9 +1141,9 @@
       ;; Check if ctx needs a callee-saved register (reduces available count)
       (let ((ctx-early (ctx-loads-early-p prog)))
         (unless ctx-early
-          ;; ctx-load present and not early → R6 reserved, only 3 callee-saved
+          ;; ctx-load/ctx-store present and not early → R6 reserved, only 3 callee-saved
           (when (some (lambda (block)
-                        (some (lambda (insn) (eq (ir-insn-op insn) :ctx-load))
+                        (some (lambda (insn) (member (ir-insn-op insn) '(:ctx-load :ctx-store)))
                               (basic-block-insns block)))
                       (ir-program-blocks prog))
             (setf callee-saved-count 3))))

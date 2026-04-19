@@ -467,6 +467,7 @@
      ((eq op :cmp)       (emit-cmp-insn ctx dst args))
      ((eq op :load)      (emit-load-insn ctx dst args))
      ((eq op :ctx-load)  (emit-ctx-load-insn ctx dst args))
+     ((eq op :ctx-store) (emit-ctx-store-insn ctx args))
      ((eq op :store)     (emit-store-insn ctx args))
      ((eq op :atomic-add)(emit-atomic-add-insn ctx args))
      ((eq op :call)      (emit-call-insn ctx dst args))
@@ -710,6 +711,24 @@
       (ectx-emit ctx (whistler/bpf:emit-stx-mem
                        whistler/bpf:+bpf-dw+
                        whistler/bpf:+bpf-reg-10+ dst-reg (cadr dst-loc))))))
+
+(defun emit-ctx-store-insn (ctx args)
+  "Emit a store to a BPF context field. Uses the same register logic as ctx-load."
+  (let* ((ctx-early (ctx-loads-early-p (emit-ctx-ir-prog ctx)))
+         (ctx-reg (if ctx-early
+                      (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+)
+                      whistler/bpf:+bpf-reg-6+))
+         (off (imm-arg-value (second args)))
+         (val-arg (third args))
+         (val-imm (or (imm-arg-value val-arg)
+                      (and (integerp val-arg)
+                           (gethash val-arg (emit-ctx-const-values ctx)))))
+         (type-kw (type-arg-name (fourth args)))
+         (bpf-size (ir-type-to-bpf-size type-kw)))
+    (if val-imm
+        (ectx-emit ctx (whistler/bpf:emit-st-mem bpf-size ctx-reg off val-imm))
+        (let ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-2+)))
+          (ectx-emit ctx (whistler/bpf:emit-stx-mem bpf-size ctx-reg val-reg off))))))
 
 (defun emit-store-insn (ctx args)
   (let* ((ptr-vreg (first args))

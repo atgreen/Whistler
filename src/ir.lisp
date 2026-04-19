@@ -87,7 +87,7 @@
 (defun ir-insn-side-effect-p (insn)
   "Does this instruction have side effects?"
   (member (ir-insn-op insn)
-          '(:call :tail-call :store :stack-store :atomic-add
+          '(:call :tail-call :store :ctx-store :stack-store :atomic-add
             :map-update :map-update-ptr :map-delete :map-delete-ptr
             :struct-alloc :br :br-cond :ret
             :ringbuf-reserve :ringbuf-submit :ringbuf-discard)))

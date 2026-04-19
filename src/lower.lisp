@@ -296,7 +296,11 @@
       ((sym= head 'ringbuf-discard)
        (lower-ringbuf-discard ctx (first args) (second args)))
 
+      ((sym= head 'ctx)
+       (lower-ctx-load ctx (first args) (second args)))
+
       ((sym= head 'ctx-load)
+       (warn "ctx-load is deprecated; use (ctx TYPE OFFSET) instead")
        (lower-ctx-load ctx (first args) (second args)))
 
       ((sym= head 'tail-call)
@@ -304,6 +308,18 @@
 
       ((sym= head 'core-ctx-load)
        (lower-core-ctx-load ctx args))
+
+      ((sym= head '%ctx-set)
+       ;; Internal form emitted by (setf (ctx ...) ...) expansion
+       (lower-ctx-store ctx (first args) (second args) (third args)))
+
+      ((sym= head 'ctx-store)
+       (warn "ctx-store is deprecated; use (setf (ctx TYPE OFFSET) VALUE) instead")
+       (lower-ctx-store ctx (first args) (second args) (third args)))
+
+      ((sym= head 'ctx-ptr)
+       ;; Return the raw context pointer (R1) for passing to helpers
+       (cdr (ctx-lookup-var ctx (intern "%%CTX" (find-package '#:whistler/ir)))))
 
       ((sym= head 'setf)
        ;; CL-style multi-pair setf: (setf place1 val1 place2 val2 ...)
@@ -1178,13 +1194,27 @@
     (ctx-emit ctx :ctx-load dst (list ctx-vreg `(:imm ,offset) `(:type ,type-kw)) type-kw)
     dst))
 
+(defun lower-ctx-store (ctx type-kw offset value-form)
+  "Lower (ctx-store TYPE OFFSET VALUE) — write a value to a BPF context field."
+  (let ((ctx-vreg (cdr (ctx-lookup-var ctx (intern "%%CTX" (find-package '#:whistler/ir)))))
+        (val-vreg (lower-expr ctx value-form)))
+    (ctx-emit ctx :ctx-store nil (list ctx-vreg `(:imm ,offset) val-vreg `(:type ,type-kw)))
+    nil))
+
 ;;; ========== Setf ==========
 
-(defun lower-setf (ctx var-name expr)
-  (let ((new-vreg (lower-expr ctx expr)))
-    ;; SSA: update the variable to point to the new vreg
-    (ctx-update-var ctx var-name new-vreg)
-    new-vreg))
+(defun lower-setf (ctx place expr)
+  (cond
+    ;; Compound place: (setf (ctx TYPE OFFSET) VALUE)
+    ((and (consp place) (sym= (car place) 'ctx))
+     (lower-ctx-store ctx (first (cdr place)) (second (cdr place)) expr)
+     nil)
+    ;; Simple variable
+    (t
+     (let ((new-vreg (lower-expr ctx expr)))
+       ;; SSA: update the variable to point to the new vreg
+       (ctx-update-var ctx place new-vreg)
+       new-vreg))))
 
 ;;; ========== Stack-addr ==========
 

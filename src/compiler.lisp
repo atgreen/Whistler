@@ -40,7 +40,7 @@
     ("RINGBUF-RESERVE"      . 131)
     ("RINGBUF-SUBMIT"       . 132)
     ("RINGBUF-DISCARD"      . 133)
-    ("GET-SOCKET-COOKIE"    . 47)
+    ("GET-SOCKET-COOKIE"    . 46)
     ("GET-CURRENT-TASK-BTF" . 159)
     ("KTIME-GET-COARSE-NS"  . 161))
   "BPF helper functions: string name → helper ID.

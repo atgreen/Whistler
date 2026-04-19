@@ -327,6 +327,23 @@
        :expected (format nil "(defstruct ~a ...) before sizeof" struct-name)))
     (car def)))
 
+;;; Context access — (ctx TYPE OFFSET) is setf-able
+;;;
+;;; We use define-setf-expander (not defsetf) because TYPE is DSL syntax
+;;; (u32, u16, etc.), not a CL expression. defsetf would wrap it in a let
+;;; binding and try to evaluate it. define-setf-expander lets us splice
+;;; TYPE directly into the generated form.
+
+(define-setf-expander ctx (type offset &environment env)
+  (declare (ignore env))
+  (let ((val-temp (gensym "VAL")))
+    (values
+     nil                                    ; no temps (type/offset are constants)
+     nil                                    ; no value forms
+     (list val-temp)                        ; store variable
+     `(%ctx-set ,type ,offset ,val-temp)    ; storing form
+     `(ctx ,type ,offset))))
+
 ;;; Memory operations
 
 (defun widen-byte-value (byte-val width)
