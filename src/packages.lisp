@@ -141,7 +141,7 @@
            #:udp-src-port #:udp-dst-port #:udp-length
            #:+udp-hdr-len+
            ;; Structs
-           #:defstruct #:struct-set #:struct-ref #:sizeof
+           #:defstruct #:defunion #:struct-set #:struct-ref #:sizeof
            ;; Kernel integration
            #:deftracepoint #:import-kernel-struct
            ;; Memory operations

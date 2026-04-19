@@ -69,21 +69,38 @@
 (defconstant +skb-protocol+ 16)
 (defconstant +skb-family+   88)
 
-;;; ========== IP header offsets ==========
+;;; ========== Packet headers ==========
 
-(defconstant +iph-protocol+  9)   ; u8 at offset 9
-(defconstant +iph-daddr+     16)  ; u32 at offset 16
-(defconstant +iph-size+      20)
+(defstruct ip-hdr
+  (ver-ihl   u8)     ; 0
+  (tos       u8)     ; 1
+  (tot-len   u16)    ; 2
+  (id        u16)    ; 4
+  (frag-off  u16)    ; 6
+  (ttl       u8)     ; 8
+  (protocol  u8)     ; 9
+  (check     u16)    ; 10
+  (saddr     u32)    ; 12
+  (daddr     u32))   ; 16  — total 20 bytes
 
-;;; ========== TCP header offsets ==========
+(defstruct udp-hdr
+  (src-port  u16)    ; 0
+  (dst-port  u16)    ; 2
+  (length    u16)    ; 4
+  (checksum  u16))   ; 6  — total 8 bytes
 
-(defconstant +tcph-dest+     2)   ; u16 at offset 2
-(defconstant +tcph-size+     20)
+(defstruct tcp-hdr
+  (src-port  u16)    ; 0
+  (dst-port  u16)    ; 2
+  (seq       u32)    ; 4
+  (ack-seq   u32)    ; 8
+  (doff-flags u16)   ; 12
+  (window    u16)    ; 14
+  (check     u16)    ; 16
+  (urg-ptr   u16))   ; 18  — total 20 bytes
 
-;;; ========== UDP header offsets ==========
-
-(defconstant +udph-dest+     2)   ; u16 at offset 2
-(defconstant +udph-size+     8)
+;; Single stack allocation, accessed through any header's accessors
+(defunion packet-buf ip-hdr udp-hdr tcp-hdr)
 
 ;;; ========== Event struct ==========
 
@@ -105,7 +122,7 @@
 
 ;; Ring buffer for sending events to userspace
 (defmap events :type :ringbuf
-  :max-entries (* 1 1024 1024))  ; 1MB
+  :max-entries (* 1024 1024))  ; 1MB
 
 ;; socket cookie → original destination IP (before redirect)
 (defmap sock-client-to-original-ip :type :hash
@@ -249,14 +266,13 @@
                             :section "cgroup_skb/egress"
                             :license "GPL")
   ;; Load IP header from packet via skb_load_bytes
-  ;; We allocate a stack buffer for the IP header
-  (let* ((iph (make-event))  ; reuse event struct as scratch (>= 20 bytes)
-         (rc (skb-load-bytes (ctx-ptr) 0 iph +iph-size+)))
+  (let* ((pkt (make-packet-buf))
+         (rc (skb-load-bytes (ctx-ptr) 0 pkt (sizeof ip-hdr))))
     (when (s< rc 0)
       (return +egress-deny+))
 
-    (let* ((protocol (load u8 iph +iph-protocol+))
-           (daddr    (load u32 iph +iph-daddr+))
+    (let* ((protocol (ip-hdr-protocol pkt))
+           (daddr    (ip-hdr-daddr pkt))
 
            ;; Look up PID from socket cookie
            (socket-cookie (get-socket-cookie (ctx-ptr)))
@@ -266,7 +282,6 @@
 
            ;; Look up original destination (before redirect)
            (orig-ip-ptr (map-lookup sock-client-to-original-ip socket-cookie))
-           (dest-ip     (if (/= orig-ip-ptr 0) (load u32 orig-ip-ptr 0) daddr))
            (original-ip (if (/= orig-ip-ptr 0) (load u32 orig-ip-ptr 0) daddr))
            (is-redirected u8 (if (/= original-ip daddr) 1 0)))
 
@@ -283,27 +298,25 @@
                 (event-event-type evt) +localhost-packet-bypass+))
         (return +egress-allow+))
 
-      ;; Parse transport header for port information
+      ;; Parse transport header — reuse pkt buffer (IP fields already extracted)
       (let ((port u16 0))
 
         ;; UDP handling
         (when (= protocol +ipproto-udp+)
-          (let* ((udph (make-event))  ; scratch buffer for UDP header
-                 (rc2 (skb-load-bytes (ctx-ptr) +iph-size+ udph +udph-size+)))
+          (let ((rc2 (skb-load-bytes (ctx-ptr) (sizeof ip-hdr) pkt (sizeof udp-hdr))))
             (when (s< rc2 0)
               (return +egress-deny+))
 
-            (setf port (load u16 udph +udph-dest+))
+            (setf port (udp-hdr-dst-port pkt))
 
             ;; Check for proxied DNS request
             (when (and (= port (htons 5553))   ; DNS proxy port placeholder
                        (= daddr +localhost-nbo+))
-              ;; Extract DNS transaction ID
-              (let* ((dns-buf (make-event))  ; scratch for DNS header
-                     (dns-off (+ +iph-size+ +udph-size+))
-                     (rc3 (skb-load-bytes (ctx-ptr) dns-off dns-buf 2)))
+              ;; Extract DNS transaction ID — reuse pkt again
+              (let* ((dns-off (+ (sizeof ip-hdr) (sizeof udp-hdr)))
+                     (rc3 (skb-load-bytes (ctx-ptr) dns-off pkt 2)))
                 (let ((txid u16 (if (s>= rc3 0)
-                                    (ntohs (load u16 dns-buf 0))
+                                    (ntohs (load u16 pkt 0))
                                     0)))
                   (with-ringbuf (evt events (sizeof event))
                     (setf (event-pid evt) pid
@@ -319,11 +332,10 @@
 
         ;; TCP handling — extract destination port
         (when (= protocol +ipproto-tcp+)
-          (let* ((tcph (make-event))  ; scratch buffer for TCP header
-                 (rc2 (skb-load-bytes (ctx-ptr) +iph-size+ tcph +tcph-size+)))
+          (let ((rc2 (skb-load-bytes (ctx-ptr) (sizeof ip-hdr) pkt (sizeof tcp-hdr))))
             (when (s< rc2 0)
               (return +egress-deny+))
-            (setf port (load u16 tcph +tcph-dest+))))
+            (setf port (tcp-hdr-dst-port pkt))))
 
         ;; Block IPv6 traffic (not supported)
         (let ((family (ctx u32 +skb-family+)))

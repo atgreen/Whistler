@@ -327,6 +327,41 @@
        :expected (format nil "(defstruct ~a ...) before sizeof" struct-name)))
     (car def)))
 
+;;; Unions — overlapping struct views at a single stack allocation
+
+(defmacro defunion (name &body members)
+  "Define a union of existing struct types. Allocates the size of the
+   largest member; the returned pointer can be used with any member's
+   field accessors (all members share offset 0).
+
+   Example:
+     (defstruct ip-hdr  (protocol u8) (pad (array u8 15)) (daddr u32))
+     (defstruct udp-hdr (src-port u16) (dst-port u16) (length u16) (checksum u16))
+     (defunion packet-buf ip-hdr udp-hdr)
+
+     (let ((buf (make-packet-buf)))
+       (skb-load-bytes (ctx-ptr) 0 buf 20)
+       (ip-hdr-protocol buf)    ; access as IP header
+       (udp-hdr-dst-port buf))  ; or as UDP header — same pointer"
+  (let ((sizes (mapcar (lambda (member)
+                         (let ((def (gethash (string member) *struct-defs*)))
+                           (unless def
+                             (whistler-error
+                              :what (format nil "defunion ~a: unknown struct member ~a"
+                                            name member)
+                              :expected (format nil "(defstruct ~a ...) before defunion"
+                                                member)))
+                           (car def)))
+                       members)))
+    (let* ((total (apply #'max sizes))
+           (make-name (intern (format nil "MAKE-~a" (symbol-name name))
+                              (symbol-package name))))
+      `(progn
+         (setf (gethash ,(string name) *struct-defs*)
+               (cons ,total nil))
+         (cl:defmacro ,make-name ()
+           '(struct-alloc ,total))))))
+
 ;;; Context access — (ctx TYPE OFFSET) is setf-able
 ;;;
 ;;; We use define-setf-expander (not defsetf) because TYPE is DSL syntax
