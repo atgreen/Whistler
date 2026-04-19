@@ -766,8 +766,13 @@
            (ectx-emit ctx insns))))
       ;; Normal pointer-based store
       (t
-       (let ((ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-1+))
-             (val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-2+)))
+       ;; Materialize the value before the pointer. This avoids cases where
+       ;; computing VAL reuses/clobbers the register currently holding PTR,
+       ;; which is especially important for ringbuf record pointers.
+       (emit-vreg-to-reg ctx val-arg whistler/bpf:+bpf-reg-2+)
+       (emit-vreg-to-reg ctx ptr-vreg whistler/bpf:+bpf-reg-1+)
+       (let ((ptr-reg whistler/bpf:+bpf-reg-1+)
+             (val-reg whistler/bpf:+bpf-reg-2+))
          (let ((insns (whistler/bpf:emit-stx-mem bpf-size ptr-reg val-reg off)))
            (setf store-insn (first insns))
            (ectx-emit ctx insns)))))
@@ -1082,7 +1087,21 @@
     ;; R1 = map fd (last — ld_imm64 clobbers R1)
     (emit-map-fd ctx map-name whistler/bpf:+bpf-reg-1+)
     (ectx-emit ctx (whistler/bpf:emit-call 131))  ; bpf_ringbuf_reserve
-    (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
+    (when dst
+      ;; Keep reserved ringbuf record pointers in a stack slot rather than a
+      ;; register. Field initializers inside WITH-RINGBUF often evaluate other
+      ;; expressions between stores, and reloading the pointer from stack avoids
+      ;; accidental register reuse/clobbering before the next store.
+      (let* ((existing (gethash dst (emit-ctx-vreg-map ctx)))
+             (spill-off (if (and existing (eq (car existing) :stack))
+                            (cadr existing)
+                            (ectx-alloc-stack ctx 8 "ringbuf ptr spill"))))
+        (setf (gethash dst (emit-ctx-vreg-map ctx)) (list :stack spill-off))
+        (ectx-emit ctx (whistler/bpf:emit-stx-mem
+                         whistler/bpf:+bpf-dw+
+                         whistler/bpf:+bpf-reg-10+
+                         whistler/bpf:+bpf-reg-0+
+                         spill-off))))))
 
 (defun emit-ringbuf-submit-insn (ctx dst args)
   "Emit bpf_ringbuf_submit(data, flags).
