@@ -5,12 +5,15 @@ runtime, all in one Lisp file. No separate compilation step.
 
 ## How it works
 
-1. At macroexpand time: `bpf:map` and `bpf:prog` forms are extracted,
-   re-interned into the Whistler package, compiled to BPF bytecode, and
-   embedded as literal byte arrays in the expansion.
-2. At runtime: maps are created, relocations patched, programs loaded
-   into the kernel, and the remaining CL body executes.
-3. On exit: all maps, programs, and attachments are closed automatically.
+```mermaid
+graph TD
+    A["<b>Macroexpand time</b><br/>bpf:map and bpf:prog forms extracted,<br/>compiled to BPF bytecode,<br/>embedded as literal byte arrays"] --> B["<b>Runtime</b><br/>Maps created, relocations patched,<br/>programs loaded into kernel,<br/>CL body executes"]
+    B --> C["<b>Exit</b><br/>All maps, programs, and<br/>attachments closed automatically"]
+
+    style A fill:#4a9eff,color:#fff
+    style B fill:#f39c12,color:#fff
+    style C fill:#2ecc71,color:#fff
+```
 
 ## Syntax
 

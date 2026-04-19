@@ -397,7 +397,7 @@ One file, one language. No intermediate artifacts or separate build steps.
 ## Documentation
 
 The full language reference, compilation model, and API details are in
-[doc/MANUAL.md](doc/MANUAL.md).
+[The Whistler Book](https://atgreen.github.io/Whistler/).
 
 ## Author
 

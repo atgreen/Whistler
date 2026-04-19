@@ -120,8 +120,10 @@ The most Lisp-native approach compiles and loads in one form:
 The `bpf:` forms compile to eBPF at macroexpand time. The rest is ordinary
 Common Lisp that runs at load time.
 
-For interactive development, prefer this inline-session workflow. Use file
+```admonish tip
+For interactive development, prefer the inline-session workflow. Use file
 compilation when you specifically want a `.bpf.o` artifact.
+```
 
 ## What the compiler produces
 

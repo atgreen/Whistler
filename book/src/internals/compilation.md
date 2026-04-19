@@ -7,6 +7,22 @@ the macroexpansion phase.
 
 ## Pipeline
 
+```mermaid
+graph LR
+    A[Source] --> B[Load]
+    B --> C[Macroexpand]
+    C --> D[Constant Fold]
+    D --> E[Lower to SSA IR]
+    E --> F[SSA Optimize]
+    F --> G[Register Alloc]
+    G --> H[BPF Emit]
+    H --> I[Peephole]
+    I --> J[ELF Output]
+
+    style A fill:#4a9eff,color:#fff
+    style J fill:#2ecc71,color:#fff
+```
+
 ### 1. Load
 
 Read the source file. `defmap`, `defprog`, `defstruct`, `defconstant`,
@@ -132,6 +148,7 @@ object file. See [ELF Output](./elf.md) for section details.
 
 ## eBPF constraints
 
+```admonish warning title="Verifier Constraints"
 The BPF verifier enforces these constraints on loaded programs:
 
 - **No unbounded loops** -- all loops must have a provable upper bound
@@ -143,3 +160,4 @@ The BPF verifier enforces these constraints on loaded programs:
   allows access.
 - **Helper restrictions** -- each program type has a specific set of
   allowed helpers. The verifier rejects calls to disallowed helpers.
+```

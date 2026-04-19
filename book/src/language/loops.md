@@ -1,7 +1,10 @@
 # Loops
 
+```admonish warning
 The BPF verifier requires that all loops have a provably bounded
-iteration count. Whistler enforces this at compile time.
+iteration count. Whistler enforces this at compile time -- a non-constant
+or negative bound is a compile error.
+```
 
 ## dotimes
 
@@ -22,8 +25,6 @@ The loop variable is bound as a `u32` starting at 0.
   (when (= (load u8 ptr i) 0)
     (return i)))
 ```
-
-A non-constant or negative bound is a compile error.
 
 ## do-user-ptrs
 

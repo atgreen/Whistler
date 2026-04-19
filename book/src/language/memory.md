@@ -129,4 +129,8 @@ supported).
     ...))
 ```
 
-Compiling on an unsupported architecture produces a compile-time error.
+```admonish warning
+`pt-regs` accessors are architecture-specific. Currently x86-64 and
+aarch64 are supported. Compiling on an unsupported architecture produces
+a compile-time error.
+```

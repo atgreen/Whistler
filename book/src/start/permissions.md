@@ -5,6 +5,7 @@ need full root access -- Linux capabilities are sufficient.
 
 ## Required capabilities
 
+```admonish note title="Minimum Capabilities"
 Two capabilities cover the common case:
 
 - **CAP_BPF** -- load BPF programs and create maps.
@@ -13,6 +14,7 @@ Two capabilities cover the common case:
 
 Together these allow loading, attaching, and consuming events for most BPF
 program types without running as root.
+```
 
 ## Setting capabilities on SBCL
 
@@ -99,6 +101,10 @@ sudo setcap cap_bpf,cap_perfmon,cap_net_admin+ep /usr/bin/sbcl
 ```
 
 ## Running as root
+
+```admonish tip
+Prefer setting capabilities over running as root. Capabilities grant only the specific privileges needed, while root grants everything.
+```
 
 If capabilities are not an option, `sudo` works:
 

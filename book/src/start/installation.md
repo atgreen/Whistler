@@ -9,8 +9,10 @@
   Kernel 5.8+ is recommended for ring buffer maps and BTF support.
 - **FiveAM** is required only for running the test suite.
 
+```admonish info
 Whistler has zero non-Lisp dependencies. No LLVM, no libelf, no kernel
 headers.
+```
 
 ## Loading the compiler
 
