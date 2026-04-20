@@ -195,23 +195,37 @@ Required plumbing changes:
 program only works on kernels where the struct layout matches. This is
 the same as writing raw offsets today, just more readable.
 
-#### Phase 2: BTF-driven resolution
+#### Phase 2: BTF-driven resolution *(implemented)*
 
-Replace the static table with BTF lookup from `/sys/kernel/btf/vmlinux`
-at compile time. This handles kernel version differences and
-custom/backported fields. The existing BTF infrastructure in
-`src/btf.lisp` and `src/vmlinux.lisp` already parses BTF — extend it
-to look up context struct fields by name.
+Context field resolution now uses BTF from `/sys/kernel/btf/vmlinux`
+at compile time when available, via a resolver hook
+(`*ctx-btf-resolver*`) installed by `src/vmlinux.lisp`. The resolver
+calls `btf-ctx-struct-fields` which looks up the struct in the
+kernel's BTF, resolves field types (scalars, arrays, pointers),
+and flattens anonymous struct/union members.
+
+Implementation:
+- `btf-ctx-struct-fields` in `src/vmlinux.lisp` — BTF struct lookup
+  returning fields in `*ctx-struct-fields*` format
+- `btf-resolve-array` — resolves BTF array types to element type + count
+- `btf-member-raw-type-id` — follows typedef chains without collapsing
+- `*ctx-btf-resolver*` in `src/compiler.lisp` — callback hook, set at
+  load time by `src/vmlinux.lisp`
+- `*vmlinux-btf-path*` — override BTF path for cross-compilation
+- `vmlinux-btf` struct now caches `type-data`, eliminating the
+  redundant re-read in `btf-struct-fields`
+
+**Resolution order:** BTF first, static table fallback. When BTF is
+available, offsets reflect the build host's actual kernel layout.
 
 **Portability:** Offsets are resolved from the build host's kernel BTF
 and baked into the program. Compiled programs work only on the kernel
 they were built on (or compatible ones). This is not compile-once
 portability.
 
-**Fallback:** When BTF is unavailable (cross-compilation, CI without
-a running kernel), require the user to supply a BTF blob path via a
-compiler option (e.g., `--btf /path/to/vmlinux.btf`). Do not silently
-fall back to the static table — that would mask version mismatches.
+**Cross-compilation:** Set `*vmlinux-btf-path*` to point to the
+target kernel's BTF blob. When BTF is unavailable (no vmlinux, no
+override), the static table provides a fallback with standard offsets.
 
 #### Phase 3: CO-RE relocation
 
@@ -247,7 +261,7 @@ compiles to a relocatable access that works across kernel versions.
 |------|--------|
 | `src/whistler.lisp` | Context struct table, prog-type plumbing in `defprog`/`compile-program`, `define-setf-expander` arity |
 | `src/lower.lisp` | `ctx` form: detect symbol vs type keyword, unify `section-to-ctx-fields`, accept prog type in `lower-program` |
-| `src/vmlinux.lisp` | BTF lookup for context structs (Phase 2) |
+| `src/vmlinux.lisp` | BTF lookup for context structs (Phase 2) *(done)* |
 | `src/emit.lisp` | CO-RE relocation emission (Phase 3) |
 | `book/src/language/memory.md` | Document `(ctx field-name)` form |
 

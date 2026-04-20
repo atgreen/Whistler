@@ -78,7 +78,7 @@
            #:bpf-map-value-size #:bpf-map-max-entries #:bpf-map-flags #:bpf-map-index
            #:make-bpf-map
            #:sym= #:bpf-type-p #:bpf-type-size #:builtin-helper-p
-           #:ctx-resolve-field
+           #:ctx-resolve-field #:*ctx-btf-resolver*
            #:*prog-type-to-ctx-struct* #:*ctx-struct-fields*
            #:*builtin-helpers* #:*builtin-constants* #:*whistler-builtins*))
 

@@ -29,7 +29,7 @@
 (defconstant +btf-kind-enum64+ 19)
 
 (cl:defstruct vmlinux-btf
-  strtab types)
+  strtab types type-data)
 
 (cl:defstruct btf-type-info
   name-off info size/type)
@@ -96,7 +96,7 @@
                          (#.+btf-kind-datasec+ (* vlen 12))
                          (#.+btf-kind-enum64+ (* vlen 12))
                          (t 0))))))
-        (make-vmlinux-btf :strtab strtab :types types)))))
+        (make-vmlinux-btf :strtab strtab :types types :type-data type-data)))))
 
 ;;; ========== Struct lookup ==========
 
@@ -150,16 +150,7 @@
    struct/union members. Returns list of (name type offset size)."
   (let* ((types (vmlinux-btf-types vmbtf))
          (strtab (vmlinux-btf-strtab vmbtf))
-         (type-data (with-open-file (f "/sys/kernel/btf/vmlinux"
-                                       :element-type '(unsigned-byte 8))
-                      (let ((buf (make-array (file-length f)
-                                             :element-type '(unsigned-byte 8))))
-                        (read-sequence buf f)
-                        (let* ((hdr-len (btf-u32 buf 4))
-                               (type-off (btf-u32 buf 8))
-                               (type-len (btf-u32 buf 12)))
-                          (subseq buf (+ hdr-len type-off)
-                                  (+ hdr-len type-off type-len)))))))
+         (type-data (vmlinux-btf-type-data vmbtf)))
     (labels ((collect-fields (tid base-offset)
                "Collect fields from struct/union at TID, adding BASE-OFFSET
                 to each field's byte offset. Recurses into anonymous members."
@@ -192,6 +183,97 @@
                  (nreverse fields))))
       (collect-fields struct-type-id 0))))
 
+;;; ========== Context struct BTF lookup ==========
+
+(defun btf-resolve-array (vmbtf type-id)
+  "Resolve a BTF array type. Returns (values elem-bpf-type nelems) or NIL."
+  (let* ((types (vmlinux-btf-types vmbtf))
+         (type-data (vmlinux-btf-type-data vmbtf))
+         (rec (when (and type-id (< type-id (length types)))
+                (aref types type-id))))
+    (when (and rec (= (getf rec :kind) +btf-kind-array+))
+      (let* ((data-off (getf rec :data-off))
+             (elem-type-id (btf-u32 type-data data-off))
+             (nelems (btf-u32 type-data (+ data-off 8))))
+        (multiple-value-bind (bpf-type size name)
+            (btf-resolve-type vmbtf elem-type-id)
+          (declare (ignore size name))
+          (when bpf-type
+            (values bpf-type nelems)))))))
+
+(defun btf-member-raw-type-id (vmbtf member-type-id)
+  "Follow typedef/const/volatile/restrict chain without collapsing to a scalar.
+   Returns the underlying type-id (struct, array, int, ptr, etc.)."
+  (let ((types (vmlinux-btf-types vmbtf)))
+    (loop for id = member-type-id then (getf rec :size)
+          for rec = (when (and id (< id (length types))) (aref types id))
+          while rec
+          for kind = (getf rec :kind)
+          unless (member kind (list +btf-kind-typedef+ +btf-kind-volatile+
+                                    +btf-kind-const+ +btf-kind-restrict+))
+            return (values id kind))))
+
+(defun btf-ctx-struct-fields (vmbtf struct-name)
+  "Look up a context struct in BTF and return fields in *ctx-struct-fields* format:
+   ((field-name type offset) ...) where type is u8/u16/u32/u64, (:array elem-type count),
+   or :ptr. Recursively flattens anonymous struct/union members.
+   Returns NIL if the struct is not found."
+  (multiple-value-bind (type-id rec) (btf-find-struct vmbtf struct-name)
+    (declare (ignore rec))
+    (when type-id
+      (let* ((types (vmlinux-btf-types vmbtf))
+             (strtab (vmlinux-btf-strtab vmbtf))
+             (type-data (vmlinux-btf-type-data vmbtf)))
+        (labels ((collect (tid base-offset)
+                   (let* ((srec (aref types tid))
+                          (data-off (getf srec :data-off))
+                          (vlen (getf srec :vlen))
+                          (fields '()))
+                     (dotimes (i vlen)
+                       (let* ((moff (+ data-off (* i 12)))
+                              (name-off (btf-u32 type-data moff))
+                              (member-type-id (btf-u32 type-data (+ moff 4)))
+                              (bit-offset (btf-u32 type-data (+ moff 8)))
+                              (byte-offset (+ base-offset (ash bit-offset -3)))
+                              (fname (btf-string strtab name-off)))
+                         (if (plusp (length fname))
+                             ;; Named field
+                             (let ((lisp-name (intern (string-upcase (substitute #\- #\_ fname))
+                                                      (find-package '#:whistler))))
+                               (multiple-value-bind (raw-id raw-kind)
+                                   (btf-member-raw-type-id vmbtf member-type-id)
+                                 (cond
+                                   ;; Array field
+                                   ((= raw-kind +btf-kind-array+)
+                                    (multiple-value-bind (elem-type nelems)
+                                        (btf-resolve-array vmbtf raw-id)
+                                      (when elem-type
+                                        (push (list lisp-name (list :array elem-type nelems)
+                                                    byte-offset)
+                                              fields))))
+                                   ;; Pointer field
+                                   ((= raw-kind +btf-kind-ptr+)
+                                    (push (list lisp-name :ptr byte-offset) fields))
+                                   ;; Scalar (int, enum)
+                                   (t
+                                    (multiple-value-bind (bpf-type size name)
+                                        (btf-resolve-type vmbtf member-type-id)
+                                      (declare (ignore size name))
+                                      (when bpf-type
+                                        (push (list lisp-name bpf-type byte-offset)
+                                              fields)))))))
+                             ;; Anonymous struct/union: recurse
+                             (multiple-value-bind (raw-id raw-kind)
+                                 (btf-member-raw-type-id vmbtf member-type-id)
+                               (declare (ignore raw-id))
+                               (when (member raw-kind
+                                             (list +btf-kind-struct+ +btf-kind-union+))
+                                 (setf fields
+                                       (nconc (collect member-type-id byte-offset)
+                                              fields)))))))
+                     (nreverse fields))))
+          (collect type-id 0))))))
+
 ;;; ========== Typed pointer support ==========
 
 (defmacro typed-ptr (struct-type expr)
@@ -223,10 +305,29 @@
 (defvar *vmlinux-btf-cache* nil
   "Cached vmlinux BTF parse, shared across macro expansions.")
 
+(defvar *vmlinux-btf-path* nil
+  "When set, override the default /sys/kernel/btf/vmlinux path for BTF lookup.
+   Use this for cross-compilation or CI environments without a running kernel.")
+
 (defun ensure-vmlinux-btf ()
   (or *vmlinux-btf-cache*
       (setf *vmlinux-btf-cache*
-            (read-vmlinux-btf))))
+            (read-vmlinux-btf
+             (or *vmlinux-btf-path* "/sys/kernel/btf/vmlinux")))))
+
+;;; Install BTF resolver for context field lookup.
+;;; Returns nil (triggering static table fallback) when BTF is unavailable.
+(setf whistler/compiler:*ctx-btf-resolver*
+      (let ((btf-cache nil)
+            (btf-tried nil))
+        (lambda (struct-name)
+          (unless btf-tried
+            (setf btf-tried t)
+            (let ((path (or *vmlinux-btf-path* "/sys/kernel/btf/vmlinux")))
+              (when (probe-file path)
+                (setf btf-cache (ensure-vmlinux-btf)))))
+          (when btf-cache
+            (btf-ctx-struct-fields btf-cache struct-name)))))
 
 (defmacro import-kernel-struct (struct-name &rest field-names)
   "Import a kernel struct from vmlinux BTF at macroexpand time.

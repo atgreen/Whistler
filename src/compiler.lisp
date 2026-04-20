@@ -139,6 +139,11 @@
 
 ;;; ========== Context struct layouts ==========
 
+(defvar *ctx-btf-resolver* nil
+  "When non-nil, a function (lambda (struct-name) ...) that looks up a context
+   struct in the kernel's BTF and returns fields in *ctx-struct-fields* format:
+   ((field-name type offset) ...). Set by vmlinux.lisp at load time.")
+
 (defparameter *prog-type-to-ctx-struct*
   '((:xdp              . "xdp_md")
     (:cgroup-skb        . "__sk_buff")
@@ -208,10 +213,14 @@
 
 (defun ctx-resolve-field (prog-type field-name &optional index)
   "Resolve a context field name to (values type offset) for a program type.
-   For array fields, INDEX must be a compile-time constant integer."
+   For array fields, INDEX must be a compile-time constant integer.
+   Tries BTF resolution first (when available), falls back to static table."
   (let* ((struct-name (cdr (assoc prog-type *prog-type-to-ctx-struct*)))
-         (struct (when struct-name
-                   (cdr (assoc struct-name *ctx-struct-fields* :test #'string=))))
+         (btf-fields (when (and struct-name *ctx-btf-resolver*)
+                       (funcall *ctx-btf-resolver* struct-name)))
+         (struct (or btf-fields
+                     (when struct-name
+                       (cdr (assoc struct-name *ctx-struct-fields* :test #'string=)))))
          (field (when struct
                   (find (symbol-name field-name) struct
                         :key (lambda (f) (symbol-name (first f)))
