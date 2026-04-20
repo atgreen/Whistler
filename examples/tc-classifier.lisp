@@ -13,12 +13,6 @@
 
 (in-package #:whistler)
 
-;;; TC __sk_buff context field accessors
-;;; __sk_buff has data at offset 76, data_end at 80 (vs xdp_md: 0 and 4)
-
-(defmacro skb-data ()     `(ctx-load u32 76))
-(defmacro skb-data-end () `(ctx-load u32 80))
-
 ;;; Maps
 
 ;; Per-category packet counters
@@ -40,9 +34,9 @@
 
 ;;; Program
 
-(defprog tc-classify (:type :xdp :section "classifier" :license "GPL")
-  (let ((data     (skb-data))
-        (data-end (skb-data-end)))
+(defprog tc-classify (:type :tc :section "classifier" :license "GPL")
+  (let ((data     (ctx data))
+        (data-end (ctx data-end)))
     ;; Bounds check: Eth(14) + IPv4(20) + L4 ports(4) = 38
     (when (> (+ data 38) data-end)
       (return TC_ACT_OK))

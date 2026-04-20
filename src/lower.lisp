@@ -18,7 +18,8 @@
   (block nil)         ; current basic-block
   (env '())           ; ((name type vreg) ...) variable bindings
   (maps '())          ; ((name . bpf-map) ...) map definitions
-  (next-id 0))        ; instruction sequence counter
+  (next-id 0)         ; instruction sequence counter
+  (prog-type nil))    ; program type keyword (e.g., :xdp, :cgroup-sock-addr)
 
 (defun ctx-emit (ctx op dst args &optional type)
   "Emit an IR instruction into the current block."
@@ -115,15 +116,17 @@
 
 ;;; ========== Main lowering entry point ==========
 
-(defun lower-program (section license maps body)
+(defun lower-program (section license maps body &key prog-type)
   "Lower a Whistler program to SSA IR.
    MAPS: list of bpf-map structs.
-   BODY: list of macro-expanded, constant-folded s-expressions."
+   BODY: list of macro-expanded, constant-folded s-expressions.
+   PROG-TYPE: program type keyword (e.g., :xdp, :cgroup-sock-addr)."
   (let* ((prog (make-ir-program :section section :license license
                                 :maps maps :next-vreg 0))
          (entry-label (ir-fresh-label prog "entry"))
          (entry-block (make-basic-block :label entry-label))
-         (ctx (make-lower-ctx :prog prog :block entry-block)))
+         (ctx (make-lower-ctx :prog prog :block entry-block
+                              :prog-type prog-type)))
     (setf (ir-program-entry prog) entry-label)
     (ir-add-block prog entry-block)
 
@@ -300,7 +303,14 @@
        (lower-ringbuf-discard ctx (first args) (second args)))
 
       ((sym= head 'ctx)
-       (lower-ctx-load ctx (first args) (second args)))
+       (if (whistler/compiler:bpf-type-p (first args))
+           ;; Legacy: (ctx TYPE OFFSET)
+           (lower-ctx-load ctx (first args) (second args))
+           ;; Field name: (ctx field-name) or (ctx field-name index)
+           (multiple-value-bind (type offset)
+               (whistler/compiler:ctx-resolve-field (lower-ctx-prog-type ctx)
+                                           (first args) (second args))
+             (lower-ctx-load ctx type offset))))
 
       ((sym= head 'ctx-load)
        (warn "ctx-load is deprecated; use (ctx TYPE OFFSET) instead")
@@ -314,7 +324,18 @@
 
       ((sym= head '%ctx-set)
        ;; Internal form emitted by (setf (ctx ...) ...) expansion
-       (lower-ctx-store ctx (first args) (second args) (third args)))
+       ;; Shapes: (%ctx-set TYPE OFFSET VAL) or (%ctx-set FIELD VAL)
+       ;;         or (%ctx-set FIELD INDEX VAL)
+       (if (whistler/compiler:bpf-type-p (first args))
+           ;; Legacy: (%ctx-set TYPE OFFSET VAL)
+           (lower-ctx-store ctx (first args) (second args) (third args))
+           ;; Field name: last arg is always the value
+           (let ((value-form (car (last args)))
+                 (field-args (butlast (cdr args))))
+             (multiple-value-bind (type offset)
+                 (whistler/compiler:ctx-resolve-field (lower-ctx-prog-type ctx)
+                                            (first args) (first field-args))
+               (lower-ctx-store ctx type offset value-form)))))
 
       ((sym= head 'ctx-store)
        (warn "ctx-store is deprecated; use (setf (ctx TYPE OFFSET) VALUE) instead")

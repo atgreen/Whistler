@@ -362,6 +362,9 @@
          (cl:defmacro ,make-name ()
            '(struct-alloc ,total))))))
 
+;;; Context struct tables and field resolution are in src/compiler.lisp
+;;; (shared between whistler and whistler/ir packages).
+
 ;;; Context access — (ctx TYPE OFFSET) is setf-able
 ;;;
 ;;; We use define-setf-expander (not defsetf) because TYPE is DSL syntax
@@ -369,15 +372,15 @@
 ;;; binding and try to evaluate it. define-setf-expander lets us splice
 ;;; TYPE directly into the generated form.
 
-(define-setf-expander ctx (type offset &environment env)
+(define-setf-expander ctx (&rest ctx-args &environment env)
   (declare (ignore env))
   (let ((val-temp (gensym "VAL")))
     (values
-     nil                                    ; no temps (type/offset are constants)
-     nil                                    ; no value forms
-     (list val-temp)                        ; store variable
-     `(%ctx-set ,type ,offset ,val-temp)    ; storing form
-     `(ctx ,type ,offset))))
+     nil
+     nil
+     (list val-temp)
+     `(%ctx-set ,@ctx-args ,val-temp)
+     `(ctx ,@ctx-args))))
 
 ;;; Memory operations
 
@@ -505,7 +508,7 @@
    no need for an explicit (return ...) at the end."
   (let ((sec (or section (string-downcase (symbol-name type))))
         (wrapped-body (wrap-implicit-return body)))
-    `(push (list ',name :section ,sec :license ,license :body ',wrapped-body)
+    `(push (list ',name :type ,type :section ,sec :license ,license :body ',wrapped-body)
            *programs*)))
 
 (defun wrap-implicit-return (body)
@@ -536,8 +539,9 @@
     ;; Compile each program independently
     (let ((compiled-units
            (mapcar (lambda (prog-spec)
-                     (destructuring-bind (name &key section license body) prog-spec
-                       (let ((cu (compile-program section license maps body)))
+                     (destructuring-bind (name &key type section license body) prog-spec
+                       (let ((cu (compile-program section license maps body
+                                                  :prog-type type)))
                          (setf (cu-name cu)
                                (substitute #\_ #\-
                                            (string-downcase (symbol-name name))))
@@ -622,7 +626,7 @@
              (< (length (cu-map-relocs candidate))
                 (length (cu-map-relocs best)))))))
 
-(defun compile-program (section license maps body)
+(defun compile-program (section license maps body &key prog-type)
   "Compile a program through the SSA IR pipeline.
    Returns a compilation-unit."
   ;; Build map structs
@@ -652,7 +656,8 @@
       ;; vregs — these would produce BPF verifier 'Rn !read_ok' errors.
       (let ((best-cu nil))
         (dolist (candidate (backend-candidates))
-          (let ((ir (whistler/ir:lower-program section license map-structs expanded)))
+          (let ((ir (whistler/ir:lower-program section license map-structs expanded
+                                              :prog-type prog-type)))
             (let ((whistler/ir::*force-save-ctx* (getf candidate :force-save-ctx)))
               (whistler/ir:optimize-ir ir)
               (when (whistler/ir:ir-well-formed-p ir)

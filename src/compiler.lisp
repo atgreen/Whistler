@@ -137,6 +137,124 @@
     ((:u32 :i32) 4)
     ((:u64 :i64) 8)))
 
+;;; ========== Context struct layouts ==========
+
+(defparameter *prog-type-to-ctx-struct*
+  '((:xdp              . "xdp_md")
+    (:cgroup-skb        . "__sk_buff")
+    (:cgroup-sock-addr  . "bpf_sock_addr")
+    (:cgroup-sock       . "bpf_sock_ops")
+    (:tc                . "__sk_buff")))
+
+(defparameter *ctx-struct-fields*
+  '(("xdp_md" .
+     ((data          u32 0)
+      (data-end      u32 4)
+      (data-meta     u32 8)
+      (ingress-ifindex u32 12)
+      (rx-queue-index u32 16)
+      (egress-ifindex u32 20)))
+    ("bpf_sock_addr" .
+     ((user-family   u32 0)
+      (user-ip4      u32 4)
+      (user-ip6      (:array u32 4) 8)
+      (user-port     u32 24)
+      (family        u32 28)
+      (type          u32 32)
+      (protocol      u32 36)
+      (msg-src-ip4   u32 40)
+      (msg-src-ip6   (:array u32 4) 44)
+      (sk            :ptr 60)))
+    ("bpf_sock_ops" .
+     ((op            u32 0)
+      (args          (:array u32 4) 4)
+      (family        u32 20)
+      (remote-ip4    u32 24)
+      (local-ip4     u32 28)
+      (remote-ip6    (:array u32 4) 32)
+      (local-ip6     (:array u32 4) 48)
+      (remote-port   u32 64)
+      (local-port    u32 68)
+      (is-fullsock   u32 72)
+      (snd-cwnd      u32 76)
+      (srtt-us       u32 80)))
+    ("__sk_buff" .
+     ((len           u32 0)
+      (pkt-type      u32 4)
+      (mark          u32 8)
+      (queue-mapping u32 12)
+      (protocol      u32 16)
+      (vlan-present  u32 20)
+      (vlan-tci      u32 24)
+      (vlan-proto    u32 28)
+      (priority      u32 32)
+      (ingress-ifindex u32 36)
+      (ifindex       u32 40)
+      (tc-index      u32 44)
+      (cb            (:array u32 5) 48)
+      (hash          u32 68)
+      (tc-classid    u32 72)
+      (data          u32 76)
+      (data-end      u32 80)
+      (napi-id       u32 84)
+      (family        u32 88)
+      (remote-ip4    u32 92)
+      (local-ip4     u32 96)
+      (remote-ip6    (:array u32 4) 100)
+      (local-ip6     (:array u32 4) 116)
+      (remote-port   u32 132)
+      (local-port    u32 136)
+      (data-meta     u32 140)))))
+
+(defun ctx-resolve-field (prog-type field-name &optional index)
+  "Resolve a context field name to (values type offset) for a program type.
+   For array fields, INDEX must be a compile-time constant integer."
+  (let* ((struct-name (cdr (assoc prog-type *prog-type-to-ctx-struct*)))
+         (struct (when struct-name
+                   (cdr (assoc struct-name *ctx-struct-fields* :test #'string=))))
+         (field (when struct
+                  (find (symbol-name field-name) struct
+                        :key (lambda (f) (symbol-name (first f)))
+                        :test #'string=))))
+    (unless field
+      (whistler-error
+       :what (format nil "unknown context field: ~a" field-name)
+       :expected (if struct
+                     (format nil "a field of ~a: ~{~a~^, ~}" struct-name
+                             (mapcar #'first struct))
+                     (format nil "program type ~a has no known context struct"
+                             (or prog-type :unknown)))))
+    (destructuring-bind (name ftype foffset) field
+      (declare (ignore name))
+      (cond
+        ;; Array field
+        ((and (consp ftype) (eq (first ftype) :array))
+         (unless index
+           (whistler-error
+            :what (format nil "~a is an array field — index required" field-name)
+            :expected (format nil "(ctx ~a INDEX)" field-name)))
+         (unless (integerp index)
+           (whistler-error
+            :what (format nil "array index must be a compile-time constant, got ~s" index)))
+         (let ((elem-type (second ftype))
+               (count (third ftype)))
+           (when (or (< index 0) (>= index count))
+             (whistler-error
+              :what (format nil "index ~d out of bounds for ~a[~d]" index field-name count)))
+           (values elem-type (+ foffset (* index (bpf-type-size elem-type))))))
+        ;; Pointer field
+        ((eq ftype :ptr)
+         (when index
+           (whistler-error
+            :what (format nil "~a is a pointer field — no index allowed" field-name)))
+         (values 'u64 foffset))
+        ;; Scalar field
+        (t
+         (when index
+           (whistler-error
+            :what (format nil "~a is a scalar field — no index allowed" field-name)))
+         (values ftype foffset))))))
+
 (defun builtin-helper-p (sym)
   "Return the helper ID if SYM names a known BPF helper, or NIL."
   (and (symbolp sym)

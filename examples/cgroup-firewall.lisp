@@ -46,28 +46,8 @@
 ;; sockops callback types
 (defconstant +bpf-sock-ops-active-established-cb+ 4)
 
-;;; ========== bpf_sock_addr context offsets ==========
-;; struct bpf_sock_addr { user_family(0), user_ip4(4), user_ip6(8..23),
-;;                        user_port(24), family(28), type(32), protocol(36) }
-
-(defconstant +sock-addr-user-ip4+  4)
-(defconstant +sock-addr-user-port+ 24)
-
-;;; ========== bpf_sock_ops context offsets ==========
-;; struct bpf_sock_ops { op(0), union{args/reply/replylong}(4..19),
-;;                       family(20), remote_ip4(24), local_ip4(28),
-;;                       remote_ip6(32..47), local_ip6(48..63),
-;;                       remote_port(64), local_port(68) }
-
-(defconstant +sock-ops-op+         0)
-(defconstant +sock-ops-family+     20)
-(defconstant +sock-ops-local-port+ 68)
-
-;;; ========== __sk_buff context offsets ==========
-;; struct __sk_buff { len(0)..napi_id(84), family(88) }
-
-(defconstant +skb-protocol+ 16)
-(defconstant +skb-family+   88)
+;;; Context field offsets are resolved automatically from the program
+;;; type via (ctx field-name).  No manual offset constants needed.
 
 ;;; ========== Packet headers ==========
 
@@ -173,8 +153,8 @@
     (map-update socket-pid-map pid-key pid 0)
 
     ;; Read context fields
-    (let* ((user-ip4  (ctx u32 +sock-addr-user-ip4+))
-           (user-port (ctx u32 +sock-addr-user-port+))
+    (let* ((user-ip4  (ctx user-ip4))
+           (user-port (ctx user-port))
            (original-ip user-ip4)
            (original-port (ntohs (cast u16 user-port))))
 
@@ -183,21 +163,21 @@
         ((or (= user-port (htons 80))
              (= user-port (htons 443)))
 
-         (setf (ctx u32 +sock-addr-user-ip4+) +localhost-nbo+)
+         (setf (ctx user-ip4) +localhost-nbo+)
 
          ;; Redirect port based on original port
          ;; NOTE: proxy ports must be set by loader; using placeholders
          (when (= user-port (htons 80))
-           (setf (ctx u32 +sock-addr-user-port+) (htons 8080)))
+           (setf (ctx user-port) (htons 8080)))
          (when (= user-port (htons 443))
-           (setf (ctx u32 +sock-addr-user-port+) (htons 8443)))
+           (setf (ctx user-port) (htons 8443)))
 
          ;; Send HTTP redirect event
          (let ((evt (make-event)))
            (setf (event-pid evt) pid
-                 (event-port evt) (ntohs (cast u16 (ctx u32 +sock-addr-user-port+)))
+                 (event-port evt) (ntohs (cast u16 (ctx user-port)))
                  (event-allowed evt) 1
-                 (event-ip evt) (ntohl (ctx u32 +sock-addr-user-ip4+))
+                 (event-ip evt) (ntohl (ctx user-ip4))
                  (event-original-ip evt) original-ip
                  (event-event-type evt) +http-redirect+
                  (event-redirected evt) 1
@@ -212,15 +192,15 @@
         ;; DNS port (53) — redirect to local DNS proxy
         ((= user-port (htons 53))
 
-         (setf (ctx u32 +sock-addr-user-ip4+) +localhost-nbo+)
-         (setf (ctx u32 +sock-addr-user-port+) (htons 5553))
+         (setf (ctx user-ip4) +localhost-nbo+)
+         (setf (ctx user-port) (htons 5553))
 
          ;; Send DNS redirect event
          (let ((evt (make-event)))
            (setf (event-pid evt) pid
-                 (event-port evt) (ntohs (cast u16 (ctx u32 +sock-addr-user-port+)))
+                 (event-port evt) (ntohs (cast u16 (ctx user-port)))
                  (event-allowed evt) 1
-                 (event-ip evt) (ntohl (ctx u32 +sock-addr-user-ip4+))
+                 (event-ip evt) (ntohl (ctx user-ip4))
                  (event-original-ip evt) original-ip
                  (event-event-type evt) +dns-redirect+
                  (event-redirected evt) 1
@@ -243,15 +223,15 @@
 (defprog cg-sock-ops (:type :cgroup-sock
                       :section "sockops"
                       :license "GPL")
-  (let ((family (ctx u32 +sock-ops-family+)))
+  (let ((family (ctx family)))
     (when (/= family +af-inet+)
       (return 0))
 
     ;; Outbound connection established (client calling out)
-    (let ((op (ctx u32 +sock-ops-op+)))
+    (let ((op (ctx op)))
       (when (= op +bpf-sock-ops-active-established-cb+)
         (let* ((cookie (get-socket-cookie (ctx-ptr)))
-               (src-port u16 (cast u16 (ctx u32 +sock-ops-local-port+))))
+               (src-port u16 (cast u16 (ctx local-port))))
           (map-update src-port-to-sock-client src-port cookie 0)))))
   0)
 
@@ -342,7 +322,7 @@
             (setf port (tcp-hdr-dst-port pkt))))
 
         ;; Block IPv6 traffic (not supported)
-        (let ((family (ctx u32 +skb-family+)))
+        (let ((family (ctx family)))
           (when (= family +af-inet6+)
             (let ((evt (make-event)))
               (setf (event-pid evt) pid
