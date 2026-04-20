@@ -1211,66 +1211,50 @@
 
 ;;; ========== Context load ==========
 
-;;; Context struct layouts for compile-time validation.
-;;; Each entry: (offset size-bytes type-kw pointer-p)
-;;; pointer-p indicates the field holds a pointer (packet data, packet end, etc.)
-;;; that the verifier will track — arithmetic on these is restricted.
-
-(defparameter *xdp-ctx-fields*
-  '((0  4 u32 :pkt)         ; data       — packet pointer
-    (4  4 u32 :pkt-end)     ; data_end   — packet end pointer
-    (8  4 u32 :scalar)      ; data_meta
-    (12 4 u32 :scalar)      ; ingress_ifindex
-    (16 4 u32 :scalar))     ; rx_queue_index
-  "xdp_md context fields: (offset size type pointer-kind)")
-
-(defparameter *skb-ctx-fields*
-  '((76 4 u32 :pkt)         ; data       — packet pointer
-    (80 4 u32 :pkt-end))    ; data_end   — packet end pointer
-  "Commonly accessed __sk_buff context fields for TC programs.")
-
-(defun section-to-ctx-fields (section)
-  "Return the context field layout for the given section, or NIL if unknown."
-  (cond
-    ((or (string= section "xdp")
-         (and (> (length section) 4)
-              (string= (subseq section 0 4) "xdp/")))
-     *xdp-ctx-fields*)
-    ((or (string= section "tc")
-         (and (> (length section) 3)
-              (string= (subseq section 0 3) "tc/"))
-         (string= section "classifier"))
-     *skb-ctx-fields*)
-    ;; kprobe/uprobe: pt_regs — all u64 fields, don't restrict
-    ;; tracepoint: variable layout, don't restrict
-    ;; cgroup: __sk_buff or bpf_sock, partial coverage
-    (t nil)))
-
-(defun ctx-field-lookup (fields offset)
-  "Find the field at OFFSET in FIELDS. Returns (offset size type pointer-kind) or NIL."
-  (find offset fields :key #'first))
+;;; Context load validation uses *ctx-struct-fields* from whistler/compiler
+;;; (the same table that field-name resolution uses) as the single source of truth.
 
 (defun validate-ctx-load (ctx type-kw offset)
-  "Validate a ctx-load against the known context struct layout.
-   Signals a compile-time error for invalid access widths.
-   Returns the pointer kind (:pkt, :pkt-end, :scalar) or NIL if unknown."
-  (let* ((section (ir-program-section (lower-ctx-prog ctx)))
-         (fields (section-to-ctx-fields section)))
+  "Validate a ctx-load against the context struct layout from *ctx-struct-fields*.
+   Signals a compile-time error for invalid access widths."
+  (let* ((prog-type (lower-ctx-prog-type ctx))
+         (struct-name (when prog-type
+                        (cdr (assoc prog-type whistler/compiler:*prog-type-to-ctx-struct*))))
+         (fields (when struct-name
+                   (cdr (assoc struct-name whistler/compiler:*ctx-struct-fields*
+                               :test #'string=)))))
     (when fields
-      (let ((field (ctx-field-lookup fields offset)))
-        (cond
-          ;; Unknown offset — warn but allow (context structs may have fields we don't track)
-          ((null field) nil)
-          ;; Access size mismatch
-          ((/= (whistler/compiler:bpf-type-size type-kw)
-                (second field))
-           (whistler/compiler:whistler-error
-            :what (format nil "ctx-load ~a at offset ~d: wrong access size" type-kw offset)
-            :expected (format nil "~a (~d bytes) — the context field at this offset is ~d bytes wide"
-                              (third field) (second field) (second field))
-            :hint (format nil "use (ctx-load ~a ~d) instead" (third field) offset)))
-          ;; Valid — return pointer kind
-          (t (fourth field)))))))
+      ;; Find the field at this offset (scalar or array element)
+      (let ((field (find offset fields
+                         :key (lambda (f)
+                                (let ((ftype (second f))
+                                      (foffset (third f)))
+                                  (if (and (consp ftype) (eq (first ftype) :array))
+                                      ;; Array field: match any element offset
+                                      ;; within [base, base + count*elem-size)
+                                      (let* ((elem-type (second ftype))
+                                             (elem-size (whistler/compiler:bpf-type-size elem-type))
+                                             (count (third ftype)))
+                                        (if (and (>= offset foffset)
+                                                 (< offset (+ foffset (* count elem-size)))
+                                                 (zerop (mod (- offset foffset) elem-size)))
+                                            offset
+                                            -1))
+                                      foffset)))
+                         :test #'=)))
+        (when field
+          (let* ((ftype (second field))
+                 (expected-type (if (and (consp ftype) (eq (first ftype) :array))
+                                   (second ftype)
+                                   ftype))
+                 (expected-size (whistler/compiler:bpf-type-size expected-type)))
+            (when (/= (whistler/compiler:bpf-type-size type-kw) expected-size)
+              (whistler/compiler:whistler-error
+               :what (format nil "ctx-load ~a at offset ~d: wrong access size" type-kw offset)
+               :expected (format nil "~a (~d bytes) -- the context field at this offset is ~d bytes wide"
+                                 expected-type expected-size expected-size)
+               :hint (format nil "use (ctx ~a ~d) instead" expected-type offset)))))))))
+
 
 (defun lower-ctx-load (ctx type-kw offset)
   (validate-ctx-load ctx type-kw offset)
