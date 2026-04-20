@@ -30,7 +30,7 @@ Pipeline: **source** → macro expansion → **lowering** (lower.lisp) → SSA I
 |------|---------|
 | `packages.lisp` | Package definitions and exports |
 | `bpf.lisp` | BPF instruction encoding, constants, opcodes |
-| `compiler.lisp` | Legacy direct compiler, macro expansion (`whistler-macroexpand`), constant folding, **shared definitions** (helpers, constants, builtins — single source of truth for both pipelines) |
+| `compiler.lisp` | Legacy direct compiler, macro expansion (`whistler-macroexpand`), constant folding, **shared definitions** (helpers, constants, builtins, context struct layouts, BTF resolver hook -- single source of truth for both pipelines) |
 | `ir.lisp` | SSA IR data structures (`ir-insn`, `basic-block`, `ir-program`) |
 | `lower.lisp` | Lowering from surface language to SSA IR |
 | `ssa-opt.lisp` | SSA optimizations (copy prop, DCE, constant folding, phi threading) |
@@ -40,6 +40,7 @@ Pipeline: **source** → macro expansion → **lowering** (lower.lisp) → SSA I
 | `btf.lisp` | BTF type encoding and BTF.ext (CO-RE relocations, func_info) |
 | `elf.lisp` | ELF object file writer (multi-program support) |
 | `protocols.lisp` | Protocol header macros (Ethernet, IPv4, TCP, UDP), map/struct surface macros |
+| `vmlinux.lisp` | BTF reader, `import-kernel-struct`, context struct BTF lookup, CO-RE resolver |
 | `whistler.lisp` | Top-level interface: `defmap`, `defprog`, `defstruct`, `compile-to-elf` |
 
 ### Packages
@@ -63,13 +64,15 @@ Programs are defined with `defprog`, maps with `defmap`, structs with `defstruct
 
 Use `(declare (type ...))` for narrowing when inference can't determine the type (integer literals, arithmetic results).
 
-Key forms: `let` (parallel bindings, standard CL), `let*` (sequential bindings), `if`, `when`, `unless`, `when-let`, `if-let`, `return`, `load`, `store`, `logand`, `logxor`, `>>`, `ash`, `cast`, `map-lookup`, `map-update`, `map-delete`, `map-lookup-ptr`, `struct-alloc`, `stack-addr`, `tail-call`, `get-prandom-u32`, `sizeof`, `memset`, `memcpy`, `do-user-ptrs`, `do-user-array`, `with-ringbuf`, `fill-process-info`, `pt-regs-parm1`..`parm6`, `pt-regs-ret`, protocol accessors.
+Key forms: `let` (parallel bindings, standard CL), `let*` (sequential bindings), `if`, `when`, `unless`, `when-let`, `if-let`, `return`, `load`, `store`, `logand`, `logxor`, `>>`, `ash`, `cast`, `ctx`, `map-lookup`, `map-update`, `map-delete`, `map-lookup-ptr`, `struct-alloc`, `stack-addr`, `tail-call`, `get-prandom-u32`, `sizeof`, `memset`, `memcpy`, `do-user-ptrs`, `do-user-array`, `with-ringbuf`, `fill-process-info`, `pt-regs-parm1`..`parm6`, `pt-regs-ret`, protocol accessors.
 
 `setf` supports CL-style multi-pair: `(setf place1 val1 place2 val2 ...)`. `defmap` defaults `:key-size` and `:value-size` to 0 (omit for ringbuf maps).
 
 `defstruct` generates BPF accessors `(name-field ptr)`, `setf` expanders, indexed array access, and pointer accessors `(name-field-ptr ptr)`. Also generates CL-side: `name` struct with `(name-field instance)` accessors, `decode-name` (bytes→struct), `encode-name` (struct→bytes). The CL accessors use the same names as the BPF accessors. `(sizeof name)` returns compile-time struct size. Maps support `(getmap m k)` / `(setf (getmap m k) v)` / `(remmap m k)` — matching CL's gethash/remhash pattern.
 
 `with-ringbuf` handles reserve/null-check/submit: `(with-ringbuf (var map size) body...)`. `fill-process-info` fills pid/uid/timestamp/comm from BPF helpers using struct accessor names.
+
+Context access: `(ctx field-name)` reads a field from the program's context struct, resolved by program type (e.g., `:xdp` uses `xdp_md`, `:cgroup-sock-addr` uses `bpf_sock_addr`). `(setf (ctx field-name) val)` writes. Array fields: `(ctx user-ip6 0)`. Legacy `(ctx u32 4)` with explicit type+offset still works. Field-name access emits CO-RE relocations for compile-once portability; offsets are resolved from BTF at compile time when `/sys/kernel/btf/vmlinux` is available, falling back to a static table.
 
 Memory ops: `(memset ptr off val n)` with widened stores, `(memcpy dst doff src soff n)` with wide load/store pairs. `(pt-regs-parm1)` through `(pt-regs-parm6)` and `(pt-regs-ret)` for uprobe/kprobe context access (x86-64 and aarch64; compile-time error on unsupported architectures).
 
