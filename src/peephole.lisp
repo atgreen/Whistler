@@ -166,8 +166,11 @@
           do (let* ((ra (whistler/bpf:bpf-insn-dst mov))
                     (rb (whistler/bpf:bpf-insn-src mov))
                     (next (aref vec (1+ i))))
-               ;; Next instruction reads rA as source?
-               (when (and (insn-reads-reg next ra)
+               ;; Next instruction reads rA in its src field specifically?
+               ;; (Not as ALU accumulator via dst — that would require rewriting
+               ;; the dst which changes where the result is stored.)
+               (when (and (= (whistler/bpf:bpf-insn-src next) ra)
+                          (plusp (logand (whistler/bpf:bpf-insn-code next) #x08)) ; X-source mode
                           ;; Don't forward if next also reads rB (would change semantics)
                           (not (insn-reads-reg next rb))
                           ;; Don't forward into calls/exits/jumps

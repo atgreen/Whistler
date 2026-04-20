@@ -417,7 +417,7 @@
   (let ((new-active '())
         (new-free free-list))
     (dolist (interval active)
-      (if (< (live-interval-end interval) current-pos)
+      (if (<= (live-interval-end interval) current-pos)
           ;; Expired — return register to pool in sorted order
           ;; to maintain deterministic allocation regardless of expiry timing
           (let ((phys (live-interval-phys interval)))
