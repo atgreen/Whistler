@@ -35,6 +35,32 @@ Discard a reserved record without submitting it.
 (ringbuf-discard ptr flags)
 ```
 
+### ringbuf-output
+
+Copy a stack-allocated struct directly into the ring buffer. This is a
+single helper call -- more compact than the reserve/submit pattern when
+you build the entire record before sending.
+
+```lisp
+(ringbuf-output map-name data-ptr size flags)
+```
+
+`data-ptr` must point to a stack-allocated struct (e.g., from
+`make-event`). The BPF verifier requires the pointer to be fp-derived.
+
+```lisp
+(let ((evt (make-conn-event)))
+  (setf (conn-event-src-addr evt) src
+        (conn-event-dst-addr evt) dst
+        (conn-event-dst-port evt) port
+        (conn-event-proto evt)    proto)
+  (ringbuf-output events evt (sizeof conn-event) 0))
+```
+
+Use `ringbuf-output` when filling all fields before sending. Use
+`with-ringbuf` (below) when you need conditional field logic or want
+to avoid the stack copy.
+
 ## with-ringbuf
 
 The `with-ringbuf` macro handles reserve, body execution, and submit in

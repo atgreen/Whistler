@@ -86,11 +86,46 @@ traffic to localhost:
   (setf (ctx u32 +sock-addr-user-port+) (htons 8080)))
 ```
 
-### Structured events via ring buffer
+### Typed packet headers with defunion
 
-Every firewall decision is reported to userspace with full context --
-PID, original and redirected IPs, port, event type, and DNS transaction
-ID:
+Instead of raw `(load u8 buf 9)` with magic offsets, the example
+defines proper header structs and a union for stack-efficient reuse:
+
+```lisp
+(defstruct ip-hdr
+  (ver-ihl u8) (tos u8) (tot-len u16) (id u16) (frag-off u16)
+  (ttl u8) (protocol u8) (check u16) (saddr u32) (daddr u32))
+
+(defstruct udp-hdr
+  (src-port u16) (dst-port u16) (length u16) (checksum u16))
+
+(defstruct tcp-hdr
+  (src-port u16) (dst-port u16) (seq u32) (ack-seq u32)
+  (doff-flags u16) (window u16) (check u16) (urg-ptr u16))
+
+;; Single stack allocation, accessed through any header's accessors
+(defunion packet-buf ip-hdr udp-hdr tcp-hdr)
+```
+
+`defunion` allocates the size of the largest member. The returned
+pointer works with any member's field accessors since all members
+share offset 0:
+
+```lisp
+(let* ((pkt (make-packet-buf))
+       (rc (skb-load-bytes (ctx-ptr) 0 pkt (sizeof ip-hdr))))
+  (let ((protocol (ip-hdr-protocol pkt))   ; access as IP header
+        (daddr    (ip-hdr-daddr pkt)))
+    ;; Reuse buffer for transport header
+    (skb-load-bytes (ctx-ptr) (sizeof ip-hdr) pkt (sizeof udp-hdr))
+    (udp-hdr-dst-port pkt)))               ; access as UDP header
+```
+
+### Events via ringbuf-output
+
+Every firewall decision is reported to userspace. The event struct is
+built on the stack and copied to the ring buffer in a single helper
+call:
 
 ```lisp
 (defstruct event
@@ -107,28 +142,18 @@ ID:
   (redirected  u8)
   (pad2        u16))
 
-(with-ringbuf (evt events (sizeof event))
+(let ((evt (make-event)))
   (setf (event-pid evt) pid
         (event-port evt) (ntohs port)
         (event-allowed evt) 1
         (event-ip evt) (ntohl daddr)
-        (event-event-type evt) +http-redirect+))
+        (event-event-type evt) +http-redirect+)
+  (ringbuf-output events evt (sizeof event) 0))
 ```
 
-### Packet parsing with skb-load-bytes
-
-The egress program reads IP, TCP, and UDP headers from the packet
-buffer to extract protocol and port information:
-
-```lisp
-(let* ((iph (make-event))  ; reuse struct as scratch buffer
-       (rc (skb-load-bytes (ctx-ptr) 0 iph +iph-size+)))
-  (when (s< rc 0)
-    (return +egress-deny+))
-  (let* ((protocol (load u8 iph +iph-protocol+))
-         (daddr    (load u32 iph +iph-daddr+)))
-    ...))
-```
+This is more compact than `with-ringbuf` (which uses
+reserve+field-stores+submit) and matches the pattern clang generates
+from C's `bpf_ringbuf_output()`.
 
 ## Compiling
 
@@ -173,5 +198,6 @@ maps.
 | Userspace | 2000+ lines of Go | Loader TBD |
 | Build | clang + bpf2go codegen | `./whistler compile` |
 | Maps | C struct definitions | `defmap` declarations |
-| Events | Manual struct packing | `defstruct` + `with-ringbuf` |
+| Headers | C struct casts | `defstruct` + `defunion` |
+| Events | `bpf_ringbuf_output` | `ringbuf-output` |
 | Multi-prog | Separate C files or sections | Single `.lisp` file |

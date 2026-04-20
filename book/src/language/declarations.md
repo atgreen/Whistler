@@ -1,8 +1,8 @@
 # Top-Level Declarations
 
-A Whistler source file consists of three kinds of top-level declarations:
-`defmap`, `defprog`, and `defstruct`. Every other construct lives inside
-the body of a `defprog`.
+A Whistler source file consists of top-level declarations:
+`defmap`, `defprog`, `defstruct`, and `defunion`. Every other construct
+lives inside the body of a `defprog`.
 
 ## defmap
 
@@ -29,3 +29,21 @@ compiler generates constructors, field accessors, and `sizeof`. On the CL
 side it generates a corresponding CL struct with `encode` and `decode`
 functions, so you can pack and unpack data exchanged through maps or ring
 buffers without manual byte wrangling.
+
+## defunion
+
+`defunion` declares a union of existing struct types. It allocates the
+size of the largest member; the returned pointer can be used with any
+member's field accessors (all members share offset 0). This is useful
+for packet parsing where the same stack buffer is reused for different
+header types:
+
+```lisp
+(defstruct ip-hdr  ...)
+(defstruct udp-hdr ...)
+(defunion packet-buf ip-hdr udp-hdr)
+
+(let ((pkt (make-packet-buf)))
+  (skb-load-bytes (ctx-ptr) 0 pkt (sizeof ip-hdr))
+  (ip-hdr-protocol pkt))    ; access through any member's accessors
+```
