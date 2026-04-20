@@ -87,39 +87,24 @@ traffic to localhost:
   (setf (ctx user-port) (htons 8080)))
 ```
 
-### Typed packet headers with defunion
+### Built-in protocol headers
 
-Instead of raw `(load u8 buf 9)` with magic offsets, the example
-defines proper header structs and a union for stack-efficient reuse:
-
-```lisp
-(defstruct ip-hdr
-  (ver-ihl u8) (tos u8) (tot-len u16) (id u16) (frag-off u16)
-  (ttl u8) (protocol u8) (check u16) (saddr u32) (daddr u32))
-
-(defstruct udp-hdr
-  (src-port u16) (dst-port u16) (length u16) (checksum u16))
-
-(defstruct tcp-hdr
-  (src-port u16) (dst-port u16) (seq u32) (ack-seq u32)
-  (doff-flags u16) (window u16) (check u16) (urg-ptr u16))
-
-;; Single stack allocation, accessed through any header's accessors
-(defunion packet-buf ip-hdr udp-hdr tcp-hdr)
-```
-
-`defunion` allocates the size of the largest member. The returned
-pointer works with any member's field accessors since all members
-share offset 0:
+Cgroup/skb programs can't do direct packet access -- they must copy
+packet data onto the stack via `skb-load-bytes`, then read fields from
+the buffer. Whistler's built-in protocol headers (`ipv4-*`, `tcp-*`,
+`udp-*` from `defheader`) work on any pointer, including stack buffers.
+Port accessors auto-convert to host byte order, so comparisons use
+plain integers:
 
 ```lisp
-(let* ((pkt (make-packet-buf))
-       (rc (skb-load-bytes (ctx-ptr) 0 pkt (sizeof ip-hdr))))
-  (let ((protocol (ip-hdr-protocol pkt))   ; access as IP header
-        (daddr    (ip-hdr-daddr pkt)))
+(let* ((pkt (make-pkt-buf))
+       (rc (skb-load-bytes (ctx-ptr) 0 pkt +ipv4-hdr-len+)))
+  (let ((protocol (ipv4-protocol pkt))
+        (daddr    (ipv4-dst-addr pkt)))
     ;; Reuse buffer for transport header
-    (skb-load-bytes (ctx-ptr) (sizeof ip-hdr) pkt (sizeof udp-hdr))
-    (udp-hdr-dst-port pkt)))               ; access as UDP header
+    (skb-load-bytes (ctx-ptr) +ipv4-hdr-len+ pkt +udp-hdr-len+)
+    (when (= (udp-dst-port pkt) 53)     ; host byte order, no htons needed
+      ...)))
 ```
 
 ### Events via ringbuf-output

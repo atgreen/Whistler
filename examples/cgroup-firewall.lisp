@@ -18,10 +18,6 @@
 (defconstant +af-inet+  2)
 (defconstant +af-inet6+ 10)
 
-;; IP protocols
-(defconstant +ipproto-tcp+ 6)
-(defconstant +ipproto-udp+ 17)
-
 ;; Egress return codes
 (defconstant +egress-allow+ 1)
 (defconstant +egress-deny+  0)
@@ -48,39 +44,21 @@
 
 ;;; Context field offsets are resolved automatically from the program
 ;;; type via (ctx field-name).  No manual offset constants needed.
+;;;
+;;; Protocol headers (ipv4, tcp, udp) and their accessors come from
+;;; Whistler's built-in defheader definitions in protocols.lisp.
+;;; Port accessors auto-convert to host byte order.
 
-;;; ========== Packet headers ==========
+;;; ========== Stack buffer for skb_load_bytes ==========
+;;;
+;;; Cgroup/skb programs can't do direct packet access — they must copy
+;;; packet data onto the stack via skb-load-bytes.  We define a minimal
+;;; struct sized to hold the largest header we need (TCP = 20 bytes),
+;;; then use the built-in protocol accessors (ipv4-*, tcp-*, udp-*)
+;;; to read fields from it.
 
-(defstruct ip-hdr
-  (ver-ihl   u8)     ; 0
-  (tos       u8)     ; 1
-  (tot-len   u16)    ; 2
-  (id        u16)    ; 4
-  (frag-off  u16)    ; 6
-  (ttl       u8)     ; 8
-  (protocol  u8)     ; 9
-  (check     u16)    ; 10
-  (saddr     u32)    ; 12
-  (daddr     u32))   ; 16  — total 20 bytes
-
-(defstruct udp-hdr
-  (src-port  u16)    ; 0
-  (dst-port  u16)    ; 2
-  (length    u16)    ; 4
-  (checksum  u16))   ; 6  — total 8 bytes
-
-(defstruct tcp-hdr
-  (src-port  u16)    ; 0
-  (dst-port  u16)    ; 2
-  (seq       u32)    ; 4
-  (ack-seq   u32)    ; 8
-  (doff-flags u16)   ; 12
-  (window    u16)    ; 14
-  (check     u16)    ; 16
-  (urg-ptr   u16))   ; 18  — total 20 bytes
-
-;; Single stack allocation, accessed through any header's accessors
-(defunion packet-buf ip-hdr udp-hdr tcp-hdr)
+(defstruct pkt-buf
+  (b0 u64) (b1 u64) (b2 u32))  ; 20 bytes
 
 ;;; ========== Event struct ==========
 
@@ -248,13 +226,13 @@
                             :section "cgroup_skb/egress"
                             :license "GPL")
   ;; Load IP header from packet via skb_load_bytes
-  (let* ((pkt (make-packet-buf))
-         (rc (skb-load-bytes (ctx-ptr) 0 pkt (sizeof ip-hdr))))
+  (let* ((pkt (make-pkt-buf))
+         (rc (skb-load-bytes (ctx-ptr) 0 pkt +ipv4-hdr-len+)))
     (when (s< rc 0)
       (return +egress-deny+))
 
-    (let* ((protocol (ip-hdr-protocol pkt))
-           (daddr    (ip-hdr-daddr pkt))
+    (let* ((protocol (ipv4-protocol pkt))
+           (daddr    (ipv4-dst-addr pkt))
 
            ;; Look up PID from socket cookie
            (socket-cookie (get-socket-cookie (ctx-ptr)))
@@ -281,29 +259,29 @@
           (ringbuf-output events evt (sizeof event) 0))
         (return +egress-allow+))
 
-      ;; Parse transport header — reuse pkt buffer (IP fields already extracted)
+      ;; Parse transport header — reuse pkt buffer
       (let ((port u16 0))
 
         ;; UDP handling
-        (when (= protocol +ipproto-udp+)
-          (let ((rc2 (skb-load-bytes (ctx-ptr) (sizeof ip-hdr) pkt (sizeof udp-hdr))))
+        (when (= protocol +ip-proto-udp+)
+          (let ((rc2 (skb-load-bytes (ctx-ptr) +ipv4-hdr-len+ pkt +udp-hdr-len+)))
             (when (s< rc2 0)
               (return +egress-deny+))
 
-            (setf port (udp-hdr-dst-port pkt))
+            (setf port (udp-dst-port pkt))
 
             ;; Check for proxied DNS request
-            (when (and (= port (htons 5553))   ; DNS proxy port placeholder
+            (when (and (= port 5553)   ; DNS proxy port placeholder
                        (= daddr +localhost-nbo+))
               ;; Extract DNS transaction ID — reuse pkt again
-              (let* ((dns-off (+ (sizeof ip-hdr) (sizeof udp-hdr)))
+              (let* ((dns-off (+ +ipv4-hdr-len+ +udp-hdr-len+))
                      (rc3 (skb-load-bytes (ctx-ptr) dns-off pkt 2)))
                 (let ((txid u16 (if (s>= rc3 0)
                                     (ntohs (load u16 pkt 0))
                                     0)))
                   (let ((evt (make-event)))
                     (setf (event-pid evt) pid
-                          (event-port evt) (ntohs port)
+                          (event-port evt) port
                           (event-allowed evt) 1
                           (event-ip evt) (ntohl daddr)
                           (event-pid-resolved evt) pid-ok
@@ -315,11 +293,11 @@
                   (return +egress-allow+))))))
 
         ;; TCP handling — extract destination port
-        (when (= protocol +ipproto-tcp+)
-          (let ((rc2 (skb-load-bytes (ctx-ptr) (sizeof ip-hdr) pkt (sizeof tcp-hdr))))
+        (when (= protocol +ip-proto-tcp+)
+          (let ((rc2 (skb-load-bytes (ctx-ptr) +ipv4-hdr-len+ pkt +tcp-hdr-len+)))
             (when (s< rc2 0)
               (return +egress-deny+))
-            (setf port (tcp-hdr-dst-port pkt))))
+            (setf port (tcp-dst-port pkt))))
 
         ;; Block IPv6 traffic (not supported)
         (let ((family (ctx family)))
@@ -352,8 +330,8 @@
                ;; Check if redirected to HTTP proxy
                (is-http-proxy u8
                  (if (and (= daddr +localhost-nbo+)
-                          (or (= port (htons 8080))
-                              (= port (htons 8443))))
+                          (or (= port 8080)
+                              (= port 8443)))
                      1 0)))
 
           ;; In log-only mode or if IP is in general allowlist, allow
@@ -371,7 +349,7 @@
                      (/= is-http-proxy 0))
             (let ((evt (make-event)))
               (setf (event-pid evt) pid
-                    (event-port evt) (ntohs port)
+                    (event-port evt) port
                     (event-allowed evt) 1
                     (event-ip evt) (ntohl daddr)
                     (event-pid-resolved evt) pid-ok
@@ -384,7 +362,7 @@
           ;; Default: emit event and return firewall decision
           (let ((evt (make-event)))
             (setf (event-pid evt) pid
-                  (event-port evt) (ntohs port)
+                  (event-port evt) port
                   (event-allowed evt) (cast u8 dest-allowed)
                   (event-ip evt) (ntohl daddr)
                   (event-pid-resolved evt) pid-ok
