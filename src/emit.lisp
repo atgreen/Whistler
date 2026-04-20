@@ -534,6 +534,7 @@
      ((eq op :map-update-ptr)(emit-map-update-ptr-insn ctx dst args))
      ((eq op :map-delete)(emit-map-delete-insn ctx dst args))
      ((eq op :map-delete-ptr)(emit-map-delete-ptr-insn ctx dst args))
+     ((eq op :ringbuf-output) (emit-ringbuf-output-insn ctx dst args))
      ((eq op :ringbuf-reserve)(emit-ringbuf-reserve-insn ctx dst args))
      ((eq op :ringbuf-submit)(emit-ringbuf-submit-insn ctx dst args))
      ((eq op :ringbuf-discard)(emit-ringbuf-discard-insn ctx dst args))
@@ -1121,6 +1122,35 @@
         (let ((r (vreg-to-physical ctx vreg dst-reg)))
           (unless (= r dst-reg)
             (ectx-emit ctx (whistler/bpf:emit-mov64-reg dst-reg r)))))))
+
+(defun emit-ringbuf-output-insn (ctx dst args)
+  "Emit bpf_ringbuf_output(map, data, size, flags) — copy stack data to ringbuf.
+   The data pointer (R2) must be a direct fp-derived pointer (R10 + offset)
+   for the BPF verifier to accept it. We recompute it from the struct-alloc's
+   known stack offset rather than using the vreg (which may have been copied
+   through intermediate registers, losing its fp provenance)."
+  (let* ((map-name (map-arg-name (first args)))
+         (data-vreg (second args))
+         (size-vreg (third args))
+         (flags-vreg (fourth args))
+         ;; Look up the struct's stack offset directly
+         (stack-off (gethash data-vreg (emit-ctx-struct-offsets ctx))))
+    ;; R4 = flags, R3 = size — set before R1/R2
+    (emit-vreg-to-reg ctx flags-vreg whistler/bpf:+bpf-reg-4+)
+    (emit-vreg-to-reg ctx size-vreg whistler/bpf:+bpf-reg-3+)
+    ;; R2 = data pointer — recompute from R10 to preserve fp provenance
+    (if stack-off
+        (progn
+          (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                          whistler/bpf:+bpf-reg-2+ whistler/bpf:+bpf-reg-10+))
+          (ectx-emit ctx (whistler/bpf:emit-alu64-imm
+                          whistler/bpf:+bpf-add+ whistler/bpf:+bpf-reg-2+ stack-off)))
+        ;; Fallback: use vreg directly (may fail verifier for non-stack data)
+        (emit-vreg-to-reg ctx data-vreg whistler/bpf:+bpf-reg-2+))
+    ;; R1 = map fd (last — ld_imm64 clobbers R1)
+    (emit-map-fd ctx map-name whistler/bpf:+bpf-reg-1+)
+    (ectx-emit ctx (whistler/bpf:emit-call 130))  ; bpf_ringbuf_output
+    (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
 
 (defun emit-ringbuf-reserve-insn (ctx dst args)
   "Emit bpf_ringbuf_reserve(map, size, flags) — returns pointer or NULL.

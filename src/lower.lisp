@@ -287,6 +287,9 @@
        (lower-map-delete-ptr ctx (first args) (second args)))
 
       ;; Ring buffer operations (first arg is map name)
+      ((sym= head 'ringbuf-output)
+       (lower-ringbuf-output ctx (first args) (second args) (third args) (fourth args)))
+
       ((sym= head 'ringbuf-reserve)
        (lower-ringbuf-reserve ctx (first args) (second args) (third args)))
 
@@ -1031,6 +1034,18 @@
     dst))
 
 ;;; ========== Ring buffer operations ==========
+
+(defun lower-ringbuf-output (ctx map-name data-expr size-expr flags-expr)
+  "Lower (ringbuf-output map data size flags): copy data to ring buffer."
+  (check-map-type-is ctx map-name whistler/bpf:+bpf-map-type-ringbuf+
+                     "ringbuf" "ringbuf-output")
+  (let ((data-vreg (lower-expr ctx data-expr))
+        (size-vreg (lower-expr ctx size-expr))
+        (flags-vreg (lower-expr ctx flags-expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :ringbuf-output dst
+              (list `(:map ,map-name) data-vreg size-vreg flags-vreg) 'u64)
+    dst))
 
 (defun lower-ringbuf-reserve (ctx map-name size-expr flags-expr)
   "Lower (ringbuf-reserve map size flags): reserve space in a ring buffer."

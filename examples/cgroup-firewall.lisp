@@ -193,7 +193,7 @@
            (setf (ctx u32 +sock-addr-user-port+) (htons 8443)))
 
          ;; Send HTTP redirect event
-         (with-ringbuf (evt events (sizeof event))
+         (let ((evt (make-event)))
            (setf (event-pid evt) pid
                  (event-port evt) (ntohs (cast u16 (ctx u32 +sock-addr-user-port+)))
                  (event-allowed evt) 1
@@ -201,7 +201,8 @@
                  (event-original-ip evt) original-ip
                  (event-event-type evt) +http-redirect+
                  (event-redirected evt) 1
-                 (event-pid-resolved evt) 1))
+                 (event-pid-resolved evt) 1)
+           (ringbuf-output events evt (sizeof event) 0))
 
          ;; Store original destination
          (let ((cookie-key u64 socket-cookie))
@@ -215,7 +216,7 @@
          (setf (ctx u32 +sock-addr-user-port+) (htons 5553))
 
          ;; Send DNS redirect event
-         (with-ringbuf (evt events (sizeof event))
+         (let ((evt (make-event)))
            (setf (event-pid evt) pid
                  (event-port evt) (ntohs (cast u16 (ctx u32 +sock-addr-user-port+)))
                  (event-allowed evt) 1
@@ -223,7 +224,8 @@
                  (event-original-ip evt) original-ip
                  (event-event-type evt) +dns-redirect+
                  (event-redirected evt) 1
-                 (event-pid-resolved evt) 1))
+                 (event-pid-resolved evt) 1)
+           (ringbuf-output events evt (sizeof event) 0))
 
          ;; Store original destination
          (let ((cookie-key u64 socket-cookie))
@@ -287,7 +289,7 @@
 
       ;; Allow localhost traffic
       (when (= original-ip +localhost-nbo+)
-        (with-ringbuf (evt events (sizeof event))
+        (let ((evt (make-event)))
           (setf (event-pid evt) pid
                 (event-port evt) 0
                 (event-allowed evt) 1
@@ -295,7 +297,8 @@
                 (event-original-ip evt) (ntohl original-ip)
                 (event-pid-resolved evt) pid-ok
                 (event-redirected evt) is-redirected
-                (event-event-type evt) +localhost-packet-bypass+))
+                (event-event-type evt) +localhost-packet-bypass+)
+          (ringbuf-output events evt (sizeof event) 0))
         (return +egress-allow+))
 
       ;; Parse transport header — reuse pkt buffer (IP fields already extracted)
@@ -318,7 +321,7 @@
                 (let ((txid u16 (if (s>= rc3 0)
                                     (ntohs (load u16 pkt 0))
                                     0)))
-                  (with-ringbuf (evt events (sizeof event))
+                  (let ((evt (make-event)))
                     (setf (event-pid evt) pid
                           (event-port evt) (ntohs port)
                           (event-allowed evt) 1
@@ -327,7 +330,8 @@
                           (event-original-ip evt) (ntohl original-ip)
                           (event-redirected evt) is-redirected
                           (event-event-type evt) +dns-proxy-packet-bypass+
-                          (event-dns-txid evt) txid))
+                          (event-dns-txid evt) txid)
+                    (ringbuf-output events evt (sizeof event) 0))
                   (return +egress-allow+))))))
 
         ;; TCP handling — extract destination port
@@ -340,7 +344,7 @@
         ;; Block IPv6 traffic (not supported)
         (let ((family (ctx u32 +skb-family+)))
           (when (= family +af-inet6+)
-            (with-ringbuf (evt events (sizeof event))
+            (let ((evt (make-event)))
               (setf (event-pid evt) pid
                     (event-port evt) port
                     (event-allowed evt) 0
@@ -348,7 +352,8 @@
                     (event-pid-resolved evt) pid-ok
                     (event-original-ip evt) (ntohl original-ip)
                     (event-redirected evt) is-redirected
-                    (event-event-type evt) +packet-ipv6+))
+                    (event-event-type evt) +packet-ipv6+)
+              (ringbuf-output events evt (sizeof event) 0))
             (return +egress-deny+)))
 
         ;; Firewall mode check
@@ -384,7 +389,7 @@
           ;; If allowed and going to HTTP proxy, emit bypass event
           (when (and (/= dest-allowed 0)
                      (/= is-http-proxy 0))
-            (with-ringbuf (evt events (sizeof event))
+            (let ((evt (make-event)))
               (setf (event-pid evt) pid
                     (event-port evt) (ntohs port)
                     (event-allowed evt) 1
@@ -392,11 +397,12 @@
                     (event-pid-resolved evt) pid-ok
                     (event-original-ip evt) (ntohl original-ip)
                     (event-redirected evt) is-redirected
-                    (event-event-type evt) +http-proxy-packet-bypass+))
+                    (event-event-type evt) +http-proxy-packet-bypass+)
+              (ringbuf-output events evt (sizeof event) 0))
             (return +egress-allow+))
 
           ;; Default: emit event and return firewall decision
-          (with-ringbuf (evt events (sizeof event))
+          (let ((evt (make-event)))
             (setf (event-pid evt) pid
                   (event-port evt) (ntohs port)
                   (event-allowed evt) (cast u8 dest-allowed)
@@ -404,6 +410,7 @@
                   (event-pid-resolved evt) pid-ok
                   (event-original-ip evt) (ntohl original-ip)
                   (event-redirected evt) is-redirected
-                  (event-event-type evt) 0))
+                  (event-event-type evt) 0)
+            (ringbuf-output events evt (sizeof event) 0))
 
           dest-allowed)))))

@@ -90,7 +90,8 @@
           '(:call :tail-call :store :ctx-store :stack-store :atomic-add
             :map-update :map-update-ptr :map-delete :map-delete-ptr
             :struct-alloc :br :br-cond :ret
-            :ringbuf-reserve :ringbuf-submit :ringbuf-discard)))
+            :ringbuf-reserve :ringbuf-submit :ringbuf-discard
+            :ringbuf-output)))
 
 ;;; ========== Call-like operations and helper-effect classification ==========
 ;;;
@@ -111,7 +112,8 @@
                :map-update :map-update-ptr
                :map-delete :map-delete-ptr
                :map-lookup-ptr
-               :ringbuf-reserve :ringbuf-submit :ringbuf-discard)))
+               :ringbuf-reserve :ringbuf-submit :ringbuf-discard
+            :ringbuf-output)))
 
 (defun helper-effects (insn)
   "Return a list of effect keywords for a call-like instruction.
