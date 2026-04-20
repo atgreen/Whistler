@@ -72,18 +72,19 @@ mappings; `egress` reads both to reconstruct the full picture:
 
 ### Setf-able context access for connection redirection
 
-`ctx` is a setf-able place for BPF context struct fields. Reading uses
-`(ctx TYPE OFFSET)`, writing uses `(setf (ctx TYPE OFFSET) VALUE)`.
-This is what makes transparent proxying work -- the application thinks
+`ctx` is a setf-able place for BPF context struct fields. The compiler
+resolves field names from the program type automatically — `(ctx
+user-ip4)` instead of `(ctx u32 4)`. This is what makes transparent
+proxying work -- the application thinks
 it's connecting to the original destination, but the kernel sends the
 traffic to localhost:
 
 ```lisp
 ;; Read the original destination
-(let ((user-ip4 (ctx u32 +sock-addr-user-ip4+)))
+(let ((user-ip4 (ctx user-ip4)))
   ;; Redirect to localhost proxy
-  (setf (ctx u32 +sock-addr-user-ip4+) +localhost-nbo+)
-  (setf (ctx u32 +sock-addr-user-port+) (htons 8080)))
+  (setf (ctx user-ip4) +localhost-nbo+)
+  (setf (ctx user-port) (htons 8080)))
 ```
 
 ### Typed packet headers with defunion
@@ -173,10 +174,10 @@ maps.
   context struct with different available fields.
 
 - **Setf-able context**: Most cgroup programs only read context fields
-  via `(ctx TYPE OFFSET)`. `cgroup/connect4` *writes* via
-  `(setf (ctx ...) ...)` to `user_ip4` and `user_port`, redirecting
-  connections -- this is what makes it a transparent proxy rather than
-  just an observer.
+  via `(ctx field-name)`. `cgroup/connect4` *writes* via
+  `(setf (ctx field-name) ...)` to `user-ip4` and `user-port`,
+  redirecting connections -- this is what makes it a transparent proxy
+  rather than just an observer.
 
 - **Runtime constants**: The original Go implementation uses `.rodata`
   rewriting to set proxy ports, PID, and firewall mode at load time.

@@ -34,31 +34,52 @@ Write a value to memory:
 
 Read from or write to the BPF program context (the `ctx` pointer
 passed by the kernel). The context structure varies by program type --
-for XDP it contains `data`, `data_end`, and `data_meta` as `u32`
-offsets.
+for XDP it contains `data`, `data_end`, and `data_meta`; for
+`cgroup-sock-addr` it contains `user_ip4`, `user_port`, etc.
 
-`ctx` is a setf-able place:
+`ctx` is a setf-able place. The preferred form uses **field names**,
+which the compiler resolves from the program type's context struct:
 
 ```lisp
-;; Read a context field
-(ctx type offset)
+;; Read a context field by name
+(ctx field-name)
 
-;; Write a context field (e.g., to redirect connections in cgroup programs)
-(setf (ctx type offset) value)
+;; Write a context field
+(setf (ctx field-name) value)
+
+;; Array fields require an index
+(ctx user-ip6 0)                  ; first u32 of IPv6 address
+(setf (ctx user-ip6 2) value)     ; write third element
 ```
 
 ```lisp
 ;; XDP: read packet bounds
-(let ((data     (ctx u32 0))    ; xdp_md->data
-      (data-end (ctx u32 4)))   ; xdp_md->data_end
-  ...)
+(defprog my-xdp (:type :xdp ...)
+  (let ((data     (ctx data))
+        (data-end (ctx data-end)))
+    ...))
 
 ;; cgroup/connect4: redirect destination
-(setf (ctx u32 4) +localhost-nbo+)   ; bpf_sock_addr->user_ip4
+(defprog connect4 (:type :cgroup-sock-addr ...)
+  (let ((ip (ctx user-ip4)))
+    (setf (ctx user-ip4) +localhost-nbo+)
+    (setf (ctx user-port) (htons 8080))))
 ```
 
-> **Note:** `ctx-load` is a deprecated alias for `ctx` (read-only).
-> Prefer `(ctx ...)` and `(setf (ctx ...) ...)` in new code.
+The compiler knows which context struct each program type uses
+(`xdp_md`, `__sk_buff`, `bpf_sock_addr`, `bpf_sock_ops`) and
+resolves field names to types and offsets at compile time.
+
+**Legacy syntax:** `(ctx type offset)` with explicit type and numeric
+offset still works for backward compatibility:
+
+```lisp
+(ctx u32 4)              ; equivalent to (ctx user-ip4) in cgroup-sock-addr
+(setf (ctx u32 4) val)   ; equivalent to (setf (ctx user-ip4) val)
+```
+
+> **Note:** `ctx-load` and `ctx-store` are deprecated. Use `(ctx ...)`
+> and `(setf (ctx ...) ...)` instead.
 
 ## stack-addr
 
