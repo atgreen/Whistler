@@ -80,6 +80,7 @@
         (first-stack-addr (make-hash-table))  ; vreg → first stack-addr use position
         (has-non-stack-use (make-hash-table)) ; vreg → t if used outside stack-addr
         (def-insn (make-hash-table))   ; vreg → defining instruction
+        (block-end-pos (make-hash-table)) ; label → last insn position in block
         (pos 0))
 
     ;; Walk all instructions in block order, assigning positions
@@ -91,23 +92,49 @@
             (setf (gethash (ir-insn-dst insn) def-pos) pos)
             (setf (gethash (ir-insn-dst insn) def-insn) insn)))
 
-        ;; Record uses, tracking stack-addr vs other uses
-        (dolist (vreg (ir-insn-all-vreg-uses insn))
-          (setf (gethash vreg last-use) pos)
-          (if (eq (ir-insn-op insn) :stack-addr)
-              ;; Track first stack-addr use
-              (unless (gethash vreg first-stack-addr)
-                (setf (gethash vreg first-stack-addr) pos))
-              ;; Non-stack-addr use
-              (setf (gethash vreg has-non-stack-use) t)))
+        ;; Record uses, tracking stack-addr vs other uses.
+        ;; PHI operands are conceptually used on predecessor edges, not in
+        ;; the successor block that contains the PHI instruction. Handle them
+        ;; in a second pass once block end positions are known.
+        (unless (eq (ir-insn-op insn) :phi)
+          (dolist (vreg (ir-insn-all-vreg-uses insn))
+            (setf (gethash vreg last-use) pos)
+            (if (eq (ir-insn-op insn) :stack-addr)
+                ;; Track first stack-addr use
+                (unless (gethash vreg first-stack-addr)
+                  (setf (gethash vreg first-stack-addr) pos))
+                ;; Non-stack-addr use
+                (setf (gethash vreg has-non-stack-use) t))))
 
         ;; Record call positions
         (when (call-like-op-p (ir-insn-op insn))
           (push pos call-positions))
 
-        (incf pos)))
+        (incf pos))
+      (when (> pos 0)
+        (setf (gethash (basic-block-label block) block-end-pos) (1- pos))))
 
     (setf call-positions (nreverse call-positions))
+
+    ;; PHI operands are live on the incoming edge from their predecessor.
+    ;; Extend each source vreg's last use to the end of the corresponding
+    ;; predecessor block so allocation keeps the value available for the
+    ;; edge move emitted by emit-phi-moves.
+    (dolist (block (ir-program-blocks prog))
+      (dolist (insn (basic-block-insns block))
+        (when (eq (ir-insn-op insn) :phi)
+          (dolist (arg (ir-insn-args insn))
+            (when (and (consp arg)
+                       (integerp (first arg))
+                       (consp (second arg))
+                       (eq (car (second arg)) :label))
+              (let* ((vreg (first arg))
+                     (pred-label (cadr (second arg)))
+                     (pred-end (gethash pred-label block-end-pos)))
+                (when pred-end
+                  (setf (gethash vreg last-use)
+                        (max (or (gethash vreg last-use) pred-end)
+                             pred-end)))))))))
 
     ;; Build intervals with value classification
     (let ((intervals '()))
@@ -122,11 +149,13 @@
                                  raw-end))
                         (spans (some (lambda (cp) (and (> cp def) (< cp end)))
                                      call-positions))
-                        (insn (gethash vreg def-insn)))
+                        (insn (gethash vreg def-insn))
+                        (force-callee (and insn
+                                           (eq (ir-insn-op insn) :ringbuf-reserve))))
                    (multiple-value-bind (vclass remat-p recipe)
                        (if insn (classify-vreg insn) (values :temporary nil nil))
                      (push (make-live-interval :vreg vreg :start def :end end
-                                               :spans-call-p spans
+                                               :spans-call-p (or spans force-callee)
                                                :value-class vclass
                                                :rematerializable-p remat-p
                                                :remat-recipe recipe
@@ -379,15 +408,16 @@
     (values result stack-offset)))
 
 (defun expire-intervals (active free-list current-pos)
-  "Remove intervals from ACTIVE that end at or before CURRENT-POS.
-   Uses <= because in SSA, when an interval's last use is at position P,
-   and a new interval starts at P (defined by the instruction that uses
-   the old value), they can safely share a register.
+  "Remove intervals from ACTIVE that end before CURRENT-POS.
+   Live ranges are inclusive at their last use. If an interval ends at
+   CURRENT-POS, its value is still needed by the current instruction and
+   must not be expired yet, or two simultaneously-live operands can be
+   assigned the same physical register.
    Returns (values new-active new-free-list)."
   (let ((new-active '())
         (new-free free-list))
     (dolist (interval active)
-      (if (<= (live-interval-end interval) current-pos)
+      (if (< (live-interval-end interval) current-pos)
           ;; Expired — return register to pool in sorted order
           ;; to maintain deterministic allocation regardless of expiry timing
           (let ((phys (live-interval-phys interval)))

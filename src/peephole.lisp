@@ -388,50 +388,43 @@
        (= (whistler/bpf:bpf-insn-src insn) whistler/bpf:+bpf-reg-10+)))
 
 (defun peephole-store-load-elimination (insns)
-  "Replace stx [r10+off], rX; ldx rY, [r10+off] with stx + mov rY, rX."
+  "Replace an immediately-adjacent stx/ldx pair with stx + mov.
+   Restricting this to adjacent instructions avoids erasing reloads that
+   are required at CFG joins where only one predecessor executed the store."
   (let ((vec (coerce insns 'vector))
-        (len (length insns)))
+        (len (length insns))
+        (targets (make-hash-table)))
+    ;; A jump target is a CFG merge/header. A load there may be reached from
+    ;; paths that did not execute the candidate store, so it must not be
+    ;; rewritten as a register copy from only one predecessor.
+    (loop for i from 0 below len
+          for insn = (aref vec i)
+          when (or (bpf-unconditional-jmp-p insn)
+                   (bpf-conditional-jmp-p insn))
+          do (let ((target (+ i 1 (whistler/bpf:bpf-insn-off insn))))
+               (when (and (>= target 0) (<= target len))
+                 (setf (gethash target targets) t))))
     (loop for i from 0 below (1- len)
           for store = (aref vec i)
           when (bpf-stack-store-p store)
           do (let ((store-off (whistler/bpf:bpf-insn-off store))
-                   (store-src (whistler/bpf:bpf-insn-src store)))
-               ;; Look ahead for a load from the same offset
-               (loop for j from (1+ i) below (min (+ i 8) len)
-                     for insn = (aref vec j)
-                     do (cond
-                          ;; Found a load from the same stack slot
-                          ((and (bpf-stack-load-p insn)
-                                (= (whistler/bpf:bpf-insn-off insn) store-off))
-                           ;; Only forward if store-src register was not modified
-                           ;; between the store and this load
-                           (let ((src-clobbered nil))
-                             (loop for k from (1+ i) below j
-                                   when (bpf-reg-written-p (aref vec k) store-src)
-                                   do (setf src-clobbered t) (return))
-                             (unless src-clobbered
-                               (let ((load-dst (whistler/bpf:bpf-insn-dst insn)))
-                                 ;; Replace ldx rY, [r10+off] → mov rY, rX
-                                 (setf (whistler/bpf:bpf-insn-code insn)
-                                       (logior whistler/bpf:+bpf-alu64+
-                                               whistler/bpf:+bpf-mov+
-                                               whistler/bpf:+bpf-x+))
-                                 (setf (whistler/bpf:bpf-insn-src insn) store-src)
-                                 (setf (whistler/bpf:bpf-insn-dst insn) load-dst)
-                                 (setf (whistler/bpf:bpf-insn-off insn) 0)
-                                 (setf (whistler/bpf:bpf-insn-imm insn) 0))))
-                           (return))
-                          ;; Another store to the same slot invalidates
-                          ((and (bpf-stack-store-p insn)
-                                (= (whistler/bpf:bpf-insn-off insn) store-off))
-                           (return))
-                          ;; A call clobbers caller-saved registers
-                          ((= (whistler/bpf:bpf-insn-code insn) #x85)
-                           (return))
-                          ;; Jump means control flow diverges
-                          ((or (bpf-unconditional-jmp-p insn)
-                               (bpf-conditional-jmp-p insn))
-                           (return))))))
+                   (store-src (whistler/bpf:bpf-insn-src store))
+                   (j (1+ i)))
+               (when (< j len)
+                 (let ((insn (aref vec j)))
+                   (when (and (not (gethash j targets))
+                              (bpf-stack-load-p insn)
+                              (= (whistler/bpf:bpf-insn-off insn) store-off))
+                     (let ((load-dst (whistler/bpf:bpf-insn-dst insn)))
+                       ;; Replace ldx rY, [r10+off] → mov rY, rX
+                       (setf (whistler/bpf:bpf-insn-code insn)
+                             (logior whistler/bpf:+bpf-alu64+
+                                     whistler/bpf:+bpf-mov+
+                                     whistler/bpf:+bpf-x+))
+                       (setf (whistler/bpf:bpf-insn-src insn) store-src)
+                       (setf (whistler/bpf:bpf-insn-dst insn) load-dst)
+                       (setf (whistler/bpf:bpf-insn-off insn) 0)
+                       (setf (whistler/bpf:bpf-insn-imm insn) 0)))))))
     (coerce vec 'list)))
 
 ;;; ========== Stack-addr folding ==========
@@ -580,7 +573,17 @@
 (defun peephole-load-load-forwarding (insns)
   "Replace redundant stack loads from the same offset with a register copy."
   (let ((vec (coerce insns 'vector))
-        (len (length insns)))
+        (len (length insns))
+        (targets (make-hash-table)))
+    ;; A jump target may be reached without executing the earlier load.
+    ;; Restrict this forwarding to straight-line code segments.
+    (loop for i from 0 below len
+          for insn = (aref vec i)
+          when (or (bpf-unconditional-jmp-p insn)
+                   (bpf-conditional-jmp-p insn))
+          do (let ((target (+ i 1 (whistler/bpf:bpf-insn-off insn))))
+               (when (and (>= target 0) (<= target len))
+                 (setf (gethash target targets) t))))
     (loop for i from 0 below len
           for load1 = (aref vec i)
           when (bpf-stack-load-p load1)
@@ -590,6 +593,9 @@
                (loop for j from (1+ i) below (min (+ i 16) len)
                      for insn = (aref vec j)
                      do (cond
+                          ;; Entering a jump target crosses a CFG edge.
+                          ((gethash j targets)
+                           (return))
                           ;; Found another load from same stack slot
                           ((and (bpf-stack-load-p insn)
                                 (= (whistler/bpf:bpf-insn-off insn) load-off))

@@ -162,6 +162,61 @@
   "Return true when OP is safe to evaluate with swapped operands."
   (member op '(:add :mul :and :or :xor)))
 
+(defun choose-temp-reg (&rest avoid)
+  "Pick a caller-saved scratch register not present in AVOID."
+  (or (find-if (lambda (reg) (not (member reg avoid)))
+               (list whistler/bpf:+bpf-reg-1+
+                     whistler/bpf:+bpf-reg-2+
+                     whistler/bpf:+bpf-reg-3+
+                     whistler/bpf:+bpf-reg-4+
+                     whistler/bpf:+bpf-reg-5+))
+      whistler/bpf:+bpf-reg-5+))
+
+(defun materialize-compare-operands (ctx lhs rhs &key avoid-reg)
+  "Materialize LHS/RHS into safe registers for compare/jump emission.
+   Returns (values lhs-reg rhs-reg imm), where IMM is the immediate RHS
+   value when RHS can be emitted as an immediate compare."
+  (let* ((imm (imm-arg-value rhs))
+         (lhs-loc (and (integerp lhs) (allocate-vreg ctx lhs)))
+         (rhs-loc (and (integerp rhs) (allocate-vreg ctx rhs)))
+         (lhs-phys (and lhs-loc (eq (car lhs-loc) :reg) (cadr lhs-loc)))
+         (rhs-phys (and rhs-loc (eq (car rhs-loc) :reg) (cadr rhs-loc)))
+         (avoid-p (lambda (reg)
+                    (and avoid-reg (= reg avoid-reg))))
+         (rhs-reg (unless (and imm (typep imm '(signed-byte 32)))
+                    (cond
+                      ((and rhs-phys
+                            (not (funcall avoid-p rhs-phys)))
+                       rhs-phys)
+                      (t
+                       (choose-temp-reg avoid-reg lhs-phys)))))
+         (lhs-reg (cond
+                    ((and lhs-phys
+                          (not (funcall avoid-p lhs-phys))
+                          (or (null rhs-reg) (/= lhs-phys rhs-reg)))
+                     lhs-phys)
+                    (t
+                     (choose-temp-reg avoid-reg rhs-reg rhs-phys)))))
+    (when (integerp lhs)
+      (ecase (car lhs-loc)
+        (:reg
+         (unless (= lhs-reg (cadr lhs-loc))
+           (ectx-emit ctx (whistler/bpf:emit-mov64-reg lhs-reg (cadr lhs-loc)))))
+        (:stack
+         (ectx-emit ctx (whistler/bpf:emit-ldx-mem
+                         whistler/bpf:+bpf-dw+ lhs-reg
+                         whistler/bpf:+bpf-reg-10+ (cadr lhs-loc))))))
+    (when (and rhs-reg (integerp rhs))
+      (ecase (car rhs-loc)
+        (:reg
+         (unless (= rhs-reg (cadr rhs-loc))
+           (ectx-emit ctx (whistler/bpf:emit-mov64-reg rhs-reg (cadr rhs-loc)))))
+        (:stack
+         (ectx-emit ctx (whistler/bpf:emit-ldx-mem
+                         whistler/bpf:+bpf-dw+ rhs-reg
+                         whistler/bpf:+bpf-reg-10+ (cadr rhs-loc))))))
+    (values lhs-reg rhs-reg imm)))
+
 ;;; ========== Size helpers ==========
 
 (defun ir-type-to-bpf-size (type-kw)
@@ -633,20 +688,14 @@
          (rhs (third args))
          (dst-loc (allocate-vreg ctx dst))
          (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-1+)))
-    ;; Load lhs
-    (let ((lhs-reg (if (integerp lhs)
-                       (vreg-to-physical ctx lhs whistler/bpf:+bpf-reg-2+)
-                       whistler/bpf:+bpf-reg-2+)))
+    (multiple-value-bind (lhs-reg rhs-reg imm)
+        (materialize-compare-operands ctx lhs rhs :avoid-reg dst-reg)
       ;; Set result = 1
       (ectx-emit ctx (whistler/bpf:emit-mov64-imm dst-reg 1))
       ;; Compare
-      (let ((imm (imm-arg-value rhs)))
-        (if (and imm (typep imm '(signed-byte 32)))
-            (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 1))
-            (let ((rhs-reg (if (integerp rhs)
-                               (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-3+)
-                               whistler/bpf:+bpf-reg-3+)))
-              (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 1)))))
+      (if (and imm (typep imm '(signed-byte 32)))
+          (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 1))
+          (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 1)))
       ;; Set result = 0 (fallthrough)
       (ectx-emit ctx (whistler/bpf:emit-mov64-imm dst-reg 0)))
     ;; Store if needed
@@ -1087,21 +1136,7 @@
     ;; R1 = map fd (last — ld_imm64 clobbers R1)
     (emit-map-fd ctx map-name whistler/bpf:+bpf-reg-1+)
     (ectx-emit ctx (whistler/bpf:emit-call 131))  ; bpf_ringbuf_reserve
-    (when dst
-      ;; Keep reserved ringbuf record pointers in a stack slot rather than a
-      ;; register. Field initializers inside WITH-RINGBUF often evaluate other
-      ;; expressions between stores, and reloading the pointer from stack avoids
-      ;; accidental register reuse/clobbering before the next store.
-      (let* ((existing (gethash dst (emit-ctx-vreg-map ctx)))
-             (spill-off (if (and existing (eq (car existing) :stack))
-                            (cadr existing)
-                            (ectx-alloc-stack ctx 8 "ringbuf ptr spill"))))
-        (setf (gethash dst (emit-ctx-vreg-map ctx)) (list :stack spill-off))
-        (ectx-emit ctx (whistler/bpf:emit-stx-mem
-                         whistler/bpf:+bpf-dw+
-                         whistler/bpf:+bpf-reg-10+
-                         whistler/bpf:+bpf-reg-0+
-                         spill-off))))))
+    (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
 
 (defun emit-ringbuf-submit-insn (ctx dst args)
   "Emit bpf_ringbuf_submit(data, flags).
@@ -1372,52 +1407,45 @@
          (rhs (third args))
          (then-label (label-arg-name (fourth args)))
          (else-label (label-arg-name (fifth args)))
-         (lhs-reg (if (integerp lhs)
-                      (vreg-to-physical ctx lhs whistler/bpf:+bpf-reg-1+)
-                      whistler/bpf:+bpf-reg-1+))
          (then-moves (phi-moves-for-edge ctx then-label))
          (else-moves (phi-moves-for-edge ctx else-label)))
-    (if (or then-moves else-moves)
-        ;; Phi moves needed: emit trampoline for then-edge.
-        ;;   if cond goto then_trampoline
-        ;;   [else-edge phi moves]
-        ;;   goto else_label
-        ;;   then_trampoline:
-        ;;   [then-edge phi moves]
-        ;;   goto then_label
-        (let ((trampoline-label (gensym "PHI_THEN_")))
-          ;; Conditional jump to trampoline (will be fixup'd)
-          (let ((imm (imm-arg-value rhs)))
+    (multiple-value-bind (lhs-reg rhs-reg imm)
+        (materialize-compare-operands ctx lhs rhs)
+      (if (or then-moves else-moves)
+          ;; Phi moves needed: emit trampoline for then-edge.
+          ;;   if cond goto then_trampoline
+          ;;   [else-edge phi moves]
+          ;;   goto else_label
+          ;;   then_trampoline:
+          ;;   [then-edge phi moves]
+          ;;   goto then_label
+          (let ((trampoline-label (gensym "PHI_THEN_")))
+            ;; Conditional jump to trampoline (will be fixup'd)
             (if (and imm (typep imm '(signed-byte 32)))
                 (progn
                   (push (list (ectx-current-idx ctx) trampoline-label) (emit-ctx-fixups ctx))
                   (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 0)))
-                (let ((rhs-reg (if (integerp rhs)
-                                   (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-2+)
-                                   whistler/bpf:+bpf-reg-2+)))
+                (progn
                   (push (list (ectx-current-idx ctx) trampoline-label) (emit-ctx-fixups ctx))
-                  (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 0)))))
-          ;; Else path: phi moves + jump
-          (emit-phi-moves ctx else-label)
-          (push (list (ectx-current-idx ctx) else-label) (emit-ctx-fixups ctx))
-          (ectx-emit ctx (whistler/bpf:emit-jmp-a 0))
-          ;; Trampoline: then phi moves + jump
-          (setf (gethash trampoline-label block-positions)
-                (ectx-current-idx ctx))
-          (emit-phi-moves ctx then-label)
-          (push (list (ectx-current-idx ctx) then-label) (emit-ctx-fixups ctx))
-          (ectx-emit ctx (whistler/bpf:emit-jmp-a 0)))
-        ;; No phi moves: emit plain if/goto/goto as before
-        (progn
-          (let ((imm (imm-arg-value rhs)))
+                  (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 0))))
+            ;; Else path: phi moves + jump
+            (emit-phi-moves ctx else-label)
+            (push (list (ectx-current-idx ctx) else-label) (emit-ctx-fixups ctx))
+            (ectx-emit ctx (whistler/bpf:emit-jmp-a 0))
+            ;; Trampoline: then phi moves + jump
+            (setf (gethash trampoline-label block-positions)
+                  (ectx-current-idx ctx))
+            (emit-phi-moves ctx then-label)
+            (push (list (ectx-current-idx ctx) then-label) (emit-ctx-fixups ctx))
+            (ectx-emit ctx (whistler/bpf:emit-jmp-a 0)))
+          ;; No phi moves: emit plain if/goto/goto as before
+          (progn
             (if (and imm (typep imm '(signed-byte 32)))
                 (progn
                   (push (list (ectx-current-idx ctx) then-label) (emit-ctx-fixups ctx))
                   (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 0)))
-                (let ((rhs-reg (if (integerp rhs)
-                                   (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-2+)
-                                   whistler/bpf:+bpf-reg-2+)))
+                (progn
                   (push (list (ectx-current-idx ctx) then-label) (emit-ctx-fixups ctx))
-                  (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 0)))))
-          (push (list (ectx-current-idx ctx) else-label) (emit-ctx-fixups ctx))
-          (ectx-emit ctx (whistler/bpf:emit-jmp-a 0))))))
+                  (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 0))))
+            (push (list (ectx-current-idx ctx) else-label) (emit-ctx-fixups ctx))
+            (ectx-emit ctx (whistler/bpf:emit-jmp-a 0)))))))

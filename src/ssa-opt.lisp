@@ -180,6 +180,24 @@
                  (when (and imm (typep (second imm) '(signed-byte 32)))
                    (setf (third (ir-insn-args insn)) imm)))))
 
+            ;; bswap of a constant → fold to MOV of the swapped value
+            ((member op '(:bswap16 :bswap32 :bswap64))
+             (when (and (= (length args) 1) (integerp (first args)))
+               (let ((imm (gethash (first args) constants)))
+                 (when imm
+                   (let* ((val (second imm))
+                          (folded (case op
+                                    (:bswap16 (bswap16-const val))
+                                    (:bswap32 (bswap32-const val))
+                                    (:bswap64 val))))
+                     (when folded
+                       (setf (ir-insn-op insn) :mov)
+                       (setf (ir-insn-args insn) (list `(:imm ,folded)))
+                       ;; Register the folded constant for further propagation
+                       (when (ir-insn-dst insn)
+                         (setf (gethash (ir-insn-dst insn) constants)
+                               `(:imm ,folded)))))))))
+
             ;; map-update/map-update-ptr: propagate flags (4th arg)
             ((member op '(:map-update :map-update-ptr))
              (when (and (>= (length args) 4)
@@ -1221,6 +1239,12 @@
                     (remhash (ir-insn-dst insn) rewrites))
 
                   (cond
+                    ;; PHI operands belong to predecessor edges, not this block.
+                    ;; Never insert reloads for them here or rewrite them with
+                    ;; block-local rematerializations.
+                    ((eq (ir-insn-op insn) :phi)
+                     (push insn new-insns))
+
                     ;; Call: apply rewrites, emit, then invalidate all candidates
                     ((call-like-op-p (ir-insn-op insn))
                      (when (plusp (hash-table-count rewrites))
@@ -1949,6 +1973,37 @@
                          (basic-block-insns block)))))
   prog))
 
+(defun ir-well-formed-p (prog)
+  "Return T if every vreg used in PROG has a defining instruction.
+   Used as a cheap safety gate to reject backend candidates that would
+   produce BPF verifier 'Rn !read_ok' errors."
+  (let ((defs (make-hash-table)))
+    (dolist (block (ir-program-blocks prog))
+      (dolist (insn (basic-block-insns block))
+        (when (ir-insn-dst insn)
+          (setf (gethash (ir-insn-dst insn) defs) t))))
+    (dolist (block (ir-program-blocks prog))
+      (dolist (insn (basic-block-insns block))
+        (dolist (vreg (ir-insn-all-vreg-uses insn))
+          (unless (gethash vreg defs)
+            (return-from ir-well-formed-p nil)))))
+    t))
+
+(defun ensure-phis-first (prog)
+  "Restore the SSA invariant that PHI nodes lead each block.
+   Some optimization passes can insert non-PHI instructions before PHIs,
+   but the emitter resolves PHIs by scanning each target block's PHI prefix."
+  (dolist (block (ir-program-blocks prog))
+    (let ((phis '())
+          (rest '()))
+      (dolist (insn (basic-block-insns block))
+        (if (eq (ir-insn-op insn) :phi)
+            (push insn phis)
+            (push insn rest)))
+      (setf (basic-block-insns block)
+            (nconc (nreverse phis) (nreverse rest)))))
+  prog)
+
 ;;; ========== Redundant branch cleanup ==========
 ;;;
 ;;; After optimizations, br-cond may have both targets equal, or br may
@@ -2028,5 +2083,9 @@
 
   ;; Phase 7: Backend preparation
   (narrow-alu-types prog)
+  ;; The emitter expects PHIs to form a contiguous prefix in each block.
+  (ensure-phis-first prog)
   (split-live-ranges prog)
+  ;; Reassert the invariant in case live-range splitting inserted code.
+  (ensure-phis-first prog)
   prog)

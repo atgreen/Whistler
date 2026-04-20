@@ -590,7 +590,8 @@
 ;;; SSA pipeline compilation
 
 (defun backend-candidates ()
-  "Return backend policy variants to try for SSA-based compilation."
+  "Return backend policy variants to try for SSA-based compilation.
+   Each variant is compiled and the smallest verifier-safe result wins."
   (list '(:name :baseline-auto
           :reserve-callee-count nil
           :force-save-ctx nil
@@ -647,18 +648,20 @@
                             body)))
       ;; Lower + optimize per backend variant. Programs are small enough that
       ;; trying a few complete backend shapes is cheaper than overfitting one
-      ;; allocator heuristic path.
+      ;; allocator heuristic path. Reject candidates whose IR has undefined
+      ;; vregs — these would produce BPF verifier 'Rn !read_ok' errors.
       (let ((best-cu nil))
         (dolist (candidate (backend-candidates))
           (let ((ir (whistler/ir:lower-program section license map-structs expanded)))
             (let ((whistler/ir::*force-save-ctx* (getf candidate :force-save-ctx)))
               (whistler/ir:optimize-ir ir)
-              (let ((cu (whistler/ir:emit-ir-to-bpf
-                         ir
-                         :reserve-callee-count (getf candidate :reserve-callee-count)
-                         :auto-reserve-helper-setup (getf candidate :auto-reserve-helper-setup))))
-                (when (or (null best-cu) (better-cu-p cu best-cu))
-                  (setf best-cu cu))))))
+              (when (whistler/ir:ir-well-formed-p ir)
+                (let ((cu (whistler/ir:emit-ir-to-bpf
+                           ir
+                           :reserve-callee-count (getf candidate :reserve-callee-count)
+                           :auto-reserve-helper-setup (getf candidate :auto-reserve-helper-setup))))
+                  (when (or (null best-cu) (better-cu-p cu best-cu))
+                    (setf best-cu cu)))))))
         best-cu))))
 
 (defun reset-compilation-state ()

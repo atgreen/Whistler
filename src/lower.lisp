@@ -542,6 +542,65 @@
         (setf (lower-ctx-env ctx) saved-env)
         result))))
 
+;;; ========== Conditional branch emission ==========
+
+(defun emit-test-branch (ctx test then-label else-label)
+  "Emit branch(es) for TEST, jumping to THEN-LABEL when true, ELSE-LABEL
+   when false.  Short-circuits (or ...) and (and ...) into multi-way
+   branches instead of materializing a boolean."
+  (cond
+    ;; (or a b ...) — jump to then if ANY condition is true
+    ((and (consp test) (sym= (car test) 'or))
+     (let ((clauses (cdr test)))
+       (if (null clauses)
+           ;; (or) is false
+           (ctx-emit ctx :br nil (list `(:label ,else-label)))
+           (loop for (clause . rest) on clauses
+                 do (if rest
+                        ;; Not the last clause: true → then, false → try next
+                        (let ((next-label (ir-fresh-label (lower-ctx-prog ctx) "or_next")))
+                          (emit-test-branch ctx clause then-label next-label)
+                          (let ((next-block (make-basic-block :label next-label)))
+                            (ctx-switch-block ctx next-block)))
+                        ;; Last clause: true → then, false → else
+                        (emit-test-branch ctx clause then-label else-label))))))
+
+    ;; (and a b ...) — jump to else if ANY condition is false
+    ((and (consp test) (sym= (car test) 'and))
+     (let ((clauses (cdr test)))
+       (if (null clauses)
+           ;; (and) is true
+           (ctx-emit ctx :br nil (list `(:label ,then-label)))
+           (loop for (clause . rest) on clauses
+                 do (if rest
+                        ;; Not the last clause: true → try next, false → else
+                        (let ((next-label (ir-fresh-label (lower-ctx-prog ctx) "and_next")))
+                          (emit-test-branch ctx clause next-label else-label)
+                          (let ((next-block (make-basic-block :label next-label)))
+                            (ctx-switch-block ctx next-block)))
+                        ;; Last clause: true → then, false → else
+                        (emit-test-branch ctx clause then-label else-label))))))
+
+    ;; (not x) — swap then/else
+    ((and (consp test) (sym= (car test) 'not))
+     (emit-test-branch ctx (second test) else-label then-label))
+
+    ;; Direct comparison: (= x y), (/= x y), etc.
+    ((and (consp test) (ir-jmp-op (car test)))
+     (let* ((jmp-op (ir-jmp-op (car test)))
+            (lhs (lower-expr ctx (second test)))
+            (rhs (lower-expr ctx (third test))))
+       (ctx-emit ctx :br-cond nil
+                 (list `(:cmp ,jmp-op) lhs rhs
+                       `(:label ,then-label) `(:label ,else-label)))))
+
+    ;; General expression: evaluate and branch on non-zero
+    (t
+     (let ((test-vreg (lower-expr ctx test)))
+       (ctx-emit ctx :br-cond nil
+                 (list '(:cmp :jne) test-vreg `(:imm 0)
+                       `(:label ,then-label) `(:label ,else-label)))))))
+
 ;;; ========== If ==========
 
 (defun lower-if (ctx test then-form else-form)
@@ -553,18 +612,8 @@
          (pre-env (mapcar (lambda (e) (list (car e) (cadr e) (cddr e)))
                           (lower-ctx-env ctx))))
 
-    ;; Emit conditional branch
-    (if (and (consp test) (ir-jmp-op (car test)))
-        (let* ((jmp-op (ir-jmp-op (car test)))
-               (lhs (lower-expr ctx (second test)))
-               (rhs (lower-expr ctx (third test))))
-          (ctx-emit ctx :br-cond nil
-                    (list `(:cmp ,jmp-op) lhs rhs
-                          `(:label ,then-label) `(:label ,else-label))))
-        (let ((test-vreg (lower-expr ctx test)))
-          (ctx-emit ctx :br-cond nil
-                    (list '(:cmp :jne) test-vreg `(:imm 0)
-                          `(:label ,then-label) `(:label ,else-label)))))
+    ;; Emit conditional branch — short-circuit or/and when used as a test
+    (emit-test-branch ctx test then-label else-label)
 
     ;; Then block
     (let ((then-block (make-basic-block :label then-label)))
