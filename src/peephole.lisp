@@ -42,6 +42,7 @@
     (setf result (peephole-eliminate-local-dead-writes result))
     (setf result (peephole-forward-cross-reg-imm result))
     (setf result (peephole-coalesce-copy result))
+    (setf result (peephole-forward-mov-chain result))
     ;; Final cleanup pass — iterate branch inversion + dead-jump removal
     ;; since dead-jump removal can expose new cleanup candidates
     (setf result (peephole-eliminate-redundant-movs result))
@@ -86,6 +87,122 @@
 (defun bpf-exit-p (insn)
   "Is this an EXIT instruction?"
   (= (whistler/bpf:bpf-insn-code insn) #x95))
+
+;;; ========== Mov chain forwarding ==========
+;;; Pattern: mov rA, rB; <op using rA as src> → <op using rB as src>
+;;; Deletes the mov when rA is only used as an intermediate.
+;;; Restricted to adjacent instructions within a straight-line block.
+
+(defun insn-reads-reg (insn reg)
+  "Does INSN read REG as a source operand?"
+  (let* ((code (whistler/bpf:bpf-insn-code insn))
+         (class (logand code #x07)))
+    (or
+     ;; ALU/JMP with X source: src field is read
+     (and (plusp (logand code #x08))
+          (= (whistler/bpf:bpf-insn-src insn) reg))
+     ;; ALU ops read dst as accumulator (dst op= src/imm)
+     (and (or (= class whistler/bpf:+bpf-alu+)
+              (= class whistler/bpf:+bpf-alu64+))
+          (not (let ((op (logand code #xf0)))
+                 ;; mov is the only ALU that doesn't read dst
+                 (= op whistler/bpf:+bpf-mov+)))
+          (= (whistler/bpf:bpf-insn-dst insn) reg))
+     ;; STX: src is value, dst is base pointer — both read
+     (and (= class whistler/bpf:+bpf-stx+)
+          (or (= (whistler/bpf:bpf-insn-src insn) reg)
+              (= (whistler/bpf:bpf-insn-dst insn) reg)))
+     ;; ST (store imm): dst is base pointer — read
+     (and (= class whistler/bpf:+bpf-st+)
+          (= (whistler/bpf:bpf-insn-dst insn) reg))
+     ;; LDX: src is base pointer — read
+     (and (= class whistler/bpf:+bpf-ldx+)
+          (= (whistler/bpf:bpf-insn-src insn) reg))
+     ;; Conditional jump: reads dst and possibly src
+     (and (bpf-conditional-jmp-p insn)
+          (or (= (whistler/bpf:bpf-insn-dst insn) reg)
+              (and (plusp (logand code #x08))
+                   (= (whistler/bpf:bpf-insn-src insn) reg)))))))
+
+(defun insn-writes-reg (insn reg)
+  "Does INSN write to REG?"
+  (let ((code (whistler/bpf:bpf-insn-code insn)))
+    (cond
+      ;; Call clobbers R0-R5
+      ((= code #x85) (<= reg 5))
+      ;; Exit doesn't write
+      ((= code #x95) nil)
+      ;; JA doesn't write
+      ((= code #x05) nil)
+      ;; Conditional jumps don't write
+      ((bpf-conditional-jmp-p insn) nil)
+      ;; Everything else writes dst
+      (t (= (whistler/bpf:bpf-insn-dst insn) reg)))))
+
+(defun peephole-forward-mov-chain (insns)
+  "Forward register copies through adjacent instructions.
+   mov rA, rB; <next using rA as src> → substitute rB for rA in <next>,
+   delete the mov if rA is not used later in the straight-line block."
+  (let* ((vec (coerce insns 'vector))
+         (len (length vec))
+         (targets (make-hash-table))
+         (to-delete (make-hash-table))
+         (changed nil))
+    ;; Mark jump targets — can't forward across CFG merges
+    (loop for i from 0 below len
+          for insn = (aref vec i)
+          when (or (bpf-unconditional-jmp-p insn)
+                   (bpf-conditional-jmp-p insn))
+          do (let ((target (+ i 1 (whistler/bpf:bpf-insn-off insn))))
+               (when (and (>= target 0) (<= target len))
+                 (setf (gethash target targets) t))))
+    ;; Look for mov rA, rB followed by instruction using rA
+    (loop for i from 0 below (1- len)
+          for mov = (aref vec i)
+          when (and (bpf-mov64-reg-p mov)
+                    (not (bpf-self-mov-p mov))
+                    (not (gethash i to-delete))
+                    (not (gethash (1+ i) targets)))  ; next isn't a jump target
+          do (let* ((ra (whistler/bpf:bpf-insn-dst mov))
+                    (rb (whistler/bpf:bpf-insn-src mov))
+                    (next (aref vec (1+ i))))
+               ;; Next instruction reads rA as source?
+               (when (and (insn-reads-reg next ra)
+                          ;; Don't forward if next also reads rB (would change semantics)
+                          (not (insn-reads-reg next rb))
+                          ;; Don't forward into calls/exits/jumps
+                          (not (= (whistler/bpf:bpf-insn-code next) #x85))
+                          (not (bpf-exit-p next))
+                          (not (bpf-unconditional-jmp-p next))
+                          (not (bpf-conditional-jmp-p next)))
+                 ;; Check rA is dead after next instruction
+                 ;; (not read before being overwritten in the rest of the block)
+                 (let ((ra-dead t))
+                   (loop for j from (+ i 2) below len
+                         for future = (aref vec j)
+                         do (cond
+                              ;; Jump/call/exit: rA might be live, bail
+                              ((or (bpf-unconditional-jmp-p future)
+                                   (bpf-conditional-jmp-p future)
+                                   (= (whistler/bpf:bpf-insn-code future) #x85)
+                                   (bpf-exit-p future)
+                                   (gethash j targets))
+                               (setf ra-dead nil) (return))
+                              ;; rA is read before overwritten
+                              ((insn-reads-reg future ra)
+                               (setf ra-dead nil) (return))
+                              ;; rA is overwritten: it's dead
+                              ((insn-writes-reg future ra)
+                               (return))))
+                   (when ra-dead
+                     ;; Substitute rB for rA in next's src field
+                     (when (= (whistler/bpf:bpf-insn-src next) ra)
+                       (setf (whistler/bpf:bpf-insn-src next) rb))
+                     (setf (gethash i to-delete) t)
+                     (setf changed t))))))
+    (if changed
+        (reindex-after-deletion vec to-delete)
+        insns)))
 
 ;;; ========== Redundant mov elimination ==========
 
