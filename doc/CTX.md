@@ -227,27 +227,34 @@ portability.
 target kernel's BTF blob. When BTF is unavailable (no vmlinux, no
 override), the static table provides a fallback with standard offsets.
 
-#### Phase 3: CO-RE relocation
+#### Phase 3: CO-RE relocation *(implemented)*
 
-For true compile-once portability, emit BPF CO-RE (Compile Once, Run
-Everywhere) relocations instead of hardcoded offsets. The loader
-(libbpf or Whistler's loader) patches offsets at load time based on
-the target kernel's BTF.
+Field-name context access now emits BPF CO-RE (Compile Once, Run
+Everywhere) relocations. The loader (libbpf or Whistler's loader)
+patches offsets at load time based on the target kernel's BTF.
 
-Whistler has partial CO-RE infrastructure for **reads only**:
-`lower-core-ctx-load` (`src/lower.lisp:921`) lowers to IR with
-`(:core struct-name field-name)` metadata, and the emit path
-(`src/emit.lisp:745`) consumes it to produce relocations. This
-provides a model to follow for field-name context reads.
+Implementation:
+- `ctx-resolve-field` now returns 4 values: `(type offset struct-name
+  c-field-name)` -- the extra values provide CO-RE metadata
+- Field-name reads route through `lower-core-ctx-load` (existing),
+  which attaches `(:core struct-name field-name)` to the IR
+- Field-name writes route through new `lower-core-ctx-store`, which
+  attaches the same CO-RE metadata to `:ctx-store` IR instructions
+- `emit-ctx-store-insn` now records CO-RE relocations (matching the
+  existing read-side logic in `emit-ctx-load-insn`)
+- `generate-btf-and-ext` adds context struct BTF types on demand when
+  referenced by CO-RE relocations
+- `*kernel-struct-fields*` in `src/btf.lisp` extended with field lists
+  for `__sk_buff`, `bpf_sock_addr`, and `bpf_sock_ops`
 
-**Writes need new end-to-end support.** There is no `core-ctx-store`
-in lowering, and `emit-ctx-store-insn` (`src/emit.lisp:767`) does not
-consume `(:core ...)` metadata. Phase 3 must add the full write-side
-CO-RE path: lowering with metadata, IR representation, and emission
-with relocation records.
+Legacy `(ctx u32 4)` access does not emit CO-RE relocations -- the
+programmer chose explicit offsets, so no relocation is appropriate.
 
-This is the target state. Once Phase 3 is done, `(ctx field-name)`
-compiles to a relocatable access that works across kernel versions.
+**Limitation:** Fields inside anonymous struct/union members (e.g.,
+`bpf_sock_addr.sk`) do not get correct multi-level CO-RE access
+strings yet. The access string encodes a flat field index, which
+works for direct struct members but not nested paths. This affects
+very few fields in practice.
 
 ### Backward compatibility
 
@@ -262,7 +269,7 @@ compiles to a relocatable access that works across kernel versions.
 | `src/whistler.lisp` | Context struct table, prog-type plumbing in `defprog`/`compile-program`, `define-setf-expander` arity |
 | `src/lower.lisp` | `ctx` form: detect symbol vs type keyword, unify `section-to-ctx-fields`, accept prog type in `lower-program` |
 | `src/vmlinux.lisp` | BTF lookup for context structs (Phase 2) *(done)* |
-| `src/emit.lisp` | CO-RE relocation emission (Phase 3) |
+| `src/emit.lisp` | CO-RE relocation emission (Phase 3) *(done)* |
 | `book/src/language/memory.md` | Document `(ctx field-name)` form |
 
 ### Open questions

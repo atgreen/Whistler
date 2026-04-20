@@ -212,7 +212,9 @@
       (data-meta     u32 140)))))
 
 (defun ctx-resolve-field (prog-type field-name &optional index)
-  "Resolve a context field name to (values type offset) for a program type.
+  "Resolve a context field name to (values type offset struct-name c-field-name)
+   for a program type. STRUCT-NAME is the C struct name (string).
+   C-FIELD-NAME is the C-style field name (string, underscores).
    For array fields, INDEX must be a compile-time constant integer.
    Tries BTF resolution first (when available), falls back to static table."
   (let* ((struct-name (cdr (assoc prog-type *prog-type-to-ctx-struct*)))
@@ -234,35 +236,36 @@
                      (format nil "program type ~a has no known context struct"
                              (or prog-type :unknown)))))
     (destructuring-bind (name ftype foffset) field
-      (declare (ignore name))
-      (cond
-        ;; Array field
-        ((and (consp ftype) (eq (first ftype) :array))
-         (unless index
-           (whistler-error
-            :what (format nil "~a is an array field — index required" field-name)
-            :expected (format nil "(ctx ~a INDEX)" field-name)))
-         (unless (integerp index)
-           (whistler-error
-            :what (format nil "array index must be a compile-time constant, got ~s" index)))
-         (let ((elem-type (second ftype))
-               (count (third ftype)))
-           (when (or (< index 0) (>= index count))
+      (let ((c-field (substitute #\_ #\- (string-downcase (symbol-name name)))))
+        (cond
+          ;; Array field
+          ((and (consp ftype) (eq (first ftype) :array))
+           (unless index
              (whistler-error
-              :what (format nil "index ~d out of bounds for ~a[~d]" index field-name count)))
-           (values elem-type (+ foffset (* index (bpf-type-size elem-type))))))
-        ;; Pointer field
-        ((eq ftype :ptr)
-         (when index
-           (whistler-error
-            :what (format nil "~a is a pointer field — no index allowed" field-name)))
-         (values 'u64 foffset))
-        ;; Scalar field
-        (t
-         (when index
-           (whistler-error
-            :what (format nil "~a is a scalar field — no index allowed" field-name)))
-         (values ftype foffset))))))
+              :what (format nil "~a is an array field -- index required" field-name)
+              :expected (format nil "(ctx ~a INDEX)" field-name)))
+           (unless (integerp index)
+             (whistler-error
+              :what (format nil "array index must be a compile-time constant, got ~s" index)))
+           (let ((elem-type (second ftype))
+                 (count (third ftype)))
+             (when (or (< index 0) (>= index count))
+               (whistler-error
+                :what (format nil "index ~d out of bounds for ~a[~d]" index field-name count)))
+             (values elem-type (+ foffset (* index (bpf-type-size elem-type)))
+                     struct-name c-field)))
+          ;; Pointer field
+          ((eq ftype :ptr)
+           (when index
+             (whistler-error
+              :what (format nil "~a is a pointer field -- no index allowed" field-name)))
+           (values 'u64 foffset struct-name c-field))
+          ;; Scalar field
+          (t
+           (when index
+             (whistler-error
+              :what (format nil "~a is a scalar field -- no index allowed" field-name)))
+           (values ftype foffset struct-name c-field)))))))
 
 (defun builtin-helper-p (sym)
   "Return the helper ID if SYM names a known BPF helper, or NIL."

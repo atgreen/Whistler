@@ -307,10 +307,11 @@
            ;; Legacy: (ctx TYPE OFFSET)
            (lower-ctx-load ctx (first args) (second args))
            ;; Field name: (ctx field-name) or (ctx field-name index)
-           (multiple-value-bind (type offset)
+           ;; Emit with CO-RE metadata for relocatable access
+           (multiple-value-bind (type offset struct-name c-field)
                (whistler/compiler:ctx-resolve-field (lower-ctx-prog-type ctx)
                                            (first args) (second args))
-             (lower-ctx-load ctx type offset))))
+             (lower-core-ctx-load ctx (list type offset struct-name c-field)))))
 
       ((sym= head 'ctx-load)
        (warn "ctx-load is deprecated; use (ctx TYPE OFFSET) instead")
@@ -330,12 +331,14 @@
            ;; Legacy: (%ctx-set TYPE OFFSET VAL)
            (lower-ctx-store ctx (first args) (second args) (third args))
            ;; Field name: last arg is always the value
+           ;; Emit with CO-RE metadata for relocatable access
            (let ((value-form (car (last args)))
                  (field-args (butlast (cdr args))))
-             (multiple-value-bind (type offset)
+             (multiple-value-bind (type offset struct-name c-field)
                  (whistler/compiler:ctx-resolve-field (lower-ctx-prog-type ctx)
                                             (first args) (first field-args))
-               (lower-ctx-store ctx type offset value-form)))))
+               (lower-core-ctx-store ctx type offset value-form
+                                     struct-name c-field)))))
 
       ((sym= head 'ctx-store)
        (warn "ctx-store is deprecated; use (setf (ctx TYPE OFFSET) VALUE) instead")
@@ -954,6 +957,16 @@
                     `(:core ,struct-name ,field-name))
               type-kw)
     dst))
+
+(defun lower-core-ctx-store (ctx type-kw offset value-form struct-name field-name)
+  "Lower a context store with CO-RE metadata.
+   Like lower-ctx-store but appends (:core STRUCT-NAME FIELD-NAME) to the IR args."
+  (let ((ctx-vreg (cdr (ctx-lookup-var ctx (intern "%%CTX" (find-package '#:whistler/ir)))))
+        (val-vreg (lower-expr ctx value-form)))
+    (ctx-emit ctx :ctx-store nil
+              (list ctx-vreg `(:imm ,offset) val-vreg `(:type ,type-kw)
+                    `(:core ,struct-name ,field-name)))
+    nil))
 
 (defun lower-atomic-add (ctx args)
   (unless (<= 3 (length args) 4)

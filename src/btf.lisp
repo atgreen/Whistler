@@ -401,9 +401,23 @@
   "Convert a Lisp symbol name to C-style: lowercase, hyphens to underscores."
   (substitute #\_ #\- (string-downcase (string sym))))
 
-;; Known kernel struct field lists for CO-RE (not in user *struct-defs*)
+;; Known kernel struct field lists for CO-RE (not in user *struct-defs*).
+;; Field order must match the kernel BTF struct member order.
+;; Fields inside anonymous unions/structs are listed at the position
+;; of their containing anonymous member.
 (defparameter *kernel-struct-fields*
-  '(("xdp_md" . (data data_end data_meta ingress_ifindex rx_queue_index))))
+  '(("xdp_md" . (data data_end data_meta ingress_ifindex rx_queue_index
+                  egress_ifindex))
+    ("__sk_buff" . (len pkt_type mark queue_mapping protocol vlan_present
+                    vlan_tci vlan_proto priority ingress_ifindex ifindex
+                    tc_index cb hash tc_classid data data_end napi_id
+                    family remote_ip4 local_ip4 remote_ip6 local_ip6
+                    remote_port local_port data_meta))
+    ("bpf_sock_addr" . (user_family user_ip4 user_ip6 user_port family
+                        type protocol msg_src_ip4 msg_src_ip6))
+    ("bpf_sock_ops" . (op args family remote_ip4 local_ip4 remote_ip6
+                       local_ip6 remote_port local_port is_fullsock
+                       snd_cwnd srtt_us))))
 
 (defun struct-field-index (struct-defs struct-name field-name)
   "Look up the field index for FIELD-NAME in STRUCT-NAME.
@@ -559,6 +573,30 @@
                                 (list per-section-core-relocs))))
     (multiple-value-bind (ctx func-ids)
         (build-btf-ctx struct-defs names map-specs prog-names)
+      ;; Add context struct BTF types referenced by CO-RE relocations
+      (let ((added (make-hash-table :test 'equal)))
+        (dolist (relocs relocs-per-section)
+          (dolist (reloc relocs)
+            (let ((struct-name (lisp-to-c-name (second reloc))))
+              (when (and (not (gethash struct-name added))
+                         (not (gethash struct-name (btf-ctx-type-cache ctx))))
+                (let ((kernel (assoc struct-name *kernel-struct-fields*
+                                     :test #'string=)))
+                  (when kernel
+                    (let ((fields (loop for f in (cdr kernel)
+                                       for entry in (cdr (assoc struct-name
+                                                                 whistler/compiler:*ctx-struct-fields*
+                                                                 :test #'string=))
+                                       collect (let* ((ftype (second entry))
+                                                      (etype (cond
+                                                               ((and (consp ftype) (eq (first ftype) :array))
+                                                                (second ftype))
+                                                               ((eq ftype :ptr) 'u64)
+                                                               (t ftype)))
+                                                      (size (whistler/compiler:bpf-type-size etype)))
+                                                 (list f etype (third entry) size)))))
+                      (btf-add-struct ctx struct-name fields)
+                      (setf (gethash struct-name added) t)))))))))
       ;; Encode BTF.ext BEFORE btf-encode, so access strings get into the
       ;; shared string table before it's serialized.
       (let ((btf-ext (btf-ext-encode ctx names func-ids

@@ -763,7 +763,8 @@
                        whistler/bpf:+bpf-reg-10+ dst-reg (cadr dst-loc))))))
 
 (defun emit-ctx-store-insn (ctx args)
-  "Emit a store to a BPF context field. Uses the same register logic as ctx-load."
+  "Emit a store to a BPF context field. Uses the same register logic as ctx-load.
+   Records CO-RE relocations when (:core ...) metadata is present."
   (let* ((ctx-early (ctx-loads-early-p (emit-ctx-ir-prog ctx)))
          (ctx-reg (if ctx-early
                       (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+)
@@ -774,11 +775,16 @@
                       (and (integerp val-arg)
                            (gethash val-arg (emit-ctx-const-values ctx)))))
          (type-kw (type-arg-name (fourth args)))
-         (bpf-size (ir-type-to-bpf-size type-kw)))
-    (if val-imm
-        (ectx-emit ctx (whistler/bpf:emit-st-mem bpf-size ctx-reg off val-imm))
-        (let ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-2+)))
-          (ectx-emit ctx (whistler/bpf:emit-stx-mem bpf-size ctx-reg val-reg off))))))
+         (bpf-size (ir-type-to-bpf-size type-kw))
+         (core-info (core-arg-info args)))
+    (let ((insns (if val-imm
+                     (whistler/bpf:emit-st-mem bpf-size ctx-reg off val-imm)
+                     (let ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-2+)))
+                       (whistler/bpf:emit-stx-mem bpf-size ctx-reg val-reg off)))))
+      (when core-info
+        (push (list (first insns) (first core-info) (second core-info))
+              (emit-ctx-core-relocs ctx)))
+      (ectx-emit ctx insns))))
 
 (defun emit-store-insn (ctx args)
   (let* ((ptr-vreg (first args))
