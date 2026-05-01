@@ -54,8 +54,9 @@
       ;; Compile each program
       (let ((compiled-units
              (mapcar (lambda (prog-spec)
-                       (destructuring-bind (name &key section license body) prog-spec
-                         (let ((cu (whistler::compile-program section license maps body)))
+                       (destructuring-bind (name &key type section license body) prog-spec
+                         (let ((cu (whistler::compile-program section license maps body
+                                                              :prog-type type)))
                            (setf (whistler/compiler:cu-name cu)
                                  (substitute #\_ #\-
                                              (string-downcase (symbol-name name))))
@@ -157,8 +158,12 @@
                (setf (aref insns (+ offset 6)) (logand (ash fd -16) #xff))
                (setf (aref insns (+ offset 7)) (logand (ash fd -24) #xff)))))
          (let* ((eat (section-to-expected-attach-type sec-name))
+                (btf-id (when (= prog-type +bpf-prog-type-lsm+)
+                          (resolve-btf-func-id
+                           (lsm-hook-to-btf-func sec-name))))
                 (fd (load-program insns prog-type license
-                                  :expected-attach-type eat)))
+                                  :expected-attach-type eat
+                                  :attach-btf-id btf-id)))
            (cons name (make-prog-info :name name :section-name sec-name
                                       :type prog-type :insns insns :fd fd)))))
      prog-specs)))
@@ -243,7 +248,8 @@
            (declare (special *bpf-session*))
            (unwind-protect
                 (macrolet
-                    ((bpf:attach (prog-name target &rest args)
+                    ((bpf:attach (prog-name &optional target &rest args)
+                       (declare (ignorable target))
                        ;; Detect kprobe vs uprobe vs tracepoint from section name
                        (let* ((pname (string-downcase
                                       (substitute #\_ #\-
@@ -257,6 +263,10 @@
                                                   (>= (length sec-name) 11)
                                                   (string= (subseq sec-name 0 11)
                                                            "tracepoint/")))
+                              (is-lsm (and sec-name
+                                            (>= (length sec-name) 4)
+                                            (string= (subseq sec-name 0 4)
+                                                     "lsm/")))
                               (is-cgroup (and sec-name
                                               (>= (length sec-name) 6)
                                               (string= (subseq sec-name 0 6)
@@ -264,6 +274,15 @@
                               (cgroup-eat (and is-cgroup
                                                (section-to-expected-attach-type sec-name))))
                          (cond
+                           (is-lsm
+                            ;; lsm: (bpf:attach prog) — no target needed
+                            `(let* ((prog-entry (assoc ,pname
+                                                       (bpf-session-progs *bpf-session*)
+                                                       :test #'string=))
+                                    (att (attach-lsm (prog-info-fd (cdr prog-entry))
+                                                     ,sec-name)))
+                               (push att (bpf-session-attachments *bpf-session*))
+                               att))
                            (is-cgroup
                             ;; cgroup: (bpf:attach prog cgroup-path)
                             `(let* ((prog-entry (assoc ,pname

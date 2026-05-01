@@ -279,6 +279,93 @@
                 (handler-case (sb-posix:close cgroup-fd)
                   (error () nil))))))
 
+;;; ========== LSM attachment ==========
+
+(defun resolve-btf-func-id (func-name)
+  "Resolve the BTF type ID of a FUNC named FUNC-NAME in /sys/kernel/btf/vmlinux.
+   Parses the binary BTF directly — no external tools required."
+  (let* ((bytes (with-open-file (f "/sys/kernel/btf/vmlinux"
+                                   :element-type '(unsigned-byte 8))
+                  (let ((buf (make-array (file-length f)
+                                         :element-type '(unsigned-byte 8))))
+                    (read-sequence buf f)
+                    buf)))
+         ;; Parse BTF header: magic(u16@0) ver(u8@2) flags(u8@3)
+         ;; hdr_len(u32@4) type_off(u32@8) type_len(u32@12)
+         ;; str_off(u32@16) str_len(u32@20)
+         (hdr-len (get-u32 bytes 4))
+         (type-off (get-u32 bytes 8))
+         (type-len (get-u32 bytes 12))
+         (str-off (get-u32 bytes 16))
+         (types-start (+ hdr-len type-off))
+         (types-end (+ types-start type-len))
+         (str-start (+ hdr-len str-off))
+         (target (sb-ext:string-to-octets func-name))
+         (id 1)
+         (pos types-start))
+    (flet ((btf-string (name-off)
+             "Extract a NUL-terminated string from the BTF string table."
+             (let* ((start (+ str-start name-off))
+                    (end (position 0 bytes :start start)))
+               (sb-ext:octets-to-string bytes :start start
+                                              :end (or end (+ start 256))
+                                              :external-format :utf-8)))
+           (btf-type-extra-bytes (kind vlen)
+             "Return the number of extra bytes following the 12-byte type header."
+             (case kind
+               (1  4)                     ; INT
+               (2  0)                     ; PTR
+               (3  12)                    ; ARRAY
+               ((4 5) (* 12 vlen))        ; STRUCT, UNION (members)
+               (6  (* 8 vlen))            ; ENUM (32-bit entries)
+               (7  0)                     ; FWD
+               (8  0)                     ; TYPEDEF
+               (9  0)                     ; VOLATILE
+               (10 0)                     ; CONST
+               (11 0)                     ; RESTRICT
+               (12 0)                     ; FUNC
+               (13 (* 8 vlen))            ; FUNC_PROTO (params)
+               (14 4)                     ; VAR
+               (15 (* 12 vlen))           ; DATASEC
+               (16 0)                     ; FLOAT
+               (17 4)                     ; DECL_TAG
+               (18 0)                     ; TYPE_TAG
+               (19 (* 12 vlen))           ; ENUM64
+               (t  0))))
+      (loop while (< pos types-end) do
+        (let* ((name-off (get-u32 bytes pos))
+               (info (get-u32 bytes (+ pos 4)))
+               (kind (logand (ash info -24) #x1f))
+               (vlen (logand info #xffff)))
+          ;; BTF_KIND_FUNC = 12
+          (when (and (= kind 12)
+                     (string= (btf-string name-off) func-name))
+            (return-from resolve-btf-func-id id))
+          (incf pos (+ 12 (btf-type-extra-bytes kind vlen)))
+          (incf id))))
+    (error "BTF func ~a not found in /sys/kernel/btf/vmlinux" func-name)))
+
+(defun lsm-hook-to-btf-func (section-name)
+  "Extract the LSM hook name from a section like \"lsm/socket_create\"
+   and return the BTF func name \"bpf_lsm_socket_create\"."
+  (let ((hook (subseq section-name 4)))  ; skip "lsm/"
+    (format nil "bpf_lsm_~a" hook)))
+
+(defun attach-lsm (prog-fd &optional section-name)
+  "Attach an LSM BPF program via BPF_LINK_CREATE.
+   Returns an attachment that can be passed to detach."
+  (declare (ignore section-name))
+  (let ((buf (make-attr-buf 168)))
+    ;; BPF_LINK_CREATE attr: prog_fd(0), target_fd(4), attach_type(8)
+    (put-u32 buf 0 prog-fd)
+    (put-u32 buf 4 0)              ; target_fd = 0 for LSM
+    (put-u32 buf 8 +bpf-lsm-mac+) ; attach_type = BPF_LSM_MAC
+    (let ((link-fd (%bpf +bpf-link-create+ buf 168 "lsm-link-create")))
+      (make-attachment :type :lsm :perf-fds nil :prog-fd prog-fd
+                       :cleanup (lambda ()
+                                  (handler-case (sb-posix:close link-fd)
+                                    (error () nil)))))))
+
 ;;; ========== XDP attachment ==========
 
 (defun attach-xdp (prog-fd interface-name &key (mode "xdp"))

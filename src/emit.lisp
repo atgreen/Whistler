@@ -562,8 +562,11 @@
       (let ((val (first args)))
         (when (integerp val)
           (let ((src-reg (vreg-to-physical ctx val whistler/bpf:+bpf-reg-1+)))
-            (unless (= src-reg whistler/bpf:+bpf-reg-0+)
-              (ectx-emit ctx (whistler/bpf:emit-mov64-reg whistler/bpf:+bpf-reg-0+ src-reg)))))
+            ;; Always emit mov r0, src — even if src is already r0.
+            ;; Needed when multiple branches converge on a shared exit:
+            ;; one branch may have the value in r0 while another has it
+            ;; in a different register.
+            (ectx-emit ctx (whistler/bpf:emit-mov64-reg whistler/bpf:+bpf-reg-0+ src-reg))))
         (ectx-emit ctx (whistler/bpf:emit-exit))))
 
      (t (error "Unknown IR op for emission: ~a" op)))))
@@ -1250,10 +1253,14 @@
     (loop
       (let ((safe (find-if
                    (lambda (m)
-                     (let ((src (cdr m)))
-                       (or (eq (car src) :imm)
-                           (eq (car src) :stack)
-                           (not (find (cadr src) pending :key #'car)))))
+                     (let ((dst (car m)))
+                       ;; A move is safe if its dst register is not read
+                       ;; as a source by any other pending move.
+                       (not (find-if (lambda (other)
+                                       (and (not (eq other m))
+                                            (eq (car (cdr other)) :reg)
+                                            (= (cadr (cdr other)) dst)))
+                                     pending))))
                    pending)))
         (cond
           (safe

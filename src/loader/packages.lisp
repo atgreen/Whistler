@@ -24,7 +24,7 @@
    #:map-info-fd #:map-info-name
    ;; Attachment
    #:attach-kprobe #:attach-uprobe #:attach-tracepoint #:attach-xdp #:attach-tc
-   #:attach-cgroup #:detach
+   #:attach-cgroup #:attach-lsm #:detach
    #:attach-obj-kprobe #:attach-obj-uprobe #:attach-obj-cgroup
    #:attach-obj-xdp #:attach-obj-tc
    ;; Cgroup constants
@@ -36,7 +36,7 @@
    #:+bpf-cgroup-udp4-sendmsg+ #:+bpf-cgroup-udp6-sendmsg+
    ;; Program type constants
    #:+bpf-prog-type-cgroup-skb+ #:+bpf-prog-type-cgroup-sock+
-   #:+bpf-prog-type-cgroup-sock-addr+
+   #:+bpf-prog-type-cgroup-sock-addr+ #:+bpf-prog-type-lsm+
    ;; Ring buffer
    #:open-ring-consumer #:ring-poll #:ring-consume #:close-ring-consumer
    #:open-decoding-ring-consumer #:with-decoding-ring-consumer

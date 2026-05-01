@@ -58,6 +58,10 @@
          (and (> (length section-name) 3)
               (string= (subseq section-name 0 3) "tc/")))
      +bpf-prog-type-sched-cls+)
+    ;; LSM program type
+    ((and (>= (length section-name) 4)
+          (string= (subseq section-name 0 4) "lsm/"))
+     +bpf-prog-type-lsm+)
     ;; Cgroup program types
     ((and (>= (length section-name) 10)
           (string= (subseq section-name 0 10) "cgroup_skb"))
@@ -98,12 +102,15 @@
     ((string= section-name "cgroup/bind6")        +bpf-cgroup-inet6-bind+)
     ((string= section-name "cgroup/post_bind4")   +bpf-cgroup-inet4-post-bind+)
     ((string= section-name "cgroup/post_bind6")   +bpf-cgroup-inet6-post-bind+)
+    ((and (>= (length section-name) 4)
+          (string= (subseq section-name 0 4) "lsm/"))
+     +bpf-lsm-mac+)
     (t nil)))
 
 ;;; ========== Program loading ==========
 
 (defun load-program (insns prog-type license &key (log-level 0) (log-buf-size (ash 1 20))
-                                                   expected-attach-type)
+                                                   expected-attach-type attach-btf-id)
   "Load a BPF program into the kernel. Returns the prog FD.
    EXPECTED-ATTACH-TYPE is required for cgroup program types.
    On failure, retries with logging and signals bpf-verifier-error."
@@ -119,9 +126,11 @@
           (put-u32 buf 24 log-level)
           (when expected-attach-type
             (put-u32 buf 68 expected-attach-type))
+          (when attach-btf-id
+            (put-u32 buf 108 attach-btf-id))
           ;; Try without log first
           (handler-case
-              (%bpf +bpf-prog-load+ buf 128 "prog-load")
+              (%bpf +bpf-prog-load+ buf 256 "prog-load")
             (bpf-error ()
               ;; Retry with verifier log
               (let ((log-buf (make-array log-buf-size
@@ -138,8 +147,10 @@
                   (put-ptr buf 32 (sb-sys:vector-sap log-buf))
                   (when expected-attach-type
                     (put-u32 buf 68 expected-attach-type))
+                  (when attach-btf-id
+                    (put-u32 buf 108 attach-btf-id))
                   (handler-case
-                      (%bpf +bpf-prog-load+ buf 128 "prog-load")
+                      (%bpf +bpf-prog-load+ buf 256 "prog-load")
                     (bpf-error (e)
                       (let* ((end (or (position 0 log-buf) (length log-buf)))
                              (log-str (sb-ext:octets-to-string

@@ -39,7 +39,7 @@
 (defconstant +bpf-prog-load+ 5)
 (defconstant +bpf-obj-pin+ 6)
 (defconstant +bpf-obj-get+ 7)
-(defconstant +bpf-link-create+ 29)
+(defconstant +bpf-link-create+ 28)
 
 ;;; ========== BPF map types ==========
 
@@ -61,6 +61,7 @@
 (defconstant +bpf-prog-type-cgroup-sock+ 9)
 (defconstant +bpf-prog-type-cgroup-sock-addr+ 18)
 (defconstant +bpf-prog-type-tracing+ 26)
+(defconstant +bpf-prog-type-lsm+ 29)
 
 ;;; ========== BPF commands (attach/detach) ==========
 
@@ -70,6 +71,7 @@
 ;;; ========== BPF attach types ==========
 
 (defconstant +bpf-perf-event+ 41)
+(defconstant +bpf-lsm-mac+ 27)
 
 ;;; ========== Cgroup attach types ==========
 
