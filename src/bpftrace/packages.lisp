@@ -16,4 +16,6 @@
    ;; Errors
    #:bpftrace-error
    #:bpftrace-parse-error
-   #:bpftrace-unsupported))
+   #:bpftrace-unsupported
+   ;; CLI knobs
+   #:*pid-filter*))

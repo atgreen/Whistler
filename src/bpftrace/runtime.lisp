@@ -148,10 +148,13 @@
    show up in kallsyms but perf_event_open rejects them.")
 
 (defun load-attachable-funcs ()
-  "Populate *attachable-funcs*. Tries tracefs first; falls back to
-   kallsyms with the same filtering rules."
+  "Populate *attachable-funcs*. Tries tracefs's canonical list first;
+   falls back to a name-only kallsyms parse. The fallback doesn't go
+   through *kallsyms* (which filters zero-address entries that
+   kptr_restrict hides from non-root) — for listing we only need
+   names, not addresses."
   (or
-   ;; (1) tracefs canonical list
+   ;; (1) tracefs canonical list — requires CAP_SYS_ADMIN/sudo.
    (handler-case
        (with-open-file (s "/sys/kernel/tracing/available_filter_functions"
                           :direction :input)
@@ -162,13 +165,27 @@
                unless (find #\. name)
                  collect name))
      (error () nil))
-   ;; (2) kallsyms fallback
-   (progn
-     (when (null *kallsyms*) (load-kallsyms))
-     (loop for entry across (or *kallsyms* #())
-           for name = (cdr entry)
-           unless (find #\. name)
-             collect name))))
+   ;; (2) Direct /proc/kallsyms parse — names only, ignore addresses.
+   ;; Filter to text-section ('t'/'T') symbols since data symbols
+   ;; aren't kprobe-attachable.
+   (handler-case
+       (with-open-file (s "/proc/kallsyms" :direction :input)
+         (loop for line = (read-line s nil nil)
+               while line
+               for sp1 = (position #\Space line)
+               for sp2 = (and sp1 (position #\Space line :start (1+ sp1)))
+               when (and sp1 sp2)
+                 collect (let* ((type-ch (char line (1+ sp1)))
+                                (tail (subseq line (1+ sp2)))
+                                ;; Strip ` [module]' suffix if present.
+                                (sp3 (position #\Space tail))
+                                (name (if sp3 (subseq tail 0 sp3) tail)))
+                           (when (and (or (char= type-ch #\t) (char= type-ch #\T))
+                                      (not (find #\. name)))
+                             name))
+                 into names
+               finally (return (remove nil names))))
+     (error () nil))))
 
 (defun attachable-funcs ()
   (or *attachable-funcs*
@@ -182,38 +199,57 @@
           when (cl-ppcre:scan rx name)
             collect name)))
 
+(defun attach-kprobe-glob-sequential (fd target names retprobe)
+  "Fallback when KPROBE_MULTI isn't supported — one perf_event_open
+   per match. Slow (~2ms each) but works on older kernels."
+  (let* ((attachments
+           (loop for name in names
+                 collect (handler-case
+                             (whistler/loader:attach-kprobe
+                              fd name :retprobe retprobe)
+                           (error () nil))))
+         (live (remove nil attachments)))
+    (format t ";; ~A attached on ~D of ~D (sequential fallback).~%"
+            target (length live) (length names))
+    (when (null live)
+      (error "kprobe:~A: none of ~D candidates accepted the probe"
+             target (length names)))
+    (whistler/loader::make-attachment
+     :type (if retprobe :kretprobe :kprobe)
+     :perf-fds nil :prog-fd fd
+     :cleanup (lambda ()
+                (dolist (a live)
+                  (handler-case (whistler/loader:detach a) (error () nil)))))))
+
 (defun attach-kprobe-glob (fd target &key retprobe)
   "Attach FD as a kprobe on TARGET. If TARGET contains `*', enumerate
    /proc/kallsyms and attach to every match, returning a composite
    attachment that detaches them all on close."
   (cond
     ((find #\* target)
+     ;; The program was loaded as kprobe.multi/-section, so the
+     ;; kernel knows to attach via BPF_TRACE_KPROBE_MULTI. We just
+     ;; supply the list of function names — one syscall, no
+     ;; sequential perf_event_open fan-out.
      (let ((names (kallsyms-functions-matching target)))
        (when (null names)
          (error "kprobe:~A matched no functions" target))
-       (format t ";; Attaching kprobe:~A to ~D function~:p — sequential ~
-                   perf_event_open is ~Dms-ish per attach, please wait...~%"
-               target (length names) (* 2 (length names)))
+       (format t ";; kprobe:~A → attaching ~D function~:p via KPROBE_MULTI...~%"
+               target (length names))
        (force-output)
-       (let* ((attachments
-                (loop for name in names
-                      collect (handler-case
-                                  (whistler/loader:attach-kprobe
-                                   fd name :retprobe retprobe)
-                                (error () nil))))
-              (live (remove nil attachments)))
-         (format t ";; kprobe:~A attached on ~D of ~D function~:p.~%"
-                 target (length live) (length names))
-         (when (null live)
-           (error "kprobe:~A: none of ~D candidates accepted the probe"
-                  target (length names)))
-         (whistler/loader::make-attachment
-          :type (if retprobe :kretprobe :kprobe)
-          :perf-fds nil
-          :prog-fd fd
-          :cleanup (lambda ()
-                     (dolist (a live)
-                       (handler-case (whistler/loader:detach a) (error () nil))))))))
+       (handler-case
+           (let ((att (whistler/loader:attach-kprobe-multi
+                       fd names :retprobe retprobe)))
+             (format t ";; kprobe:~A attached.~%" target)
+             att)
+         (error (e)
+           ;; KPROBE_MULTI needs kernel ≥ 5.18 and the right config.
+           ;; Fall back to sequential perf_event_open if the link
+           ;; create rejects us.
+           (format t ";; KPROBE_MULTI rejected (~A), falling back to ~
+                       sequential attach...~%" e)
+           (force-output)
+           (attach-kprobe-glob-sequential fd target names retprobe)))))
     (t (whistler/loader:attach-kprobe fd target :retprobe retprobe))))
 
 (defun attach-probe (prog-info)
@@ -228,9 +264,9 @@
          (fd      (whistler/loader::prog-info-fd prog-info)))
     (handler-case
         (cond
-          ((string= kind "kprobe")
+          ((or (string= kind "kprobe") (string= kind "kprobe.multi"))
            (attach-kprobe-glob fd target))
-          ((string= kind "kretprobe")
+          ((or (string= kind "kretprobe") (string= kind "kretprobe.multi"))
            (attach-kprobe-glob fd target :retprobe t))
           ((string= kind "uprobe")
            (multiple-value-bind (path sym) (parse-uprobe-target section 7)

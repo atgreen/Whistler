@@ -930,67 +930,152 @@
 (defun run-bpftrace-subcommand (args)
   "Dispatch `whistler bpftrace …`. Loads whistler/bpftrace lazily so
    the main system stays independent."
-  (flet ((require-bpftrace ()
-           (unless (find-package '#:whistler/bpftrace)
-             (handler-case (asdf:load-system "whistler/bpftrace" :verbose nil)
-               (error (e)
-                 (format *error-output*
-                         "Error: could not load whistler/bpftrace: ~A~%"
-                         e)
-                 (uiop:quit 1))))
-           (find-package '#:whistler/bpftrace)))
-    (cond
-      ((or (null args) (member "--help" args :test #'string=)
-           (member "-h" args :test #'string=))
-       (format t "Usage: whistler bpftrace [OPTIONS] [SCRIPT]~%")
-       (format t "~%Compile and run a bpftrace script via Whistler.~%")
-       (format t "~%Options:~%")
-       (format t "  -e PROGRAM     Inline script text (instead of a file)~%")
-       (format t "  --dump         Print generated Whistler forms and exit (no kernel load)~%")
-       (format t "  -h, --help     Show this help~%")
-       (format t "~%Examples:~%")
-       (format t "  whistler bpftrace examples/bpftrace/biolatency.bt~%")
-       (format t "  whistler bpftrace -e 'kprobe:vfs_read { @[comm] = count(); }'~%")
-       (format t "  whistler bpftrace --dump examples/bpftrace/biolatency.bt~%"))
+  (cond
+    ((or (member "--version" args :test #'string=)
+         (member "-V" args :test #'string=))
+     (format t "whistler bpftrace ~A (bpftrace-compatible frontend)~%" *version*))
 
+    ((or (null args) (member "--help" args :test #'string=)
+         (member "-h" args :test #'string=))
+     (bpftrace-print-help))
+
+    ((or (member "-l" args :test #'string=)
+         (member "--list" args :test #'string=))
+     (run-bpftrace-list args))
+
+    (t
+     (run-bpftrace-script args))))
+
+(defun bpftrace-print-help ()
+  (format t "Usage: whistler bpftrace [OPTIONS] [SCRIPT]~%")
+  (format t "~%Compile and run a bpftrace script via Whistler.~%")
+  (format t "~%Options:~%")
+  (format t "  -e PROGRAM     Inline script text (instead of a file)~%")
+  (format t "  -l [PATTERN]   List kernel probes matching PATTERN (no script needed)~%")
+  (format t "  -p PID         Inject `/pid == PID/' filter into every probe~%")
+  (format t "  -c 'CMD'       Spawn CMD and trace only its pid (implies -p)~%")
+  (format t "  --dump         Print generated Whistler forms and exit (no kernel load)~%")
+  (format t "  -V, --version  Show version~%")
+  (format t "  -h, --help     Show this help~%")
+  (format t "~%Examples:~%")
+  (format t "  whistler bpftrace examples/bpftrace/biolatency.bt~%")
+  (format t "  whistler bpftrace -e 'kprobe:vfs_read { @[comm] = count(); }'~%")
+  (format t "  whistler bpftrace -l 'kprobe:tcp_*'~%")
+  (format t "  whistler bpftrace -p 1234 -e 'kfunc:vfs_read { @ = count(); }'~%")
+  (format t "  whistler bpftrace -c 'ls /etc' -e 'tracepoint:syscalls:sys_enter_openat { printf(\"%s\\n\", str(args->filename)); }'~%"))
+
+(defun bpftrace-require ()
+  (unless (find-package '#:whistler/bpftrace)
+    (handler-case (asdf:load-system "whistler/bpftrace" :verbose nil)
+      (error (e)
+        (format *error-output* "Error: could not load whistler/bpftrace: ~A~%" e)
+        (uiop:quit 1)))))
+
+(defun run-bpftrace-list (args)
+  "Implement `whistler bpftrace -l [PATTERN]'. Today we list kprobe-
+   compatible kernel functions (the canonical 'what can I probe?'
+   workflow); tracepoint + kfunc listings are a follow-on."
+  (bpftrace-require)
+  (let* ((l-pos   (or (position "-l" args :test #'string=)
+                      (position "--list" args :test #'string=)))
+         (pattern (when l-pos (nth (1+ l-pos) args)))
+         ;; If PATTERN starts with a probe-type prefix (kprobe:, etc.)
+         ;; strip it; otherwise treat the whole arg as a kprobe glob.
+         (glob (cond
+                 ((null pattern) "*")
+                 ((or (eql 0 (search "kprobe:"    pattern)) (eql 0 (search "kfunc:" pattern)))
+                  (subseq pattern (1+ (position #\: pattern))))
+                 ((or (eql 0 (search "kretprobe:" pattern)) (eql 0 (search "kretfunc:" pattern)))
+                  (subseq pattern (1+ (position #\: pattern))))
+                 (t pattern)))
+         (match-fn (find-symbol "KALLSYMS-FUNCTIONS-MATCHING" '#:whistler/bpftrace)))
+    (unless match-fn
+      (format *error-output* "Error: kallsyms helper not exported~%")
+      (uiop:quit 1))
+    (let ((matches (funcall match-fn glob)))
+      (dolist (name matches)
+        (format t "kprobe:~A~%" name))
+      (format t "~%;; ~D probe~:p~%" (length matches)))))
+
+(defun run-bpftrace-script (args)
+  "The compile-and-run path. Parses -e / -p / -c / --dump and the
+   trailing script file."
+  (bpftrace-require)
+  (let* ((dump-p (member "--dump" args :test #'string=))
+         (e-pos  (position "-e" args :test #'string=))
+         (p-pos  (position "-p" args :test #'string=))
+         (c-pos  (position "-c" args :test #'string=))
+         (pid-arg (when p-pos
+                    (let ((s (nth (1+ p-pos) args)))
+                      (unless s
+                        (format *error-output* "Error: -p requires a PID~%")
+                        (uiop:quit 1))
+                      (parse-integer s :junk-allowed nil))))
+         (cmd-arg (when c-pos
+                    (or (nth (1+ c-pos) args)
+                        (progn (format *error-output*
+                                       "Error: -c requires a command string~%")
+                               (uiop:quit 1)))))
+         (source (read-bpftrace-source args e-pos p-pos c-pos))
+         ;; -c spawns the child *first* so we can pin its real pid into
+         ;; the filter. Otherwise pid-arg (if any) is final.
+         (child-process (when cmd-arg (spawn-traced-process cmd-arg)))
+         (pid (or (and child-process (sb-ext:process-pid child-process)) pid-arg))
+         (filter-var (find-symbol "*PID-FILTER*" '#:whistler/bpftrace)))
+    ;; Dynbind the bpftrace filter dynvar across compile + run. The
+    ;; codegen pass adds `pid == PID' to every probe's predicate.
+    (progv (if (and pid filter-var) (list filter-var) '())
+           (if (and pid filter-var) (list pid) '())
+      (cond
+        (dump-p
+         (let ((gen (funcall (find-symbol "COMPILE-SCRIPT" '#:whistler/bpftrace) source))
+               (*print-pretty* t)
+               (*print-right-margin* 90))
+           (format t "~&;; ----- defmap forms -----~%")
+           (dolist (m (getf gen :maps)) (format t "~S~%" m))
+           (format t "~&;; ----- defprog forms -----~%")
+           (dolist (p (getf gen :progs)) (format t "~S~%" p))
+           (format t "~&;; ----- user-side probes (BEGIN/END/interval) -----~%")
+           (format t "~S~%" (getf gen :user-probes))))
+        (t
+         (unwind-protect
+              (funcall (find-symbol "RUN" '#:whistler/bpftrace) source)
+           (when child-process
+             (handler-case (sb-ext:process-wait child-process)
+               (error () nil)))))))))
+
+(defun read-bpftrace-source (args e-pos p-pos c-pos)
+  "Resolve the script source: -e takes precedence; otherwise the first
+   non-flag positional argument is a path. The args consumed by -p/-c/-e
+   are skipped while looking for the positional script path."
+  (let ((skip-indices (list e-pos p-pos c-pos
+                            (when e-pos (1+ e-pos))
+                            (when p-pos (1+ p-pos))
+                            (when c-pos (1+ c-pos)))))
+    (cond
+      (e-pos
+       (or (nth (1+ e-pos) args)
+           (progn (format *error-output* "Error: -e requires an argument~%")
+                  (uiop:quit 1))))
       (t
-       (let* ((dump-p (or (member "--dump" args :test #'string=)
-                          (member "-d"     args :test #'string=)))
-              (e-pos  (position "-e" args :test #'string=))
-              (source
-                (cond
-                  (e-pos
-                   (or (nth (1+ e-pos) args)
-                       (progn (format *error-output*
-                                      "Error: -e requires an argument~%")
-                              (uiop:quit 1))))
-                  (t
-                   (let ((path (find-if (lambda (a)
-                                          (and (not (and (>= (length a) 1)
-                                                         (char= (char a 0) #\-)))
-                                               (not (and e-pos
-                                                         (string= a (nth (1+ e-pos) args))))))
-                                        args)))
-                     (unless path
-                       (format *error-output*
-                               "Error: no script (pass a path or -e PROGRAM)~%")
-                       (uiop:quit 1))
-                     (with-open-file (s path :direction :input)
-                       (let* ((buf (make-string (file-length s)))
-                              (n   (read-sequence buf s)))
-                         (subseq buf 0 n))))))))
-         (require-bpftrace)
-         (cond
-           (dump-p
-            (let ((gen (funcall (find-symbol "COMPILE-SCRIPT" '#:whistler/bpftrace)
-                                source))
-                  (*print-pretty* t)
-                  (*print-right-margin* 90))
-              (format t "~&;; ----- defmap forms -----~%")
-              (dolist (m (getf gen :maps)) (format t "~S~%" m))
-              (format t "~&;; ----- defprog forms -----~%")
-              (dolist (p (getf gen :progs)) (format t "~S~%" p))
-              (format t "~&;; ----- user-side probes (BEGIN/END/interval) -----~%")
-              (format t "~S~%" (getf gen :user-probes))))
-           (t
-            (funcall (find-symbol "RUN" '#:whistler/bpftrace) source))))))))
+       (let ((path (loop for a in args for i from 0
+                         unless (or (member i skip-indices)
+                                    (and (>= (length a) 1)
+                                         (char= (char a 0) #\-)))
+                           return a)))
+         (unless path
+           (format *error-output* "Error: no script (pass a path or -e PROGRAM)~%")
+           (uiop:quit 1))
+         (with-open-file (s path :direction :input)
+           (let* ((buf (make-string (file-length s)))
+                  (n   (read-sequence buf s)))
+             (subseq buf 0 n))))))))
+
+(defun spawn-traced-process (cmd)
+  "Spawn CMD via /bin/sh -c and return the sb-ext:process. The probes
+   attach against this child's pid; we wait for the child to exit
+   before unwinding the bpftrace runtime."
+  (sb-ext:run-program "/bin/sh" (list "-c" cmd)
+                      :wait nil
+                      :output t :error t :input nil))
+

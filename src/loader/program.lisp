@@ -53,7 +53,14 @@
          (and (>= (length section-name) 10)
               (string= (subseq section-name 0 10) "kretprobe/"))
          (and (>= (length section-name) 10)
-              (string= (subseq section-name 0 10) "uretprobe/")))
+              (string= (subseq section-name 0 10) "uretprobe/"))
+         ;; libbpf-style multi-kprobe sections — single program,
+         ;; many attach points. Same prog type as kprobe; the
+         ;; expected_attach_type distinguishes.
+         (and (>= (length section-name) 13)
+              (string= (subseq section-name 0 13) "kprobe.multi/"))
+         (and (>= (length section-name) 16)
+              (string= (subseq section-name 0 16) "kretprobe.multi/")))
      +bpf-prog-type-kprobe+)
     ;; interval / profile — PERF_EVENT prog type so the kernel will
     ;; SET_BPF on a PERF_TYPE_SOFTWARE / CPU_CLOCK event. Loaded with
@@ -139,6 +146,11 @@
     ((and (>= (length section-name) 6)
           (string= (subseq section-name 0 6) "fexit/"))
      +bpf-trace-fexit+)
+    ((or (and (>= (length section-name) 13)
+              (string= (subseq section-name 0 13) "kprobe.multi/"))
+         (and (>= (length section-name) 16)
+              (string= (subseq section-name 0 16) "kretprobe.multi/")))
+     +bpf-trace-kprobe-multi+)
     (t nil)))
 
 ;;; ========== Program loading ==========
@@ -168,6 +180,9 @@
             (put-u32 buf 68 expected-attach-type))
           (when attach-btf-id
             (put-u32 buf 108 attach-btf-id))
+          (when (and expected-attach-type (>= log-level 0))
+            (format *trace-output* ";; load-program prog-type=~D EAT=~D btf-id=~A~%"
+                    prog-type expected-attach-type attach-btf-id))
           ;; Try without log first
           (handler-case
               (%bpf +bpf-prog-load+ buf 256 "prog-load")

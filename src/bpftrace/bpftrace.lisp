@@ -18,11 +18,36 @@
 
 (in-package #:whistler/bpftrace)
 
+(defvar *pid-filter* nil
+  "When non-NIL (an integer pid), every probe's predicate is AND'd
+   with `pid == PID-FILTER' before codegen. Wired through the CLI's
+   -p / -c options.")
+
+(defun add-pid-filter (ast pid)
+  "Return AST with each probe's :predicate ANDed against (pid == PID).
+   Functions and other top-level forms pass through unchanged."
+  (cons :script
+        (loop for top in (rest ast)
+              collect (cond
+                        ((and (consp top) (eq (first top) :probe))
+                         (let ((existing (getf (cdr top) :predicate))
+                               (cmp `(:bin :op :== :lhs (:builtin :pid)
+                                           :rhs (:int ,pid))))
+                           (list :probe
+                                 :specs    (getf (cdr top) :specs)
+                                 :predicate (if existing
+                                                `(:bin :op :&& :lhs ,existing :rhs ,cmp)
+                                                cmp)
+                                 :body     (getf (cdr top) :body))))
+                        (t top)))))
+
 (defun compile-script (source)
   "Parse SOURCE (a bpftrace script string) and return a plist
-   :maps :progs :user-probes :info — see codegen.lisp for the shape."
+   :maps :progs :user-probes :info — see codegen.lisp for the shape.
+   When *pid-filter* is set, each probe gains an AND'd pid predicate."
   (let* ((tree (parse-script source))
-         (ast  (normalize tree)))
+         (ast  (normalize tree))
+         (ast  (if *pid-filter* (add-pid-filter ast *pid-filter*) ast)))
     (generate ast)))
 
 (defun read-file-to-string (path)

@@ -363,3 +363,26 @@
     (is (search "DOTIMES" text))
     (is (search "64" text)
         "bounded by +bt-max-loop-iters+ (64)")))
+
+(test pid-filter-wraps-probes
+  "add-pid-filter ANDs `pid == PID' into each probe's predicate."
+  (let* ((src "kprobe:vfs_read { @ = count(); }")
+         (ast (whistler/bpftrace::normalize
+               (whistler/bpftrace::parse-script src)))
+         (filtered (whistler/bpftrace::add-pid-filter ast 4242))
+         (probe (second filtered)))
+    (let ((pred (getf (cdr probe) :predicate)))
+      (is (not (null pred)))
+      (is (eq :bin (first pred)))
+      (is (eq :== (getf (cdr pred) :op))))))
+
+(test pid-filter-ands-existing-predicate
+  "Existing /predicate/ is ANDed with the pid check, not overwritten."
+  (let* ((src "kprobe:vfs_read /retval == 0/ { @ = count(); }")
+         (ast (whistler/bpftrace::normalize
+               (whistler/bpftrace::parse-script src)))
+         (filtered (whistler/bpftrace::add-pid-filter ast 7))
+         (probe (second filtered))
+         (pred  (getf (cdr probe) :predicate)))
+    (is (eq :&& (getf (cdr pred) :op))
+        "top-level operator is AND")))

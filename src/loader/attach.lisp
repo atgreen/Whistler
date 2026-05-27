@@ -396,6 +396,66 @@
                                   (handler-case (sb-posix:close link-fd)
                                     (error () nil)))))))
 
+(defun attach-kprobe-multi (prog-fd names &key retprobe)
+  "Attach PROG-FD to every kernel function in NAMES via a single
+   BPF_LINK_CREATE syscall using BPF_TRACE_KPROBE_MULTI. The kernel
+   handles the fan-out internally — orders of magnitude faster than
+   one perf_event_open per name. Requires Linux ≥ 5.18.
+
+   Returns an attachment that closes the link FD on detach."
+  (when (null names)
+    (error "attach-kprobe-multi: empty name list"))
+  (let* ((n (length names))
+         ;; Pack every name (with trailing NUL) into one contiguous
+         ;; byte vector. The pointer array's i-th slot then points
+         ;; at base + offset[i]. Two pinning roots instead of N+1.
+         (offsets (let ((acc '()) (cur 0))
+                    (dolist (s names)
+                      (push cur acc)
+                      (incf cur (1+ (length (sb-ext:string-to-octets
+                                             s :external-format :utf-8)))))
+                    (nreverse acc)))
+         (joined-size (let ((total 0))
+                        (dolist (s names) (incf total
+                                                (1+ (length (sb-ext:string-to-octets
+                                                             s :external-format :utf-8)))))
+                        total))
+         (joined  (make-array joined-size :element-type '(unsigned-byte 8)
+                                          :initial-element 0))
+         (ptr-arr (make-array (* n 8) :element-type '(unsigned-byte 8)
+                                       :initial-element 0))
+         (attr    (make-attr-buf 168)))
+    ;; Fill `joined' with the concatenated NUL-terminated names.
+    (let ((cur 0))
+      (dolist (s names)
+        (let ((bytes (sb-ext:string-to-octets s :external-format :utf-8)))
+          (replace joined bytes :start1 cur)
+          (incf cur (1+ (length bytes))))))
+    (sb-sys:with-pinned-objects (attr ptr-arr joined)
+      (let ((base (sb-sys:sap-int (sb-sys:vector-sap joined))))
+        (loop for off in offsets for i from 0 do
+          (put-u64 ptr-arr (* i 8) (+ base off))))
+      (put-u32 attr 0  prog-fd)
+      (put-u32 attr 4  0)
+      (put-u32 attr 8  +bpf-trace-kprobe-multi+)
+      (put-u32 attr 16 (if retprobe +bpf-f-kprobe-multi-return+ 0))
+      (put-u32 attr 20 n)
+      (put-ptr attr 24 (sb-sys:vector-sap ptr-arr))
+      ;; libbpf uses offsetofend(link_create.kprobe_multi.cookies)=48.
+      ;; The kernel's CHECK_ATTR validates the tail (past attr_size in
+      ;; the user buffer) is zero; we zero-fill, so a larger size also
+      ;; works in principle — but matching libbpf is the safe bet for
+      ;; older kernels.
+      (let ((link-fd (%bpf +bpf-link-create+ attr 48
+                           (if retprobe
+                               "kretprobe.multi-link-create"
+                               "kprobe.multi-link-create"))))
+        (make-attachment :type (if retprobe :kretprobe-multi :kprobe-multi)
+                         :perf-fds nil :prog-fd prog-fd
+                         :cleanup (lambda ()
+                                    (handler-case (sb-posix:close link-fd)
+                                      (error () nil))))))))
+
 (defun attach-fentry (prog-fd &optional retprobe-p)
   "Attach a BPF fentry (or fexit when RETPROBE-P) program via
    BPF_LINK_CREATE. attach_btf_id is already baked into the program

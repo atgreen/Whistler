@@ -1280,8 +1280,18 @@
 
 (defun spec->section (spec)
   (ecase (first spec)
-    (:kprobe     (values :kprobe       (format nil "kprobe/~A" (second spec))))
-    (:kretprobe  (values :kretprobe    (format nil "kretprobe/~A" (second spec))))
+    (:kprobe     (let ((target (second spec)))
+                   (cond ((find #\* target)
+                          (values :kprobe
+                                  (format nil "kprobe.multi/~A" target)))
+                         (t (values :kprobe
+                                    (format nil "kprobe/~A" target))))))
+    (:kretprobe  (let ((target (second spec)))
+                   (cond ((find #\* target)
+                          (values :kretprobe
+                                  (format nil "kretprobe.multi/~A" target)))
+                         (t (values :kretprobe
+                                    (format nil "kretprobe/~A" target))))))
     ;; kfunc / kretfunc → BPF_PROG_TYPE_TRACING with fentry / fexit
     ;; expected-attach-type. The section name carries the target
     ;; function so the loader can resolve its BTF func ID at load

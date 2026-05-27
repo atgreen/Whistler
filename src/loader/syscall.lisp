@@ -67,6 +67,11 @@
 ;; Expected-attach-type values for BPF_PROG_TYPE_TRACING.
 (defconstant +bpf-trace-fentry+ 24)
 (defconstant +bpf-trace-fexit+  25)
+
+;; Multi-kprobe: a single program attached to N functions in one
+;; BPF_LINK_CREATE call. Kernel ≥ 5.18.
+(defconstant +bpf-trace-kprobe-multi+ 47)
+(defconstant +bpf-f-kprobe-multi-return+ 1)
 (defconstant +bpf-prog-type-lsm+ 29)
 (defconstant +bpf-prog-type-syscall+ 31)
 (defconstant +bpf-prog-type-raw-tracepoint+ 17)
