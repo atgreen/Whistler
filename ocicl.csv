@@ -1,0 +1,12 @@
+iparse, ghcr.io/ocicl/iparse@sha256:6c71dc826f98672ee86df5bab7420e9a9934e755cb2c5d60ec78b21ae6d5137e, cl-iparse-20260213-74a8c35/iparse.asd
+fiveam, ghcr.io/ocicl/fiveam@sha256:e283043dc8d31e8df2b214465cf5a06ea07bdbea10e600a40e17aaf9518226ac, fiveam-20240928-e43d6c8/fiveam.asd
+cl-ppcre, ghcr.io/ocicl/cl-ppcre@sha256:bf073924cf4fd5957a4fd961a95d446ed0e53fa32a5002cbd2d52182874f45e5, cl-ppcre-20250606-a2ea581/cl-ppcre.asd
+closer-mop, ghcr.io/ocicl/closer-mop@sha256:0cee307fbc9538461f4ecfa329c545ad220ba43cf13faf8993e156a0bb27b699, closer-mop-20260203-211c5ec/closer-mop.asd
+fset, ghcr.io/ocicl/fset@sha256:06ed3b2b8e490fa5ddf01b23af08a5d0d5febf6633b982eab0f721f4cc3c8c15, fset-20251122-19eadf0/fset.asd
+mgl-pax, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:c30c3001293e65f6173828ed5c48d8ae9b13aadc27e3654f38e3a933caadf8cb, mgl-pax-20260305-cfd1936/mgl-pax.asd
+autoload, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:c30c3001293e65f6173828ed5c48d8ae9b13aadc27e3654f38e3a933caadf8cb, mgl-pax-20260305-cfd1936/autoload/autoload.asd
+misc-extensions, ghcr.io/ocicl/misc-extensions@sha256:bffd02c8ba19a28ecc3b9a89a3e2639d51a6f856850b7c2cdfecb779738f53af, misc-extensions-20251202-9d0fd15/misc-extensions.asd
+mt19937, ghcr.io/ocicl/mt19937@sha256:49c0a25a535cd22212343c67e17635b8e05675ad9cc20aa75ce75e35e842bbe3, MT19937-20240503-78f0419/mt19937.asd
+named-readtables, ghcr.io/ocicl/named-readtables@sha256:fd0edf41b45d4e690d6713c39d99d68be05419b38989a6cccb97a101f1e488ac, named-readtables-20260304-08c605e/named-readtables.asd
+net.didierverna.asdf-flv, ghcr.io/ocicl/net.didierverna.asdf-flv@sha256:e5cd087d41cf24302a92d9bac426a925f8868b554be2414c0f012c961e3ddb8c, asdf-flv-20240503-3f1de41/net.didierverna.asdf-flv.asd
+trivial-backtrace, ghcr.io/ocicl/trivial-backtrace@sha256:89a3138695bb767c50001402fad60dacfc1e867e4e3d3579cc6f636d3e29a51c, trivial-backtrace-20240503-7f90b4a/trivial-backtrace.asd

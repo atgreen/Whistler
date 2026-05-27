@@ -6,6 +6,15 @@
 
 (in-suite symbolize-suite)
 
+;;; Distros locate libc.so.6 differently — Fedora puts it at
+;;; /usr/lib64/, Debian/Ubuntu uses /lib/x86_64-linux-gnu/. Probe.
+(defun libc-path ()
+  (find-if #'probe-file
+           '("/usr/lib64/libc.so.6"
+             "/lib/x86_64-linux-gnu/libc.so.6"
+             "/usr/lib/x86_64-linux-gnu/libc.so.6"
+             "/usr/lib/aarch64-linux-gnu/libc.so.6")))
+
 ;;; ========== /proc/<pid>/maps parsing ==========
 
 (test maps-parses-executable-only
@@ -36,28 +45,38 @@
 ;;; ========== ELF parsing ==========
 
 (test elf-parses-libc
-  "Parse /usr/lib64/libc.so.6 and find a few well-known exports."
-  (let ((elf (whistler/symbolize::parse-elf "/usr/lib64/libc.so.6")))
-    (is (not (null elf)) "libc parses")
-    (is (whistler/symbolize::elf-info-pie-p elf) "libc is ET_DYN")
-    (let* ((syms (whistler/symbolize::elf-info-symbols elf))
-           (names (loop for v across syms collect (aref v 2))))
-      (is (member "malloc" names :test #'string=) "malloc is present"))))
+  "Parse the host libc and find a few well-known exports."
+  (let ((path (libc-path)))
+    (cond
+      ((null path) (pass "no libc found on this host"))
+      (t (let ((elf (whistler/symbolize::parse-elf path)))
+           (is (not (null elf)) "libc parses")
+           (is (whistler/symbolize::elf-info-pie-p elf) "libc is ET_DYN")
+           (let* ((syms (whistler/symbolize::elf-info-symbols elf))
+                  (names (loop for v across syms collect (aref v 2))))
+             (is (member "malloc" names :test #'string=) "malloc is present")))))))
 
 (test elf-build-id-and-debuglink-read
   "Build-ID and debuglink section content are extracted cleanly."
-  (let* ((buf (whistler/symbolize::read-file-bytes "/usr/lib64/libc.so.6")))
-    (when buf
-      (multiple-value-bind (secs shstrtab)
-          (whistler/symbolize::read-section-headers buf)
-        (let ((bid (whistler/symbolize::read-build-id buf secs shstrtab))
-              (dl  (whistler/symbolize::read-debuglink buf secs shstrtab)))
-          (is (and bid (every (lambda (c) (or (digit-char-p c)
-                                              (and (char>= c #\a) (char<= c #\f))))
-                              bid))
-              "build-id is a hex string")
-          (is (and dl (search ".debug" dl))
-              "debuglink ends in .debug"))))))
+  (let ((path (libc-path)))
+    (cond
+      ((null path) (pass "no libc found on this host"))
+      (t (let* ((buf (whistler/symbolize::read-file-bytes path)))
+           (when buf
+             (multiple-value-bind (secs shstrtab)
+                 (whistler/symbolize::read-section-headers buf)
+               (let ((bid (whistler/symbolize::read-build-id buf secs shstrtab))
+                     (dl  (whistler/symbolize::read-debuglink buf secs shstrtab)))
+                 ;; build-id is optional (Ubuntu ships it; some stripped
+                 ;; builds don't). When present it must be hex.
+                 (is (or (null bid)
+                         (every (lambda (c) (or (digit-char-p c)
+                                                (and (char>= c #\a) (char<= c #\f))))
+                                bid))
+                     "build-id, when present, is a hex string")
+                 ;; debuglink is also optional.
+                 (is (or (null dl) (search ".debug" dl))
+                     "debuglink, when present, ends in .debug")))))))))
 
 ;;; ========== End-to-end lookup ==========
 
@@ -84,8 +103,9 @@
 (test dwarf-line-info-loaded-from-libc
   "When glibc-debuginfo is installed, libc's ELF-INFO carries a
    DWARF-LINE-INFO with thousands of rows resolvable to malloc.c."
-  (let ((elf (whistler/symbolize::parse-elf "/usr/lib64/libc.so.6")))
-    (let ((li (whistler/symbolize::elf-info-line-info elf)))
+  (let* ((path (libc-path))
+         (elf  (and path (whistler/symbolize::parse-elf path))))
+    (let ((li (and elf (whistler/symbolize::elf-info-line-info elf))))
       (cond
         ((null li)
          ;; No glibc debuginfo on this host; nothing to assert.

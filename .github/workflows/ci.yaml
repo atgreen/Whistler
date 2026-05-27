@@ -10,6 +10,8 @@ permissions:
   contents: read
 
 jobs:
+  # Fast lane: parse, codegen, type-check, and verifier-free unit tests.
+  # Runs on every push.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -21,23 +23,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sbcl
 
-      - name: Install Quicklisp and FiveAM
+      - name: Install ocicl
         run: |
-          curl -sL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp
-          sbcl --noinform --non-interactive \
-            --load /tmp/quicklisp.lisp \
-            --eval '(quicklisp-quickstart:install)' \
-            --eval '(ql:quickload "fiveam")'
-          echo '(load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))' > ~/.sbclrc
+          OCICL_VERSION=$(curl -s https://api.github.com/repos/ocicl/ocicl/releases/latest \
+                          | grep '"tag_name"' \
+                          | sed -E 's/.*"v([^"]+)".*/\1/')
+          curl -sLO "https://github.com/ocicl/ocicl/releases/latest/download/ocicl_${OCICL_VERSION}-1_amd64.deb"
+          sudo dpkg -i "ocicl_${OCICL_VERSION}-1_amd64.deb"
+          ocicl setup > ~/.sbclrc
+          ocicl version
 
-      - name: Run tests
+      - name: Fetch Lisp dependencies
+        run: ocicl install
+
+      - name: Run tests (compile + codegen, no kernel)
         run: make test
 
       - name: Compile all examples
         run: |
           for f in examples/*.lisp; do
             name=$(basename "$f" .lisp)
-            # skip examples that require the loader system or kernel access
+            # Skip examples that drive the loader / need kernel access
             case "$name" in
               ffi-call-tracker|fork-tracker|cgroup-skb-count|cgroup-skb-session) continue ;;
             esac
@@ -55,3 +61,49 @@ jobs:
         run: |
           ./whistler --version
           ./whistler compile examples/count-xdp.lisp -o /tmp/count-xdp.bpf.o
+
+  # Kernel-verify lane: load every torture program into the live
+  # verifier. GitHub-hosted runners are KVM-backed VMs (not containers),
+  # so `sudo` + a recent kernel with /sys/kernel/btf/vmlinux is enough.
+  kernel-verify:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install SBCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sbcl
+
+      - name: Install ocicl
+        run: |
+          OCICL_VERSION=$(curl -s https://api.github.com/repos/ocicl/ocicl/releases/latest \
+                          | grep '"tag_name"' \
+                          | sed -E 's/.*"v([^"]+)".*/\1/')
+          curl -sLO "https://github.com/ocicl/ocicl/releases/latest/download/ocicl_${OCICL_VERSION}-1_amd64.deb"
+          sudo dpkg -i "ocicl_${OCICL_VERSION}-1_amd64.deb"
+          ocicl setup > ~/.sbclrc
+          # The kernel-verify lane runs SBCL via `sudo`, which doesn't
+          # pick up the user's ocicl setup. Mirror everything for root.
+          sudo cp ~/.sbclrc /root/.sbclrc
+
+      - name: Fetch Lisp dependencies
+        run: ocicl install
+
+      - name: Show kernel + BTF state
+        # Surface what kernel verification actually sees. If
+        # /sys/kernel/btf/vmlinux is missing, kfunc/lsm tests degrade
+        # silently rather than failing — show it loudly here.
+        run: |
+          uname -a
+          ls -la /sys/kernel/btf/vmlinux || true
+          cat /proc/sys/kernel/unprivileged_bpf_disabled || true
+
+      - name: Run torture suite under live verifier
+        # make test-torture invokes sbcl via sudo. The test macro gates
+        # kernel-verify on (has-cap-bpf-p), so without sudo the suite
+        # would still pass via compile-only; here we want it to actually
+        # round-trip every program through BPF_PROG_LOAD.
+        run: make test-torture
