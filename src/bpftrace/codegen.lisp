@@ -469,17 +469,21 @@
 (defconstant +bt-str-default-len+ 64
   "Default buffer size used by str(ptr) — matches bpftrace's default.")
 
-(defun str-call-p (expr)
-  "T when EXPR is a (:call :name \"str\" :args …) form."
+(defun named-call-p (expr name)
+  "T when EXPR is a (:call :name NAME :args …) form."
   (and (consp expr)
        (eq (first expr) :call)
        (let ((n (getf (cdr expr) :name)))
-         (and (stringp n) (string= n "str")))))
+         (and (stringp n) (string= n name)))))
+
+(defun str-call-p (expr) (named-call-p expr "str"))
 
 (defun printf-arg-type (expr)
-  "Classify a printf arg as :int (8 bytes, u64 in record), or
-   (:string . SIZE) for inline string slots. Recognises `comm' (16
-   bytes) and `str(ptr [, n])' (n bytes, default +bt-str-default-len+)."
+  "Classify a printf arg into one of:
+     :int                  8 bytes, u64 in record
+     (:string . SIZE)      SIZE bytes, NUL-terminated string slot
+     :ksym                 8 bytes, kernel address (kallsyms-resolved)
+     :usym                 16 bytes, pid_tgid + user address (symbolizer)"
   (cond
     ((eq (first expr) :comm)
      (cons :string +bt-comm-len+))
@@ -488,11 +492,15 @@
             (n    (when (and (cdr args) (eq (first (second args)) :int))
                     (second (second args)))))
        (cons :string (or n +bt-str-default-len+))))
+    ((named-call-p expr "ksym") :ksym)
+    ((named-call-p expr "usym") :usym)
     (t :int)))
 
 (defun printf-arg-size (arg-type)
   (cond
-    ((eq arg-type :int) 8)
+    ((eq arg-type :int)  8)
+    ((eq arg-type :ksym) 8)
+    ((eq arg-type :usym) 16)
     ((and (consp arg-type) (eq (car arg-type) :string)) (cdr arg-type))
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
 
@@ -535,18 +543,28 @@
                  collect (lower-printf-arg arg ty rec off))))))
 
 (defun lower-printf-arg (arg ty rec off)
-  "Emit the kernel-side store that fills RECORD slot at OFFSET with ARG.
-   TY is :int or (:string . SIZE)."
+  "Emit the kernel-side store that fills RECORD slot at OFFSET with ARG."
   (cond
     ((eq ty :int)
      `(whistler::store ,(intern "U64" :whistler) ,rec ,off ,(lower-expr arg)))
+    ((eq ty :ksym)
+     ;; Just stash the raw u64 address. Userspace will run it through
+     ;; /proc/kallsyms at decode time.
+     (let ((addr (lower-expr (first (getf (cdr arg) :args)))))
+       `(whistler::store ,(intern "U64" :whistler) ,rec ,off ,addr)))
+    ((eq ty :usym)
+     ;; 16-byte slot: pid_tgid then address. Capturing pid in-kernel
+     ;; ties the symbol lookup to the right process's address space.
+     (let ((addr (lower-expr (first (getf (cdr arg) :args)))))
+       `(progn
+          (whistler::store ,(intern "U64" :whistler) ,rec ,off
+                           (whistler::get-current-pid-tgid))
+          (whistler::store ,(intern "U64" :whistler) ,rec (+ ,off 8) ,addr))))
     ((and (consp ty) (eq (car ty) :string))
      (let ((size (cdr ty)))
        (cond
-         ;; `comm' — bpf_get_current_comm fills the slot directly.
          ((eq (first arg) :comm)
           `(whistler::get-current-comm (+ ,rec ,off) ,size))
-         ;; `str(ptr)' / `str(ptr, n)' — pick the helper by probe type.
          ((str-call-p arg)
           (let* ((args (getf (cdr arg) :args))
                  (ptr  (lower-expr (first args)))

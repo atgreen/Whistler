@@ -667,6 +667,17 @@
                                       ((eq ty :int)
                                        (prog1 (sap-read-u64-le sap off)
                                          (incf off 8)))
+                                      ((eq ty :ksym)
+                                       (let ((addr (sap-read-u64-le sap off)))
+                                         (incf off 8)
+                                         (or (resolve-symbol addr)
+                                             (format nil "0x~X" addr))))
+                                      ((eq ty :usym)
+                                       (let* ((pid-tgid (sap-read-u64-le sap off))
+                                              (addr     (sap-read-u64-le sap (+ off 8)))
+                                              (pid      (ash pid-tgid -32)))
+                                         (incf off 16)
+                                         (resolve-usym pid addr)))
                                       ((and (consp ty) (eq (car ty) :string))
                                        (let ((size (cdr ty)))
                                          (prog1 (sap-read-string-fixed
@@ -674,6 +685,22 @@
                                            (incf off size))))
                                       (t (error "unknown printf arg type ~A" ty)))))))
         (write-string (format-printf fmt args))))))
+
+(defun resolve-usym (pid addr)
+  "Resolve a (pid, user-address) into a `name+0xOFF [lib]' string using
+   the session symbolizer. Falls back to bare hex on failure."
+  (cond
+    ((or (null *session-symbolizer*) (zerop pid))
+     (format nil "0x~X" addr))
+    (t
+     (let* ((s (whistler/symbolize:symbolize *session-symbolizer* pid addr))
+            (name (whistler/symbolize:sym-name s))
+            (file (whistler/symbolize:sym-file s))
+            (lib  (and file (file-namestring file))))
+       (cond
+         (name (format nil "~A+0x~X~@[ [~A]~]"
+                       name (whistler/symbolize:sym-offset s) lib))
+         (t    (format nil "0x~X~@[ [~A]~]" addr lib)))))))
 
 ;;; print/clear are async actions whose body runs userspace-side.
 ;;; The kernel side just emits a tagged ringbuf record; the runtime

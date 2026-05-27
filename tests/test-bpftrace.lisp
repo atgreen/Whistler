@@ -125,3 +125,17 @@
     (is (= 1 (length printf-table)) "one printf entry")
     (is (equal '((:string . 64)) (third entry))
         "single :string slot of size 64")))
+
+(test codegen-printf-ksym
+  "printf(\"%s\", ksym(addr)) emits an 8-byte slot tagged :ksym."
+  (let* ((src "kprobe:vfs_read { printf(\"%s\\n\", ksym(arg0)); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (entry (first (getf gen :printf-table))))
+    (is (equal '(:ksym) (third entry)))))
+
+(test codegen-printf-usym
+  "printf(\"%s\", usym(addr)) emits a 16-byte slot tagged :usym."
+  (let* ((src "uprobe:/usr/lib64/libc.so.6:malloc { printf(\"%s\\n\", usym(arg0)); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (entry (first (getf gen :printf-table))))
+    (is (equal '(:usym) (third entry)))))
