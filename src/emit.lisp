@@ -924,9 +924,12 @@
   "Store a key value on the stack and return the stack offset.
    KEY-ARG may be a vreg (integer) or (:imm N) from constant propagation.
    TARGET-SIZE, if given, is the map's declared key-size — when it
-   exceeds the natural width of the key value, we allocate the full
-   slot, zero-fill the upper bytes, and store the value at offset 0
-   so the verifier sees an initialised key.
+   exceeds the natural width of the key value, we widen the store to
+   TARGET-SIZE so the verifier sees an initialised key. BPF register
+   loads / ALU ops on 32-bit subregisters zero-extend to 64 bits per
+   spec, so the upper bytes of a u32 vreg are guaranteed zero and a
+   plain u64 store gets the right key value at no extra instruction
+   cost (matches what bpftrace emits).
 
    Reuses existing stack slot if the same key was previously stored.
    Uses st-mem for constant keys (saves 1 insn vs mov+stx-mem)."
@@ -938,20 +941,16 @@
          (cached (gethash cache-key (emit-ctx-key-cache ctx))))
     (if cached
         cached
-        (let* ((bpf-size (if imm-val whistler/bpf:+bpf-w+
-                             (ir-type-to-bpf-size (or vreg-type 'u64))))
+        (let* ((store-size (max val-size slot-size))
+               (bpf-size (cond
+                           (imm-val whistler/bpf:+bpf-w+)
+                           ((> store-size val-size)
+                            (ir-type-to-bpf-size
+                             (case store-size (1 'u8) (2 'u16) (4 'u32) (t 'u64))))
+                           (t (ir-type-to-bpf-size (or vreg-type 'u64)))))
                (const-val (or imm-val
                               (gethash key-arg (emit-ctx-const-values ctx))))
                (offset (ectx-alloc-stack ctx slot-size "map key temporaries")))
-          ;; If the slot is wider than the value, the lower bytes get
-          ;; the value and the upper bytes need explicit zeros so the
-          ;; verifier doesn't see uninitialised stack on map_*_elem.
-          (when (> slot-size val-size)
-            (loop for i from val-size below slot-size
-                  do (ectx-emit ctx (whistler/bpf:emit-st-mem
-                                     whistler/bpf:+bpf-b+
-                                     whistler/bpf:+bpf-reg-10+
-                                     (+ offset i) 0))))
           (if (and const-val (typep const-val '(signed-byte 32)))
               (ectx-emit ctx (whistler/bpf:emit-st-mem
                               bpf-size
