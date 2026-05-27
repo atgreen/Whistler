@@ -1,61 +1,60 @@
 # CLI Reference
 
-`whistler bpftrace [OPTIONS] [SCRIPT-PATH]`
+```
+whistler bpftrace [OPTIONS] [SCRIPT-PATH]
+```
 
 ## Source selection
 
 | Flag | Behaviour |
 |---|---|
-| `-e PROGRAM` | Inline script. Mutually exclusive with a script path. |
+| `-e PROGRAM` | Inline script. Can't be combined with a script path. |
 | `SCRIPT-PATH` | Read script from a file. |
-| `--dump` | Compile only; print the generated Whistler forms (maps, progs, user-side probes) and exit. No kernel touch. |
+| `--dump` | Compile only — print the generated Whistler forms and exit. The kernel isn't touched. |
 
 ## Filtering and spawning
 
 | Flag | Behaviour |
 |---|---|
-| `-p PID` | Inject a `pid == PID` predicate AND'd into every probe. Equivalent to bpftrace's `PidFilterPass`. |
-| `-c 'CMD'` | Spawn `CMD` ptrace-stopped, attach probes, resume the child. Trace ends when the child exits. The child pid is auto-injected as a filter (since the child IS the target binary). |
+| `-p PID` | AND a `pid == PID` predicate into every probe. |
+| `-c 'CMD'` | Spawn `CMD` ptrace-stopped, attach probes, resume. The trace ends when the child exits, and the child's pid is auto-injected as a filter. |
 
-### `-p` mechanics
+### How `-p` works
 
-The `-p` filter is implemented at the AST level — a post-normalize pass
-walks each probe and AND's its `:predicate` slot with
-`(pid == PID)`. The resulting BPF program checks the pid in-kernel
-before running the rest of the body. Identical to what bpftrace does
-for kprobe/kretprobe/fentry/fexit/tracepoint.
+A post-normalize AST pass walks each probe and AND's its `:predicate`
+slot with `(pid == PID)`. The pid check runs in-kernel before the
+rest of the body. This matches bpftrace's `PidFilterPass`.
 
-### `-c` mechanics
+### How `-c` works
 
-The child is forked with `PTRACE_TRACEME`, stops at exec entry via
-`raise(SIGSTOP)`, and only resumes after the parent has attached all
-probes and called `PTRACE_DETACH`. This matches bpftrace's
-synchronisation: every syscall the spawned binary makes happens after
-probes are live.
+The child is forked with `PTRACE_TRACEME` and stops at exec entry via
+`raise(SIGSTOP)`. The parent attaches every probe, then issues
+`PTRACE_DETACH`. The first instruction the spawned binary executes
+happens after probes are live — same synchronisation bpftrace uses.
 
-Unlike bpftrace's `-c` (which spawns through `/bin/sh -c`), whistler
-splits the command on whitespace and `execve`s the binary directly,
-so:
+Whistler splits the command on whitespace and `execve`s the first
+token directly, with no shell in between. That has two practical
+consequences:
 
-- The child pid IS the user's target (e.g. `find`), not a wrapping
-  `sh`. The auto-pid-filter actually catches the right process.
-- Shell metacharacters (`|`, `>`, `2>/dev/null`, quotes) pass through
-  as literal argv tokens — same behaviour as bpftrace.
+- The child pid is the user's target (e.g. `find`), not a wrapping
+  `sh`. The auto-pid-filter catches the right process.
+- Shell metacharacters like `|`, `>`, or `2>/dev/null` pass through as
+  literal argv tokens — bpftrace behaves the same way.
 
-If you need a real shell, write `-c 'sh -c "complex | pipeline"'`
-explicitly.
+If you need shell interpretation, write it out: `-c 'sh -c "complex |
+pipeline"'`.
 
 ## Listing probes
 
 | Flag | Behaviour |
 |---|---|
-| `-l [PATTERN]` | List kernel functions matching the glob PATTERN. Reads `/sys/kernel/tracing/available_filter_functions` when readable (sudo); falls back to `/proc/kallsyms`. No script needed. |
+| `-l [PATTERN]` | List kernel functions matching the glob `PATTERN`. Reads `/sys/kernel/tracing/available_filter_functions` when readable; falls back to `/proc/kallsyms`. No script needed. |
 
 ```sh
 whistler bpftrace -l 'kprobe:tcp_send*'
 ```
 
-Output is one `kprobe:NAME` per line followed by a count:
+One match per line, followed by a count:
 
 ```
 kprobe:tcp_send_mss
@@ -65,30 +64,31 @@ kprobe:tcp_sendmsg_locked
 ;; 27 probes
 ```
 
-Compiler-generated specialisations (`tcp_call_bpf.cold`,
-`x.constprop.0.isra.0`) are silently dropped — they show up in
-kallsyms but the kprobe machinery refuses them.
+Compiler-generated specialisations like `tcp_call_bpf.cold` and
+`x.constprop.0.isra.0` show up in `/proc/kallsyms` but the kprobe
+machinery refuses them, so the listing drops anything containing a
+`.`.
 
 ## Diagnostic flags
 
 | Flag | Behaviour |
 |---|---|
-| `-V`, `--version` | Print version string. |
+| `-V`, `--version` | Print the version string. |
 | `-h`, `--help` | Print usage. |
-| `--dump` | Stop after codegen and print the generated `defmap` / `defprog` forms. |
+| `--dump` | Stop after codegen and print the generated `defmap` and `defprog` forms. |
 
 ## Examples
 
 ```sh
-# Trace every openat call, group by command name
+# Count openat calls by comm
 sudo whistler bpftrace \
   -e 'tracepoint:syscalls:sys_enter_openat { @[comm] = count(); }'
 
-# Only the events from PID 1234
+# Only PID 1234
 sudo whistler bpftrace -p 1234 \
   -e 'kprobe:vfs_read { @ = count(); }'
 
-# Trace a one-shot command's syscalls
+# What does this command open?
 sudo whistler bpftrace -c 'cat /etc/hostname' \
   -e 'tracepoint:syscalls:sys_enter_openat
         { printf("%s\n", str(args->filename)); }'
@@ -96,6 +96,6 @@ sudo whistler bpftrace -c 'cat /etc/hostname' \
 # What can I probe in TCP?
 whistler bpftrace -l 'kprobe:tcp_*' | head
 
-# Just check the script compiles — no kernel
+# Check that a script compiles, without loading it
 whistler bpftrace --dump examples/bpftrace/biolatency.bt
 ```

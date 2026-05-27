@@ -1,10 +1,9 @@
 # Overview
 
-`whistler bpftrace` runs scripts written in [bpftrace](https://github.com/bpftrace/bpftrace)'s
-surface language. The Whistler binary contains a complete bpftrace
-frontend — parser, AST passes, code generator — and reuses the same
-SSA/regalloc/peephole pipeline the rest of Whistler does. There's no
-separate bpftrace install, no clang, no LLVM, no libbpf.
+`whistler bpftrace` runs scripts written in bpftrace's surface language. The
+parser, AST passes, and code generator all live in the same SBCL image and
+feed the same SSA pipeline the Lisp surface uses. You don't install bpftrace
+separately, and there's no LLVM in the loop.
 
 ```sh
 sudo whistler bpftrace \
@@ -12,18 +11,11 @@ sudo whistler bpftrace \
         { @[comm] = count(); }'
 ```
 
-## When to reach for it
-
-| Use case | Tool |
-|---|---|
-| Quick ad-hoc trace from the command line | `whistler bpftrace` |
-| Reusing existing bpftrace scripts | `whistler bpftrace` |
-| Writing a substantial tracing program | Whistler directly (see [Inline BPF Sessions](../loader/sessions.md)) |
-| Anything not eBPF | not Whistler |
-
-The bpftrace frontend exists so the common-case scripts — opensnoop,
-biolatency, runqlat, tcpconnect — work out of the box on the same
-binary you use for everything else.
+The point of the frontend is to make existing scripts — opensnoop,
+biolatency, runqlat, tcpconnect — work on the same binary you use for
+everything else. If you're writing a substantial tracing program from
+scratch, you'll usually be better served by writing Whistler directly; see
+[Inline BPF Sessions](../loader/sessions.md).
 
 ## Architecture
 
@@ -44,35 +36,29 @@ graph TD
     style I fill:#9b59b6,color:#fff
 ```
 
-Everything from `Codegen` down is shared with the rest of Whistler.
-The frontend's job is to translate bpftrace's higher-level surface
-into the same s-expression IR the Lisp surface lowers through.
+Everything from codegen down is shared with the rest of Whistler. The
+frontend's only job is to turn bpftrace's surface into the same
+s-expression IR the Lisp surface lowers through.
 
-## What's supported
+## Coverage
 
-Most of bpftrace's day-to-day surface. See
-[Surface Language](./surface.md) for the full inventory; in summary:
+The full surface reference is in [Surface Language](./surface.md). At a
+glance, the supported set includes every standard probe type (`kprobe`,
+`kretprobe`, `kfunc`, `kretfunc`, `uprobe`, `uretprobe`, `tracepoint`,
+`profile`, `interval`, `BEGIN`, `END`) with wildcards and multi-target
+specs; the usual aggregations (`count`, `sum`, `avg`, `min`, `max`,
+`stats`, `hist`, `lhist`); the async-action repertoire (`printf` with
+flag/width parsing, `print`, `clear`, `zero`, `delete`, `time`, `exit`);
+the string and address builtins (`str`, `kstr`, `ksym`, `usym`, `ntop`,
+`reg`); all the built-in variables (`pid`/`tid`/`uid`/`comm`/`nsecs` and
+friends, plus `curtask`, `probe`, `func`, `kstack`, `ustack`); symbolic
+constants resolved from BTF; struct casts (`((struct sock *)arg0)->field`)
+with BTF-driven field offsets; and the control-flow primitives —
+`if`/`else`, ternary, filter predicates, `while`, and user-defined `fn`.
 
-- All standard probes — `kprobe`, `kretprobe`, `kfunc`, `kretfunc`,
-  `uprobe`, `uretprobe`, `tracepoint`, `profile`, `interval`,
-  `BEGIN`, `END` — plus wildcards (`kprobe:tcp_*`) and multi-target
-  specs (`kprobe:foo,kprobe:bar`).
-- Aggregations: `count`, `sum`, `avg`, `min`, `max`, `stats`, `hist`,
-  `lhist`.
-- Async actions: `printf` (with `%-16s`/`%05d` format flags),
-  `print`, `clear`, `zero`, `delete`, `time`, `exit`.
-- String + address builtins: `str` / `kstr`, `ksym`, `usym`, `ntop`,
-  `reg("ip")`.
-- Built-in variables: `pid`, `tid`, `uid`, `gid`, `comm`, `nsecs`,
-  `cpu`, `retval`, `curtask`, `args`, `probe`, `func`, `kstack`,
-  `ustack`, `$local`, `@global`, composite `@[k1, k2]`.
-- Symbolic constants like `AF_INET`, `O_RDONLY`, `IPPROTO_TCP` —
-  resolved from kernel BTF enums plus a curated `#define` table.
-  No C headers, no `#include`.
-- Struct access: `curtask->pid`, `((struct sock_common *)arg0)->skc_family`
-  (BTF-resolved field offsets, scalar fields).
-- Control flow: `if`/`else`, ternary, `/predicate/`, `while` loops,
-  user-defined `fn`.
+Symbolic constants come from kernel BTF enums plus a small curated table
+for the `#define`s BTF doesn't carry (`AF_INET`, `O_RDONLY`, mode bits).
+No C headers, no `#include`.
 
 ## Quick example
 
@@ -84,7 +70,7 @@ sudo whistler bpftrace -e \
      { printf("%-16s %s\n", comm, str(args->filename)); }'
 ```
 
-Output is a live stream of every `openat()` on the system:
+Output is one line per `openat` syscall, system-wide:
 
 ```
 Hyprland         /proc/self/stat
@@ -93,5 +79,4 @@ code             /tmp/vscode-typescript.../...
 ...
 ```
 
-Ctrl-C dumps any final map state, then exits. See
-[Examples](./examples.md) for more.
+Ctrl-C flushes any maps and exits. See [Examples](./examples.md) for more.

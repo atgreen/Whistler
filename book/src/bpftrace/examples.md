@@ -1,7 +1,7 @@
 # Examples
 
-Recipes that exercise the bpftrace frontend end-to-end. Each example
-runs unchanged on `whistler bpftrace`.
+End-to-end recipes against `whistler bpftrace`. Each script is verbatim;
+none of them need a separate bpftrace install.
 
 ## opensnoop — every file opened, per command
 
@@ -11,7 +11,7 @@ sudo whistler bpftrace -e \
      { printf("%-16s %s\n", comm, str(args->filename)); }'
 ```
 
-Live stream:
+One line per `openat` syscall:
 
 ```
 Hyprland         /proc/self/stat
@@ -19,14 +19,14 @@ ptyxis           /home/green/.local/share/recently-used.xbel
 firefox          /proc/14123/cmdline
 ```
 
-## syscall count by command
+## Open counts by command
 
 ```sh
 sudo whistler bpftrace -e \
   'tracepoint:syscalls:sys_enter_openat { @[comm] = count(); }'
 ```
 
-Aggregated at ctrl-C:
+The map dumps at ctrl-C:
 
 ```
 @[firefox]:        237
@@ -34,15 +34,15 @@ Aggregated at ctrl-C:
 @[Hyprland]:         1
 ```
 
-## biolatency-style — bounded histogram
+## Linear latency histogram
 
 ```sh
 sudo whistler bpftrace -e \
   'kretprobe:vfs_read { @us = lhist(retval, 0, 4096, 256); }'
 ```
 
-The `lhist` aggregation gives linear buckets with explicit lower /
-upper bounds + step. After ctrl-C:
+`lhist` gives linear buckets with explicit lower/upper bounds and step.
+Output after ctrl-C:
 
 ```
 @us:
@@ -53,7 +53,7 @@ upper bounds + step. After ctrl-C:
 [4096, ...)           2  |                                                     |
 ```
 
-## "what does this command open" — `-c`
+## Trace a single command with `-c`
 
 ```sh
 sudo whistler bpftrace -c 'cat /etc/hostname' \
@@ -61,8 +61,8 @@ sudo whistler bpftrace -c 'cat /etc/hostname' \
         { printf("%s\n", str(args->filename)); }'
 ```
 
-The child is ptrace-stopped at exec entry; probes attach; child runs
-to completion; tracer exits cleanly with its map state:
+The child is ptrace-stopped at exec entry, probes attach, the child
+runs to completion, and the tracer exits with its map state:
 
 ```
 ;; -c spawned pid 1989572 (ptrace-stopped) — tracing until it exits.
@@ -71,7 +71,7 @@ to completion; tracer exits cleanly with its map state:
 /etc/hostname
 ```
 
-## ksym / usym — symbolised addresses
+## ksym / usym
 
 ```sh
 sudo whistler bpftrace -e \
@@ -79,11 +79,10 @@ sudo whistler bpftrace -e \
      { printf("%s called by %s\n", comm, ksym(arg0)); }'
 ```
 
-`ksym` resolves against `/proc/kallsyms` at print time, falling back
-to `0xHEX` when there's no match (e.g. heap pointers).
-
-`usym(addr)` is the userspace equivalent; the symbolizer captures
-`pid_tgid` in the kernel so per-pid `/proc/<pid>/maps` snapshots stay
+`ksym` resolves against `/proc/kallsyms` at print time, falling back to
+`0xHEX` when there's no match (heap pointers, anonymous mappings).
+`usym(addr)` is the userspace counterpart; the symbolizer captures
+`pid_tgid` in the kernel, so per-pid `/proc/<pid>/maps` snapshots stay
 correct even after the process exits.
 
 ## Stack traces
@@ -93,10 +92,9 @@ sudo whistler bpftrace -e \
   'uprobe:/usr/lib64/libc.so.6:malloc { @[ustack] = count(); }'
 ```
 
-Userspace stack traces are symbolised through the pure-CL ELF /
-DWARF `.debug_line` reader. When `glibc-debuginfo` (or equivalent)
-is installed each frame renders as
-`name+0xOFFSET [library] file:line`:
+Userspace stack frames are symbolised through Whistler's ELF and DWARF
+`.debug_line` reader. With `glibc-debuginfo` installed each frame
+renders as `name+0xOFFSET [library] file:line`:
 
 ```
 @[
@@ -107,30 +105,29 @@ is installed each frame renders as
 ]: 4
 ```
 
-## kfunc — modern fentry probes
+## kfunc with named args
 
-`kfunc` / `kretfunc` use BTF trampolines instead of kprobe traps.
-Cheaper, supports named args:
+`kfunc` and `kretfunc` use BTF trampolines (fentry / fexit) instead of
+kprobe traps, which is cheaper and gives you named arguments:
 
 ```sh
 sudo whistler bpftrace -e \
-  'kfunc:vfs_read
-     { @[args->file] = count(); }'
+  'kfunc:vfs_read { @[args->file] = count(); }'
 ```
 
-`args->file` lowers to a direct `ctx[0]` read, using BTF
-`FUNC_PROTO` to find the slot index.
+`args->file` lowers to a direct `ctx[0]` read; the slot index comes
+from `FUNC_PROTO` in BTF.
 
-## Wildcards
+## Wildcard targets
 
 ```sh
 sudo whistler bpftrace -e \
   'kprobe:tcp_* { @ = count(); }'
 ```
 
-Currently attaches sequentially (one `perf_event_open` per match);
-`BPF_TRACE_KPROBE_MULTI` fast-path is tracked in
-[#39](https://github.com/atgreen/Whistler/issues/39).
+The current implementation attaches sequentially (one
+`perf_event_open` per match). The `BPF_TRACE_KPROBE_MULTI` fast path
+is tracked in [#39](https://github.com/atgreen/Whistler/issues/39).
 
 ## User-defined fn
 
@@ -155,7 +152,7 @@ sudo whistler bpftrace -e \
 ```
 
 `probe` is replaced at AST-rewrite time with each probe's section
-name, so the map separately counts each variant.
+name, so the map counts each variant separately.
 
 ## Constants without C headers
 
@@ -166,5 +163,5 @@ sudo whistler bpftrace -e \
 ```
 
 `O_RDONLY` resolves from the curated `#define` table; `AF_INET`,
-`IPPROTO_TCP`, `S_IFDIR` etc. all work the same way. No `#include`
-needed.
+`IPPROTO_TCP`, `S_IFDIR`, and the rest work the same way. No
+`#include` needed.
