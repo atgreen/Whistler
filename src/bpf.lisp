@@ -89,6 +89,7 @@
 (defconstant +bpf-map-type-prog-array+    3)
 (defconstant +bpf-map-type-lru-hash+      9)
 (defconstant +bpf-map-type-lpm-trie+      11)
+(defconstant +bpf-map-type-stack-trace+   7)
 (defconstant +bpf-map-type-ringbuf+       27)
 
 ;; Map flags

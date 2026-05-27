@@ -79,6 +79,8 @@
     (:var     8)
     (:bin     8)
     (:comm    16)
+    (:kstack  4)
+    (:ustack  4)
     (:field
      (let ((name (getf (cdr expr) :name)))
        (cond
@@ -138,6 +140,8 @@
     (:arg     :arg)
     (:retval  :retval)
     (:comm    :comm)
+    (:kstack  :kstack)
+    (:ustack  :ustack)
     (t        nil)))
 
 (defun infer-maps (script)
@@ -270,6 +274,8 @@
     (:arg        (lower-arg (second expr)))
     (:retval     (lower-retval))
     (:comm       (unsupported "comm only usable as printf arg or @map[comm] key"))
+    (:kstack     `(whistler::get-stackid (whistler::ctx-ptr) ,*stacks-map-name* 0))
+    (:ustack     (unsupported "ustack — Phase 4 ships kernel stacks (kstack) only"))
     (:args       (unsupported "args without ->field"))
     (:probe-name (unsupported "probe builtin"))
     (:func       (unsupported "func builtin"))
@@ -357,6 +363,14 @@
    to the userspace runtime: printf, print(@m), clear(@m), time, etc.
    Every record starts with the same 8-byte header — a u32 tag and
    a u32 id — so a single ring consumer can dispatch all of them.")
+
+(defparameter *stacks-map-name* (intern "--BT-STACKS--" :whistler)
+  "Hidden BPF_MAP_TYPE_STACK_TRACE map. Each entry is an array of
+   u64 instruction pointers — the kernel stack at the moment
+   `kstack' fired. Looked up by stack-id (u32) at print time.")
+
+(defconstant +bt-stack-depth+ 32
+  "Frames captured per kstack entry. Value-size = 8 * depth = 256.")
 
 ;;; Tag values must match those decoded in runtime.lisp.
 (defconstant +bt-tag-printf+    0)
@@ -800,7 +814,7 @@
 ;;; ========== Probe lowering ==========
 
 (defparameter *kernel-spec-tags*
-  '(:kprobe :kretprobe :tracepoint :begin :end :interval))
+  '(:kprobe :kretprobe :tracepoint :begin :end :interval :profile))
 
 (defun interval-period-ns (spec)
   "Convert an :interval probe spec to a period in nanoseconds.
@@ -833,7 +847,22 @@
     ;; event; the period (in ns) is encoded in the section name so the
     ;; runtime can parse it back when wiring up the perf timer.
     (:interval   (values :kprobe (format nil "interval/period_~D"
-                                         (interval-period-ns spec))))))
+                                         (interval-period-ns spec))))
+    ;; profile:hz:N attaches to a freq-mode PERF_TYPE_SOFTWARE event
+    ;; per-CPU at N samples/sec. Section encodes the frequency in Hz.
+    (:profile    (values :kprobe (format nil "profile/freq_~D"
+                                         (profile-freq-hz spec))))))
+
+(defun profile-freq-hz (spec)
+  "Convert a :profile probe spec to a frequency in hertz. Phase 4
+   only supports `profile:hz:N'; other units don't really make sense
+   for sampling (would need period mode)."
+  (let ((unit  (getf (cdr spec) :unit))
+        (count (getf (cdr spec) :count)))
+    (unless (eq unit :hz)
+      (unsupported "profile:~A:~D — Phase 4 supports profile:hz:N only"
+                   unit count))
+    count))
 
 (defvar *test-run-counter* 0
   "Per-generate() counter used to keep BEGIN/END section names unique.")
@@ -973,6 +1002,17 @@
     (some (lambda (probe) (walk (getf (cdr probe) :body)))
           (rest script))))
 
+(defun script-uses-kstack-p (script)
+  "T iff `kstack' appears anywhere — gates injection of the hidden
+   bt-stacks stack-trace map."
+  (labels ((walk (form)
+             (cond
+               ((not (consp form)) nil)
+               ((eq (first form) :kstack) t)
+               (t (some #'walk form)))))
+    (some (lambda (probe) (walk (getf (cdr probe) :body)))
+          (rest script))))
+
 (defun generate (script)
   "Translate normalised SCRIPT to a plist:
      :maps          (defmap forms)
@@ -993,17 +1033,22 @@
                           collect (gen-defmap info)))
          (uses-exit (script-uses-exit-p script))
          (uses-printf (script-uses-printf-p script))
+         (uses-kstack (script-uses-kstack-p script))
          (exit-map-form
            (when uses-exit
              `(whistler:defmap ,*exit-map-name*
                 :type :array :key-size 4 :value-size 1 :max-entries 1)))
          (print-map-form
            (when uses-printf
-             ;; max-entries = ringbuf byte capacity (must be a power
-             ;; of two ≥ page size). 256 KiB is plenty for one-liners
-             ;; and biolatency-class banners.
              `(whistler:defmap ,*print-map-name*
                 :type :ringbuf :max-entries 262144)))
+         (stacks-map-form
+           (when uses-kstack
+             `(whistler:defmap ,*stacks-map-name*
+                :type :stack-trace
+                :key-size 4
+                :value-size ,(* 8 +bt-stack-depth+)
+                :max-entries 4096)))
          (probes    nil)
          (user      nil)
          (tp-preamble (gen-deftracepoint-preamble script)))
@@ -1012,13 +1057,16 @@
           do (multiple-value-bind (kforms us) (gen-probe-forms probe i)
                (setf probes (append probes kforms)
                      user   (append user us))))
-    (list :maps (append (when exit-map-form  (list exit-map-form))
-                        (when print-map-form (list print-map-form))
+    (list :maps (append (when exit-map-form    (list exit-map-form))
+                        (when print-map-form   (list print-map-form))
+                        (when stacks-map-form  (list stacks-map-form))
                         maps)
           :progs (append tp-preamble probes)
           :user-probes user
           :exit-map (when uses-exit *exit-map-name*)
           :print-map (when uses-printf *print-map-name*)
+          :stacks-map (when uses-kstack *stacks-map-name*)
+          :stack-depth +bt-stack-depth+
           :printf-table (reverse *printf-table*)
           :map-id-table (reverse *map-id-table*)
           :info (loop for raw being the hash-keys of map-table

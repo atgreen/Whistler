@@ -55,11 +55,14 @@
          (and (>= (length section-name) 10)
               (string= (subseq section-name 0 10) "uretprobe/")))
      +bpf-prog-type-kprobe+)
-    ;; interval — PERF_EVENT prog type so the kernel will SET_BPF on a
-    ;; PERF_TYPE_SOFTWARE / CPU_CLOCK event. Loaded with that prog
-    ;; type; the runtime attaches via attach-perf-timer.
-    ((and (>= (length section-name) 9)
-          (string= (subseq section-name 0 9) "interval/"))
+    ;; interval / profile — PERF_EVENT prog type so the kernel will
+    ;; SET_BPF on a PERF_TYPE_SOFTWARE / CPU_CLOCK event. Loaded with
+    ;; that prog type; the runtime attaches via attach-perf-timer
+    ;; (period mode) or attach-perf-profile (per-CPU freq mode).
+    ((or (and (>= (length section-name) 9)
+              (string= (subseq section-name 0 9) "interval/"))
+         (and (>= (length section-name) 8)
+              (string= (subseq section-name 0 8) "profile/")))
      +bpf-prog-type-perf-event+)
     ;; bpftrace BEGIN/END: RAW_TRACEPOINT programs invoked once from
     ;; userspace via BPF_PROG_TEST_RUN. (bpftrace itself does exactly

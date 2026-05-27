@@ -320,6 +320,9 @@
       ((sym= head 'tail-call)
        (lower-tail-call ctx (first args) (second args)))
 
+      ((sym= head 'get-stackid)
+       (lower-get-stackid ctx (first args) (second args) (third args)))
+
       ((sym= head 'core-ctx-load)
        (lower-core-ctx-load ctx args))
 
@@ -1151,6 +1154,20 @@
         (dst (ctx-fresh-vreg ctx)))
     (ctx-emit ctx :tail-call dst
               (list `(:map ,map-name) ctx-vreg idx-vreg) 'u64)
+    dst))
+
+(defun lower-get-stackid (ctx ctx-arg map-name flags-arg)
+  "Lower (get-stackid CTX MAP FLAGS) → bpf_get_stackid(ctx, &map, flags).
+   MAP must be a stack-trace-type map. Returns the u32 stack id."
+  (check-map-type-is ctx map-name whistler/bpf:+bpf-map-type-stack-trace+
+                     "stack-trace" "get-stackid")
+  (let ((ctx-vreg (lower-expr ctx ctx-arg))
+        (flags-vreg (lower-expr ctx flags-arg))
+        (dst (ctx-fresh-vreg ctx)))
+    ;; Map ref FIRST to match other map ops (map-lookup, tail-call) so
+    ;; the relocation/usage-counting pass finds it without special-casing.
+    (ctx-emit ctx :get-stackid dst
+              (list `(:map ,map-name) ctx-vreg flags-vreg) 'u32)
     dst))
 
 ;;; ========== Helper calls ==========

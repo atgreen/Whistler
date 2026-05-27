@@ -72,14 +72,15 @@
 
   probe          = probe-specs <ws> predicate? <ws> block
   probe-specs    = probe-spec (<ws> <','> <ws> probe-spec)*
-  probe-spec     = begin-spec / end-spec / interval-spec / kretprobe-spec /
-                   kprobe-spec / tracepoint-spec
+  probe-spec     = begin-spec / end-spec / profile-spec / interval-spec /
+                   kretprobe-spec / kprobe-spec / tracepoint-spec
   begin-spec     = 'BEGIN'
   end-spec       = 'END'
   kprobe-spec    = <'kprobe'> <':'> ident
   kretprobe-spec = <'kretprobe'> <':'> ident
   tracepoint-spec= <'tracepoint'> <':'> ident <':'> ident
   interval-spec  = <'interval'> <':'> interval-unit <':'> integer
+  profile-spec   = <'profile'> <':'> interval-unit <':'> integer
   interval-unit  = 's' / 'ms' / 'us' / 'hz'
 
   predicate      = <'/'> <ws> expr <ws> <'/'>
@@ -129,7 +130,7 @@
   builtin        = builtin-name !ident-char
   builtin-name   = 'pid' / 'tid' / 'uid' / 'gid' / 'nsecs' / 'elapsed' /
                    'cpu' / 'comm' / 'probe' / 'func' / 'retval' / 'curtask' /
-                   'cgroup' / 'rand' / 'args' /
+                   'cgroup' / 'rand' / 'args' / 'kstack' / 'ustack' /
                    'arg0' / 'arg1' / 'arg2' / 'arg3' / 'arg4' /
                    'arg5' / 'arg6' / 'arg7' / 'arg8' / 'arg9'
 

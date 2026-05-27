@@ -43,7 +43,8 @@
     ("GET-SOCKET-COOKIE"    . 46)
     ("GET-CURRENT-TASK-BTF" . 159)
     ("KTIME-GET-COARSE-NS"  . 161)
-    ("KTIME-GET-BOOT-NS"    . 125))
+    ("KTIME-GET-BOOT-NS"    . 125)
+    ("GET-STACKID"          . 27))
   "BPF helper functions: string name → helper ID.
    Single source of truth — referenced by the SSA pipeline via lower.lisp.")
 
@@ -59,7 +60,8 @@
     ("RINGBUF-RESERVE" . 3) ("RINGBUF-SUBMIT" . 2) ("RINGBUF-DISCARD" . 2)
     ("RINGBUF-OUTPUT" . 4)
     ("GET-SOCKET-COOKIE" . 1) ("GET-CURRENT-TASK-BTF" . 0)
-    ("KTIME-GET-COARSE-NS" . 0) ("KTIME-GET-BOOT-NS" . 0))
+    ("KTIME-GET-COARSE-NS" . 0) ("KTIME-GET-BOOT-NS" . 0)
+    ("GET-STACKID" . 3))
   "Expected argument counts for BPF helpers that users call directly.
    BPF allows max 5 args (R1-R5). Helpers not listed here are not checked.")
 
@@ -93,6 +95,7 @@
     (:percpu-hash   +bpf-map-type-percpu-hash+)
     (:lpm-trie      +bpf-map-type-lpm-trie+)
     (:percpu-array  +bpf-map-type-percpu-array+)
+    (:stack-trace   +bpf-map-type-stack-trace+)
     (:ringbuf       +bpf-map-type-ringbuf+)))
 
 ;;; Data structures

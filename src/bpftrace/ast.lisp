@@ -136,6 +136,13 @@
               (count-node (first-tagged inner :integer)))
          (list :interval
                :unit (intern (string-upcase unit-str) :keyword)
+               :count (parse-integer (text-of count-node)))))
+      (:profile-spec
+       (let* ((unit-node (first-tagged inner :interval-unit))
+              (unit-str  (text-of unit-node))
+              (count-node (first-tagged inner :integer)))
+         (list :profile
+               :unit (intern (string-upcase unit-str) :keyword)
                :count (parse-integer (text-of count-node))))))))
 
 ;;; ========== Statements ==========
@@ -350,6 +357,8 @@
       ((string= name "comm")    '(:comm))
       ((string= name "probe")   '(:probe-name))
       ((string= name "func")    '(:func))
+      ((string= name "kstack")  '(:kstack))
+      ((string= name "ustack")  '(:ustack))
       ((and (>= (length name) 4) (string= (subseq name 0 3) "arg")
             (digit-char-p (char name 3)))
        (list :arg (parse-integer (subseq name 3))))

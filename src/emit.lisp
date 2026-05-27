@@ -337,7 +337,7 @@
     (dolist (block (ir-program-blocks prog))
       (dolist (insn (basic-block-insns block))
         (when (member (ir-insn-op insn) '(:map-lookup :map-lookup-ptr
-                                          :tail-call
+                                          :tail-call :get-stackid
                                           :map-update :map-update-ptr
                                           :map-delete :map-delete-ptr
                                           :ringbuf-reserve))
@@ -527,6 +527,7 @@
      ((eq op :atomic-add)(emit-atomic-add-insn ctx args))
      ((eq op :call)      (emit-call-insn ctx dst args))
      ((eq op :tail-call) (emit-tail-call-insn ctx dst args))
+     ((eq op :get-stackid) (emit-get-stackid-insn ctx dst args))
      ((eq op :map-lookup)(emit-map-lookup-insn ctx dst args))
      ((eq op :map-lookup-ptr)(emit-map-lookup-ptr-insn ctx dst args))
      ((eq op :struct-alloc)(emit-struct-alloc-insn ctx dst args))
@@ -1213,6 +1214,25 @@
     (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
 
 ;;; ========== Tail call emission ==========
+
+(defun emit-get-stackid-insn (ctx dst args)
+  "Emit bpf_get_stackid(ctx, stack_trace_map, flags) (helper 27).
+   Args: ((:map MAP-NAME) ctx-vreg flags-vreg).
+   Register setup: R1=ctx, R2=map FD, R3=flags."
+  (let ((map-name   (map-arg-name (first args)))
+        (ctx-vreg   (second args))
+        (flags-vreg (third args)))
+    ;; Flags → R3 first (LD_IMM64 for map FD clobbers R2 only)
+    (emit-vreg-to-reg ctx flags-vreg whistler/bpf:+bpf-reg-3+)
+    ;; Map FD → R2
+    (emit-map-fd ctx map-name whistler/bpf:+bpf-reg-2+)
+    ;; Ctx → R1
+    (let ((ctx-reg (vreg-to-physical ctx ctx-vreg whistler/bpf:+bpf-reg-1+)))
+      (unless (= ctx-reg whistler/bpf:+bpf-reg-1+)
+        (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                         whistler/bpf:+bpf-reg-1+ ctx-reg))))
+    (ectx-emit ctx (whistler/bpf:emit-call 27))
+    (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
 
 (defun emit-tail-call-insn (ctx dst args)
   "Emit bpf_tail_call(ctx, prog_array, index).

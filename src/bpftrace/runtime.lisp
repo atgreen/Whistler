@@ -10,6 +10,63 @@
 
 (in-package #:whistler/bpftrace)
 
+;;; ========== /proc/kallsyms symboliser ==========
+;;;
+;;; Lazy: only parses on first lookup, caches forever within the
+;;; running session. The file is sorted by address in the kernel's
+;;; output, but we re-sort defensively. Binary search gives us
+;;; the nearest symbol ≤ a given address, which we render as
+;;; `name+0xOFFSET`.
+
+(defvar *kallsyms* nil
+  "Sorted vector of (ADDR . NAME) cons cells. NIL until loaded.")
+
+(defun load-kallsyms ()
+  "Parse /proc/kallsyms into *kallsyms*. Silently leaves it NIL if
+   the file is unreadable (kptr_restrict, no root, etc.); the
+   stack printer falls back to bare hex in that case."
+  (handler-case
+      (with-open-file (s "/proc/kallsyms" :direction :input)
+        (let ((entries (make-array 100000 :fill-pointer 0 :adjustable t)))
+          (loop for line = (read-line s nil nil)
+                while line
+                do (let ((sp1 (position #\Space line))
+                         (sp2 nil))
+                     (when sp1
+                       (setf sp2 (position #\Space line :start (1+ sp1)))
+                       (when sp2
+                         (let ((addr (parse-integer line :end sp1 :radix 16 :junk-allowed t))
+                               (name (subseq line (1+ sp2))))
+                           (when (and addr (plusp addr))
+                             (vector-push-extend (cons addr name) entries)))))))
+          (setf *kallsyms* (sort entries #'< :key #'car))))
+    (error () (setf *kallsyms* #()))))
+
+(defun resolve-symbol (addr)
+  "Return `name+0xOFFSET' for ADDR, or just the hex address if no
+   match. Binary-searches the sorted *kallsyms* for the largest
+   entry whose address is ≤ ADDR."
+  (when (null *kallsyms*) (load-kallsyms))
+  (cond
+    ((zerop addr) nil)
+    ((or (null *kallsyms*) (zerop (length *kallsyms*)))
+     (format nil "0x~X" addr))
+    (t
+     (let ((lo 0)
+           (hi (length *kallsyms*)))
+       (loop while (< lo hi)
+             do (let ((mid (floor (+ lo hi) 2)))
+                  (if (<= (car (aref *kallsyms* mid)) addr)
+                      (setf lo (1+ mid))
+                      (setf hi mid))))
+       (if (zerop lo)
+           (format nil "0x~X" addr)
+           (let* ((entry  (aref *kallsyms* (1- lo)))
+                  (offset (- addr (car entry))))
+             (if (zerop offset)
+                 (cdr entry)
+                 (format nil "~A+0x~X" (cdr entry) offset))))))))
+
 ;;; ========== Compiling generated forms ==========
 
 (defun compile-generated (gen)
@@ -40,11 +97,19 @@
 
 (defun parse-interval-period-ns (section)
   "Extract the period (in ns) from `interval/period_N' section names."
-  (let* ((parts (split-section section)) ; ("interval" "period_N")
+  (let* ((parts (split-section section))
          (tail  (second parts)))
     (when (and tail (>= (length tail) 7)
                (string= (subseq tail 0 7) "period_"))
       (parse-integer tail :start 7 :junk-allowed t))))
+
+(defun parse-profile-freq-hz (section)
+  "Extract the frequency (Hz) from `profile/freq_N' section names."
+  (let* ((parts (split-section section))
+         (tail  (second parts)))
+    (when (and tail (>= (length tail) 5)
+               (string= (subseq tail 0 5) "freq_"))
+      (parse-integer tail :start 5 :junk-allowed t))))
 
 (defun attach-probe (prog-info)
   "Inspect the program's section name and call the appropriate attach-*.
@@ -71,6 +136,13 @@
                       :section section :target target
                       :reason "could not parse period from interval section"))
              (whistler/loader::attach-perf-timer fd period)))
+          ((string= kind "profile")
+           (let ((freq (parse-profile-freq-hz section)))
+             (unless freq
+               (error 'bpftrace-attach-error
+                      :section section :target target
+                      :reason "could not parse frequency from profile section"))
+             (whistler/loader::attach-perf-profile fd freq)))
           (t (error 'bpftrace-attach-error
                     :section section :target target
                     :reason (format nil "unknown probe kind ~A" kind))))
@@ -244,10 +316,11 @@
     (or cur 0)))
 
 (defun print-scalar-map (label info &key (key-parts 1) keyed-p
-                                          (kind :counter) key-builtin)
+                                          (kind :counter) key-builtin
+                                          stacks-info stack-depth)
   "Print a hash or percpu-hash map's contents in bpftrace's END-dump
-   style. KIND controls how the value is decoded; KEY-BUILTIN is the
-   codegen-time hint for the key shape (e.g. :comm renders ASCII)."
+   style. KIND controls value decoding; KEY-BUILTIN is the key shape
+   hint (:comm → ASCII; :kstack → multi-line symbolised stack)."
   (let* ((keys (map-keys info))
          (pairs (sort (mapcar
                        (lambda (k)
@@ -262,17 +335,27 @@
                        keys)
                       #'< :key #'cdr))
          (prefix (if (or (null label) (string= label "@")) "@" (format nil "@~A" label))))
-    (dolist (kv pairs)
-      (if keyed-p
-          (format t "~A[~A]: ~D~%"
-                  prefix
-                  (format-key (car kv)
-                              :parts key-parts
-                              :key-builtin key-builtin)
-                  (cdr kv))
-          (format t "~A: ~D~%" prefix (cdr kv))))))
+    (cond
+      ;; Stack keys render as a multi-line block of symbolised IPs.
+      ((eq key-builtin :kstack)
+       (dolist (kv pairs)
+         (format t "~A[~%~A~%]: ~D~%"
+                 prefix
+                 (format-stack (car kv) stacks-info (or stack-depth 32))
+                 (cdr kv))))
+      (keyed-p
+       (dolist (kv pairs)
+         (format t "~A[~A]: ~D~%"
+                 prefix
+                 (format-key (car kv)
+                             :parts key-parts
+                             :key-builtin key-builtin)
+                 (cdr kv))))
+      (t
+       (dolist (kv pairs)
+         (format t "~A: ~D~%" prefix (cdr kv)))))))
 
-(defun print-all-maps (info-list map-alist)
+(defun print-all-maps (info-list map-alist &key stacks-info stack-depth)
   "Dump every known map in bpftrace END style."
   (dolist (info-rec info-list)
     (let* ((raw-name    (first info-rec))
@@ -290,7 +373,9 @@
                                    :key-parts key-parts
                                    :keyed-p (getf (cdr info-rec) :keyed-p)
                                    :key-builtin (getf (cdr info-rec) :key-builtin)
-                                   :kind kind)))))))
+                                   :kind kind
+                                   :stacks-info stacks-info
+                                   :stack-depth stack-depth)))))))
 
 ;;; ========== Userspace BEGIN/END ==========
 
@@ -332,6 +417,60 @@
     (when sym
       (let ((key (string-downcase (substitute #\_ #\- (symbol-name sym)))))
         (cdr (assoc key map-alist :test #'string=))))))
+
+(defun find-stacks-map (gen map-alist)
+  (let ((sym (getf gen :stacks-map)))
+    (when sym
+      (let ((key (string-downcase (substitute #\_ #\- (symbol-name sym)))))
+        (cdr (assoc key map-alist :test #'string=))))))
+
+(defun lookup-stack-ips (stacks-info stack-id depth)
+  "Look up a stack-trace map entry by stack ID and return a list of
+   u64 IPs (truncated at the first 0)."
+  (when (and stacks-info (not (zerop stack-id)))
+    (let* ((kbytes (whistler/loader::encode-int-key
+                    stack-id (whistler/loader::map-info-key-size stacks-info)))
+           (raw    (whistler/loader::map-lookup stacks-info kbytes)))
+      (when (and raw (vectorp raw))
+        (loop for i below depth
+              for ip = (whistler/loader::decode-int-value
+                        (subseq raw (* i 8) (+ (* i 8) 8)))
+              while (plusp ip)
+              collect ip)))))
+
+(defparameter *errno-names*
+  ;; Just the errnos bpf_get_stackid actually returns. Anything else
+  ;; falls back to the bare number.
+  '((1  . "EPERM") (2  . "ENOENT") (11 . "EAGAIN") (12 . "ENOMEM")
+    (14 . "EFAULT") (16 . "EBUSY") (17 . "EEXIST") (22 . "EINVAL")
+    (28 . "ENOSPC") (75 . "EOVERFLOW")))
+
+(defun stackid-errno (stack-id)
+  "If STACK-ID has bit 31 set (i32 negative), return the matching
+   errno name (or NIL if unknown). bpf_get_stackid returns -ERRNO
+   reinterpreted as u32 when it can't capture a stack."
+  (when (logbitp 31 stack-id)
+    (let* ((neg  (- stack-id (ash 1 32)))
+           (cell (assoc (- neg) *errno-names*)))
+      (or (cdr cell) (format nil "-~D" (- neg))))))
+
+(defun format-stack (stack-id stacks-info depth)
+  "Render a kstack key as bpftrace's indented multi-line stack:
+       kfunc1+0x12
+       kfunc2+0x34
+       …
+   Returns the formatted block as a string (no trailing newline)."
+  (with-output-to-string (s)
+    (let ((errname (stackid-errno stack-id)))
+      (if errname
+          (format s "        <stack-trace: -~A>" errname)
+          (let ((ips (lookup-stack-ips stacks-info stack-id depth)))
+            (if ips
+                (loop for ip in ips
+                      for first-p = t then nil
+                      do (unless first-p (terpri s))
+                         (format s "        ~A" (resolve-symbol ip)))
+                (format s "        <stack id ~D unavailable>" stack-id)))))))
 
 ;;; ========== printf record decoding ==========
 
@@ -425,7 +564,8 @@
              (entry (assoc key map-alist :test #'string=)))
         (values (first info-rec) (cdr entry) info-rec)))))
 
-(defun decode-print-map-record (sap map-id-table map-alist info-list)
+(defun decode-print-map-record (sap map-id-table map-alist info-list
+                                stacks-info stack-depth)
   (let ((id (sap-read-u32-le sap 4)))
     (multiple-value-bind (raw map-info info-rec)
         (find-map-by-id map-id-table id map-alist info-list)
@@ -437,7 +577,9 @@
                   :key-parts (or (getf (cdr info-rec) :key-parts) 1)
                   :keyed-p   (getf (cdr info-rec) :keyed-p)
                   :key-builtin (getf (cdr info-rec) :key-builtin)
-                  :kind      (getf (cdr info-rec) :kind))))))))
+                  :kind      (getf (cdr info-rec) :kind)
+                  :stacks-info stacks-info
+                  :stack-depth stack-depth)))))))
 
 (defun decode-clear-map-record (sap map-id-table map-alist)
   (let ((id (sap-read-u32-le sap 4)))
@@ -462,14 +604,16 @@
       (declare (ignore sec))
       (format t "~2,'0D:~2,'0D:~2,'0D~%" h m s))))
 
-(defun make-ring-callback (printf-table map-id-table map-alist info-list)
+(defun make-ring-callback (printf-table map-id-table map-alist info-list
+                           &key stacks-info stack-depth)
   "Build the dispatcher that READ_RING_BUFFER invokes for every record."
   (lambda (sap len)
     (declare (ignore len))
     (let ((tag (sap-read-u32-le sap 0)))
       (case tag
         (0 (decode-printf-record    sap printf-table))
-        (1 (decode-print-map-record sap map-id-table map-alist info-list))
+        (1 (decode-print-map-record sap map-id-table map-alist info-list
+                                    stacks-info stack-depth))
         (2 (decode-clear-map-record sap map-id-table map-alist))
         (3 (decode-time-record))
         (t nil)))
@@ -503,6 +647,8 @@
            (atts       nil)
            (exit-info  (find-exit-map gen map-alist))
            (print-info (find-print-map gen map-alist))
+           (stacks-info (find-stacks-map gen map-alist))
+           (stack-depth (or (getf gen :stack-depth) 32))
            (printf-table (getf gen :printf-table))
            (map-id-table (getf gen :map-id-table))
            (info-list-cached info-list)
@@ -511,7 +657,9 @@
                (whistler/loader::open-ring-consumer
                 print-info
                 (make-ring-callback printf-table map-id-table
-                                    map-alist info-list-cached))))
+                                    map-alist info-list-cached
+                                    :stacks-info stacks-info
+                                    :stack-depth stack-depth))))
            (begin-progs (remove-if-not
                          (lambda (entry)
                            (begin-section-p
@@ -564,7 +712,9 @@
             (error () nil)))
         (when ring-consumer
           (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
-        (print-all-maps info-list map-alist)
+        (print-all-maps info-list map-alist
+                        :stacks-info stacks-info
+                        :stack-depth stack-depth)
         (dolist (a atts) (handler-case (whistler/loader::detach a) (error () nil)))
         (dolist (e prog-alist)
           (let ((fd (whistler/loader::prog-info-fd (cdr e))))

@@ -129,14 +129,28 @@
   "Attach PROG-FD to a periodic PERF_TYPE_SOFTWARE / CPU_CLOCK event
    firing every PERIOD-NS nanoseconds. Used to wire up bpftrace's
    `interval:s:N` / `interval:ms:N`. Returns an attachment record.
-   Phase 3 fires on CPU 0 only — sufficient for periodic reporting."
+   Fires on CPU 0 only — sufficient for periodic reporting."
   (let ((attr (make-perf-attr +perf-type-software+
                               +perf-count-sw-cpu-clock+)))
-    ;; sample_period at offset 16
+    ;; sample_period at offset 16; flags u64 at 40 stays zero so
+    ;; freq=0 → period mode.
     (put-u64 attr 16 period-ns)
-    ;; flags u64 at offset 40 — leave zero so freq=0 (period mode)
     (let ((fds (attach-perf-bpf attr prog-fd)))
       (make-attachment :type :perf-timer :perf-fds fds :prog-fd prog-fd))))
+
+(defun attach-perf-profile (prog-fd freq-hz)
+  "Attach PROG-FD to a PERF_TYPE_SOFTWARE / CPU_CLOCK event sampling
+   at FREQ-HZ across every online CPU. Used to wire up bpftrace's
+   `profile:hz:N`. Returns an attachment record."
+  (let ((attr (make-perf-attr +perf-type-software+
+                              +perf-count-sw-cpu-clock+)))
+    ;; sample_freq at offset 16
+    (put-u64 attr 16 freq-hz)
+    ;; flags u64 at offset 40: bit 10 = freq (use sample_freq, not
+    ;; sample_period). Bit 0 = disabled (we ENABLE separately).
+    (put-u64 attr 40 (ash 1 10))
+    (let ((fds (attach-perf-bpf attr prog-fd :per-cpu t)))
+      (make-attachment :type :perf-profile :perf-fds fds :prog-fd prog-fd))))
 
 (defun attach-tracepoint (prog-fd tracepoint-name)
   "Attach a BPF program to a tracepoint.
