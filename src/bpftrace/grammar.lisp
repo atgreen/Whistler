@@ -68,7 +68,11 @@
 
 (defparameter *grammar-source*
   "
-  script         = <ws> probe (<ws> probe)* <ws>
+  script         = <ws> top-form (<ws> top-form)* <ws>
+  top-form       = function / probe
+  function       = <'fn'> <ws> ident <ws> <'('> <ws> param-list? <ws> <')'> <ws> block
+  param-list     = param (<ws> <','> <ws> param)*
+  param          = <'$'> ident
 
   probe          = probe-specs <ws> predicate? <ws> block
   probe-specs    = probe-spec (<ws> <','> <ws> probe-spec)*
@@ -94,7 +98,8 @@
 
   block          = <'{'> <ws> statements? <ws> <'}'>
   statements     = statement (<ws> <';'> <ws> statement)* (<ws> <';'>)?
-  statement      = if-stmt / assign-stmt / expr-stmt
+  statement      = if-stmt / return-stmt / assign-stmt / expr-stmt
+  return-stmt    = <'return'> !ident-char <ws> expr?
   if-stmt        = <'if'> <ws> <'('> <ws> expr <ws> <')'> <ws> block (<ws> <'else'> <ws> block)?
   assign-stmt    = lhs <ws> assign-op <ws> expr  /
                    lhs <ws> incdec-op

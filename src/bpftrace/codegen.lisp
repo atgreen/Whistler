@@ -55,7 +55,7 @@
    build *TP-FIELD-SIZES*. Skips silently if a format file can't be
    read — the caller falls back to a default size."
   (let ((table (make-hash-table :test 'equal)))
-    (dolist (probe (rest script))
+    (dolist (probe (script-probes script))
       (dolist (spec (getf (cdr probe) :specs))
         (when (eq (first spec) :tracepoint)
           (let* ((cat (substitute #\_ #\- (second spec)))
@@ -237,7 +237,7 @@
                                (minfo-value-size info) 16)))))
                    (t (when (eq (minfo-kind info) :counter)
                         (setf (minfo-kind info) :scalar)))))))
-      (dolist (probe (rest script))
+      (dolist (probe (script-probes script))
         (let ((body (getf (cdr probe) :body))
               (pred (getf (cdr probe) :predicate)))
           (when pred (when (eq (first pred) :map) (note-keys pred)))
@@ -326,6 +326,24 @@
     (:field      (lower-field expr))
     (:index      (unsupported "array indexing outside @maps"))
     (:map        (lower-map-read expr))))
+
+;;; ========== Script top-form helpers ==========
+
+(defun script-probes (script)
+  "(rest script) filtered to :probe nodes — strips out :function defs."
+  (remove-if-not (lambda (f) (and (consp f) (eq (first f) :probe)))
+                 (rest script)))
+
+(defun script-functions (script)
+  (remove-if-not (lambda (f) (and (consp f) (eq (first f) :function)))
+                 (rest script)))
+
+(defvar *user-functions* nil
+  "Per-generate() alist NAME → (:params (…) :body (…)). User-defined
+   `fn' definitions; lower-call inlines each call site.")
+
+(defun find-user-function (name)
+  (cdr (assoc name *user-functions* :test #'string=)))
 
 ;;; ========== Symbolic constants ==========
 ;;;
@@ -534,7 +552,53 @@
                                 (getf (cdr expr) :args)))
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
+      ;; User-defined `fn' — inline the body, substituting the
+      ;; formal parameters with the actual argument expressions.
+      ((find-user-function name)
+       (inline-user-call name (getf (cdr expr) :args)))
       (t (unsupported "function ~A" name)))))
+
+(defun inline-user-call (name args)
+  "Inline a call to user-defined function NAME. Each (:var \"param\")
+   in the body is rewritten to the matching argument expression at
+   AST level, then the body is lowered as a Whistler form."
+  (let* ((fn      (find-user-function name))
+         (params  (getf fn :params))
+         (body    (getf fn :body))
+         (subs    (and params (mapcar #'cons params args))))
+    (unless (= (length params) (length args))
+      (unsupported "fn ~A expects ~D arg~:p, got ~D"
+                   name (length params) (length args)))
+    (let* ((body* (mapcar (lambda (s) (substitute-vars s subs)) body))
+           (forms (mapcar #'lower-fn-stmt body*)))
+      ;; Single trailing :return → its expression IS the result.
+      ;; Multiple forms → wrap in progn; the last form's value wins.
+      (cond
+        ((null forms) 0)
+        ((= (length forms) 1) (first forms))
+        (t `(progn ,@forms))))))
+
+(defun substitute-vars (form subs)
+  "Walk FORM (an AST), replacing every (:var \"name\") whose name
+   appears as a CAR in SUBS with the substitution expression."
+  (cond
+    ((not (consp form)) form)
+    ((and (eq (first form) :var) (stringp (second form)))
+     (let ((cell (assoc (second form) subs :test #'string=)))
+       (cond (cell (cdr cell))
+             (t form))))
+    (t (cons (substitute-vars (first form) subs)
+             (substitute-vars (rest form)  subs)))))
+
+(defun lower-fn-stmt (stmt)
+  "Lower a single statement inside a user-fn body. :return forms
+   evaluate to their expression's value; other statements lower as
+   usual."
+  (cond
+    ((and (consp stmt) (eq (first stmt) :return))
+     (let ((e (getf (cdr stmt) :expr)))
+       (if e (lower-expr e) 0)))
+    (t (lower-stmt stmt))))
 
 (defparameter *reg-aliases*
   ;; Map bpftrace reg() names to the pt-regs keyword the protocols.lisp
@@ -933,7 +997,8 @@
     (:if      (lower-if stmt))
     (:assign  (lower-assign stmt))
     (:incdec  (lower-incdec stmt))
-    (:expr    (lower-expr-stmt stmt))))
+    (:expr    (lower-expr-stmt stmt))
+    (:return  (unsupported "return outside fn body"))))
 
 (defun lower-if (stmt)
   (let ((c (lower-expr (getf (cdr stmt) :cond)))
@@ -1344,7 +1409,7 @@
                   ;; including head — recurse on every cons cell.
                   (reduce (lambda (a x) (collect-fields x a))
                           form :initial-value acc)))))
-      (dolist (probe (rest script))
+      (dolist (probe (script-probes script))
         (let ((body (getf (cdr probe) :body)))
           (dolist (spec (getf (cdr probe) :specs))
             (when (eq (first spec) :tracepoint)
@@ -1401,7 +1466,7 @@
                 t)
                (t (some #'walk form)))))
     (some (lambda (probe) (walk (getf (cdr probe) :body)))
-          (rest script))))
+          (script-probes script))))
 
 (defun script-uses-printf-p (script)
   "T iff the script calls any function that emits a bt-print record
@@ -1417,7 +1482,7 @@
                 t)
                (t (some #'walk form)))))
     (some (lambda (probe) (walk (getf (cdr probe) :body)))
-          (rest script))))
+          (script-probes script))))
 
 (defun script-uses-kstack-p (script)
   "T iff `kstack' or `ustack' appears anywhere — gates injection of
@@ -1428,7 +1493,7 @@
                ((or (eq (first form) :kstack) (eq (first form) :ustack)) t)
                (t (some #'walk form)))))
     (some (lambda (probe) (walk (getf (cdr probe) :body)))
-          (rest script))))
+          (script-probes script))))
 
 (defun generate (script)
   "Translate normalised SCRIPT to a plist:
@@ -1444,6 +1509,9 @@
          (*printf-table* nil)
          (*printf-id-counter* 0)
          (*map-id-table* nil)
+         (*user-functions* (loop for fn in (script-functions script)
+                                 collect (cons (getf (cdr fn) :name)
+                                               (cdr fn))))
          (map-table (infer-maps script))
          (*map-table* map-table)
          (maps      (loop for info being the hash-values of map-table
@@ -1469,7 +1537,7 @@
          (probes    nil)
          (user      nil)
          (tp-preamble (gen-deftracepoint-preamble script)))
-    (loop for probe in (rest script)
+    (loop for probe in (script-probes script)
           for i from 0
           do (multiple-value-bind (kforms us) (gen-probe-forms probe i)
                (setf probes (append probes kforms)

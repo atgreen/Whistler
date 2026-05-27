@@ -104,10 +104,30 @@
 
 (defun normalize (raw)
   "Convert the iparse parse tree RAW into the typed AST, then apply
-   post-parse rewrites (auto-prepend pid to ustack-keyed maps)."
+   post-parse rewrites (auto-prepend pid to ustack-keyed maps).
+   Top-level forms may be probes or function definitions; both are
+   collected into the (:script ...) list."
   (assert (eq (tag-of raw) :script) (raw) "expected :SCRIPT root, got ~S" (tag-of raw))
   (rewrite-ustack-pids
-   (cons :script (mapcar #'norm-probe (all-tagged raw :probe)))))
+   (cons :script
+         (loop for top in (all-tagged raw :top-form)
+               for inner = (find-if #'consp (children-of top))
+               collect (ecase (tag-of inner)
+                         (:probe    (norm-probe inner))
+                         (:function (norm-function inner)))))))
+
+(defun norm-function (node)
+  "Convert a function definition into (:function :name … :params (…) :body (…))."
+  (let* ((name-node  (first-tagged node :ident))
+         (params-node (first-tagged node :param-list))
+         (block-node  (first-tagged node :block))
+         (params (when params-node
+                   (loop for p in (all-tagged params-node :param)
+                         collect (text-of (first-tagged p :ident))))))
+    (list :function
+          :name (text-of name-node)
+          :params params
+          :body (norm-block block-node))))
 
 ;;; ========== Post-parse: auto-prepend pid to ustack keys ==========
 ;;;
@@ -211,6 +231,12 @@
   (let ((inner (first (remove-if-not #'consp (children-of node)))))
     (ecase (tag-of inner)
       (:if-stmt      (norm-if inner))
+      (:return-stmt
+       (let ((expr-node (find-if (lambda (c) (and (consp c)
+                                                  (not (eq (tag-of c) :ident))))
+                                 (children-of inner))))
+         (list :return :expr (when expr-node
+                               (norm-expr-or-expr-wrapped expr-node)))))
       (:assign-stmt  (norm-assign inner))
       (:expr-stmt    (list :expr (norm-expr-or-expr-wrapped
                                   (first (remove-if-not #'consp (children-of inner)))))))))

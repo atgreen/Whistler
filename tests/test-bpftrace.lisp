@@ -315,3 +315,32 @@
     (is (search "PROBE-READ-KERNEL" text))
     (is (search "STRUCT-ALLOC 2" text)
         "skc_family is u16 — 2-byte scratch buffer")))
+
+(test parse-user-fn
+  "fn defines parse and round-trip through normalize."
+  (let* ((ast (whistler/bpftrace::normalize
+               (whistler/bpftrace::parse-script
+                "fn dub($x) { return $x * 2; }
+                 kprobe:foo { @ = dub(1); }")))
+         (forms (rest ast)))
+    (is (= 2 (length forms)))
+    (let ((fn (find :function forms :key #'first)))
+      (is (string= "dub" (getf (cdr fn) :name)))
+      (is (equal '("x") (getf (cdr fn) :params))))))
+
+(test codegen-user-fn-inlined
+  "fn calls inline at codegen time — body is substituted for params."
+  (let* ((src "fn dub($x) { return $x * 2; }
+               kprobe:vfs_read { @ = dub(arg2); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (text (format nil "~S" (cdddr (first (getf gen :progs))))))
+    (is (search "* (WHISTLER:PT-REGS-PARM3) 2"
+                (string-upcase text)))
+    (is (not (search "dub" text)))))
+
+(test codegen-user-fn-arity-mismatch
+  "Calling a fn with wrong arity raises BPFTRACE-UNSUPPORTED."
+  (signals whistler/bpftrace:bpftrace-unsupported
+    (whistler/bpftrace:compile-script
+     "fn id($x) { return $x; }
+      kprobe:foo { @ = id(1, 2); }")))
