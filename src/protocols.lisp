@@ -800,10 +800,12 @@
               ;; the array bytes (same as TP-NAME-PTR). Lets
               ;; `args.disk_name' / `args.name' flow through to
               ;; printf %s without the caller needing to switch to
-              ;; the -PTR form.
+              ;; the -PTR form. Uses (ctx-ptr) (raw context pointer)
+              ;; instead of (ctx u64 0) so we don't synthesise a
+              ;; verifier-rejected u64 load of the common header.
               ((plusp array-size)
                (push `(defmacro ,accessor ()
-                        '(+ (ctx u64 0) ,offset))
+                        '(+ (ctx-ptr) ,offset))
                      forms)))
             ;; For array fields, also keep the -ptr alias.
             (when (plusp array-size)
@@ -811,6 +813,6 @@
                                              (string-upcase lisp-name))
                                       (symbol-package category/event))))
                 (push `(defmacro ,ptr-name ()
-                         '(+ (ctx u64 0) ,offset))
+                         '(+ (ctx-ptr) ,offset))
                       forms))))))
       `(progn ,@(nreverse forms)))))
