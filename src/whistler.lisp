@@ -953,7 +953,7 @@
   (format t "  -e PROGRAM     Inline script text (instead of a file)~%")
   (format t "  -l [PATTERN]   List kernel probes matching PATTERN (no script needed)~%")
   (format t "  -p PID         Inject `/pid == PID/' filter into every probe~%")
-  (format t "  -c 'CMD'       Spawn CMD and trace only its pid (implies -p)~%")
+  (format t "  -c 'CMD'       Spawn CMD and exit the tracer when it terminates~%")
   (format t "  --dump         Print generated Whistler forms and exit (no kernel load)~%")
   (format t "  -V, --version  Show version~%")
   (format t "  -h, --help     Show this help~%")
@@ -1017,15 +1017,23 @@
                                        "Error: -c requires a command string~%")
                                (uiop:quit 1)))))
          (source (read-bpftrace-source args e-pos p-pos c-pos))
-         ;; -c spawns the child *first* so we can pin its real pid into
-         ;; the filter. Otherwise pid-arg (if any) is final.
+         ;; -c spawns the child. We bind it in the runtime dynvar so
+         ;; the poll loop exits when the child exits (matching
+         ;; bpftrace). Unlike -p we *don't* auto-inject a pid filter —
+         ;; bpftrace doesn't either; if the user wants only the child's
+         ;; pid they pass both -c and -p.
          (child-process (when cmd-arg (spawn-traced-process cmd-arg)))
-         (pid (or (and child-process (sb-ext:process-pid child-process)) pid-arg))
-         (filter-var (find-symbol "*PID-FILTER*" '#:whistler/bpftrace)))
-    ;; Dynbind the bpftrace filter dynvar across compile + run. The
-    ;; codegen pass adds `pid == PID' to every probe's predicate.
-    (progv (if (and pid filter-var) (list filter-var) '())
-           (if (and pid filter-var) (list pid) '())
+         (filter-var  (find-symbol "*PID-FILTER*"    '#:whistler/bpftrace))
+         (child-var   (find-symbol "*CHILD-PROCESS*" '#:whistler/bpftrace))
+         (hook-var    (find-symbol "*POST-ATTACH-HOOK*" '#:whistler/bpftrace))
+         (release-thunk (when child-process
+                          (lambda () (release-traced-process child-process)))))
+    (progv (remove nil (list (when pid-arg     filter-var)
+                              (when child-process child-var)
+                              (when release-thunk hook-var)))
+           (remove nil (list (when pid-arg     pid-arg)
+                              (when child-process child-process)
+                              (when release-thunk release-thunk)))
       (cond
         (dump-p
          (let ((gen (funcall (find-symbol "COMPILE-SCRIPT" '#:whistler/bpftrace) source))
@@ -1038,11 +1046,15 @@
            (format t "~&;; ----- user-side probes (BEGIN/END/interval) -----~%")
            (format t "~S~%" (getf gen :user-probes))))
         (t
+         (when child-process
+           (format t ";; -c spawned pid ~D — tracing until it exits.~%"
+                   (sb-ext:process-pid child-process))
+           (force-output))
          (unwind-protect
               (funcall (find-symbol "RUN" '#:whistler/bpftrace) source)
-           (when child-process
-             (handler-case (sb-ext:process-wait child-process)
-               (error () nil)))))))))
+           (when (and child-process (sb-ext:process-alive-p child-process))
+             (handler-case (sb-ext:process-kill child-process 15) (error () nil))
+             (handler-case (sb-ext:process-wait child-process) (error () nil)))))))))
 
 (defun read-bpftrace-source (args e-pos p-pos c-pos)
   "Resolve the script source: -e takes precedence; otherwise the first
@@ -1072,10 +1084,29 @@
              (subseq buf 0 n))))))))
 
 (defun spawn-traced-process (cmd)
-  "Spawn CMD via /bin/sh -c and return the sb-ext:process. The probes
-   attach against this child's pid; we wait for the child to exit
-   before unwinding the bpftrace runtime."
-  (sb-ext:run-program "/bin/sh" (list "-c" cmd)
-                      :wait nil
-                      :output t :error t :input nil))
+  "Spawn CMD via /bin/sh -c, but make the child block until the
+   parent has attached its probes. We launch
+     sh -c 'read _; exec sh -c CMD'
+   so the inner sh blocks on `read' from its stdin until we write a
+   newline (after attach). bpftrace uses PTRACE_TRACEME + SIGSTOP for
+   the same effect; pipe-block is the no-ptrace shortcut and is
+   sufficient because we only need to defer the first exec, not single-
+   step the child."
+  (sb-ext:run-program
+   "/bin/sh"
+   (list "-c"
+         (format nil "read _; exec /bin/sh -c ~S" cmd))
+   :wait nil
+   :input :stream
+   :output t :error t))
+
+(defun release-traced-process (process)
+  "Unblock the child spawned by spawn-traced-process: write a newline
+   to its stdin to satisfy the leading `read', then close so the
+   inner exec runs."
+  (let ((in (sb-ext:process-input process)))
+    (when in
+      (write-line "" in)
+      (force-output in)
+      (close in))))
 

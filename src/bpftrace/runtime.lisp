@@ -373,25 +373,27 @@
 (defun bignum->comm-string (key)
   "Treat KEY as 16 little-endian bytes (a `comm' value) and convert
    the prefix up to the first NUL byte to a Lisp string."
-  (let ((bytes (loop for i below 16
+  (bignum->string key 16))
+
+(defun bignum->string (key max-bytes)
+  "Treat KEY as MAX-BYTES little-endian bytes (a str()/comm-style key)
+   and return the prefix up to the first NUL as a Lisp string."
+  (let ((bytes (loop for i below max-bytes
                      collect (logand (ash key (* i -8)) #xff))))
-    (let ((end (or (position 0 bytes) 16)))
+    (let ((end (or (position 0 bytes) max-bytes)))
       (sb-ext:octets-to-string
        (coerce (subseq bytes 0 end) '(simple-array (unsigned-byte 8) (*)))
        :external-format :utf-8))))
 
 (defun format-key (key &key (parts 1) key-builtin)
   "Render KEY (an integer) as bpftrace does.
-   * scalar (PARTS=1): bare decimal — unless KEY-BUILTIN is :comm,
-     in which case it's actually a 16-byte string masquerading as
-     a 2-part integer that the caller forgot to split. (We won't
-     hit this case in practice; the caller splits first.)
-   * composite (PARTS>1): split into 8-byte chunks and render. When
-     KEY-BUILTIN is :comm, the whole 16-byte key is a single string,
-     not two integer slots — render it as ASCII."
+   * KEY-BUILTIN :comm or :str — KEY's PARTS*8 little-endian bytes
+     are a NUL-padded string.
+   * scalar (PARTS=1): bare decimal.
+   * composite (PARTS>1): split into 8-byte chunks and render."
   (cond
-    ((eq key-builtin :comm)
-     (format nil "~A" (bignum->comm-string key)))
+    ((or (eq key-builtin :comm) (eq key-builtin :str))
+     (format nil "~A" (bignum->string key (* parts 8))))
     ((<= parts 1) (format nil "~D" key))
     (t
      (with-output-to-string (s)
@@ -657,6 +659,18 @@
 ;;; ========== The runtime entry ==========
 
 (defvar *bpftrace-running* nil)
+
+(defvar *child-process* nil
+  "When non-NIL, the sb-ext:process spawned via `-c CMD'. The main
+   poll loop exits as soon as this child exits — matching bpftrace's
+   behaviour where the spawned command's lifetime defines the trace
+   window.")
+
+(defvar *post-attach-hook* nil
+  "Optional thunk called once, immediately after all probes attach
+   and just before the poll loop starts. Used by the CLI's `-c CMD'
+   flow to release the pipe-blocked child so it runs with probes
+   already in place.")
 
 (defun exit-flag-set-p (exit-info)
   "Read the hidden bt-exit map and return T if the kernel side set the
@@ -1083,12 +1097,20 @@
                    ;; Attach all real probes.
                    (dolist (entry attach-progs)
                      (push (attach-probe (cdr entry)) atts))
+                   ;; Probes are live — let any waiting external code
+                   ;; (e.g. the CLI's pipe-blocked -c child) proceed.
+                   (when *post-attach-hook*
+                     (handler-case (funcall *post-attach-hook*)
+                       (error () nil)))
                    ;; Poll-sleep until interrupted or exit() fires.
                    ;; Drain the printf ringbuf on every tick.
                    (setf *bpftrace-running* t)
                    (handler-case
                        (loop while (and *bpftrace-running*
-                                        (not (exit-flag-set-p exit-info)))
+                                        (not (exit-flag-set-p exit-info))
+                                        (not (and *child-process*
+                                                  (not (sb-ext:process-alive-p
+                                                        *child-process*)))))
                              do (if ring-consumer
                                     (whistler/loader::ring-poll
                                      ring-consumer :timeout-ms 100)

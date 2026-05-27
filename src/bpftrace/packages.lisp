@@ -18,4 +18,6 @@
    #:bpftrace-parse-error
    #:bpftrace-unsupported
    ;; CLI knobs
-   #:*pid-filter*))
+   #:*pid-filter*
+   #:*child-process*
+   #:*post-attach-hook*))

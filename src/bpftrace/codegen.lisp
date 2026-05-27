@@ -71,6 +71,14 @@
                   (setf (gethash c-name table) size))))))))
     table))
 
+(defun str-key-size (expr)
+  "Size (in bytes) of a str()/kstr() call when used as a map key —
+   the explicit second arg, or +bt-str-default-len+ when omitted."
+  (let* ((args (getf (cdr expr) :args))
+         (n    (when (and (cdr args) (eq (first (second args)) :int))
+                 (second (second args)))))
+    (or n +bt-str-default-len+)))
+
 (defun expr-size (expr)
   "Best-effort byte-size for EXPR when used as a map key. Must match
    what the lowering will store on the stack — a mismatch trips the
@@ -85,6 +93,10 @@
     (:comm    16)
     (:kstack  4)
     (:ustack  4)
+    (:call
+     (cond
+       ((or (str-call-p expr) (kstr-call-p expr)) (str-key-size expr))
+       (t 8)))
     (:field
      (let ((name (getf (cdr expr) :name)))
        (cond
@@ -132,8 +144,15 @@
         (offset 0))
     (values
      (loop for e in keys
-           for size = (if (eq (first e) :comm) +bt-comm-len+ 8)
-           for type = (if (eq (first e) :comm) u8 u64)
+           for size = (cond
+                        ((eq (first e) :comm) +bt-comm-len+)
+                        ((or (str-call-p e) (kstr-call-p e))
+                         (str-key-size e))
+                        (t 8))
+           for type = (cond
+                        ((eq (first e) :comm) u8)
+                        ((or (str-call-p e) (kstr-call-p e)) u8)
+                        (t u64))
            collect (list offset size type e)
            do (incf offset size))
      offset)))
@@ -146,6 +165,8 @@
     (:comm    :comm)
     (:kstack  :kstack)
     (:ustack  :ustack)
+    (:call    (cond ((or (str-call-p expr) (kstr-call-p expr)) :str)
+                    (t nil)))
     (t        nil)))
 
 (defun infer-maps (script)
@@ -167,14 +188,15 @@
                      (keys (getf (cdr mref) :keys)))
                  (when keys
                    (setf (minfo-keyed-p info) t)
-                   ;; A single non-:comm key follows with-key's scalar
+                   ;; A single scalar key follows with-key's scalar
                    ;; path — the lowering stores it at its natural
                    ;; width via map-update (`expr-size'). Composite
-                   ;; (or :comm) keys go through the struct-key path
-                   ;; where every slot is u64, so use the layout total.
+                   ;; or string-typed keys (comm/str/kstr) go through
+                   ;; the struct-key path where every slot is u64
+                   ;; (or a wider byte buffer), so use the layout total.
                    (let ((total
                            (if (and (= (length keys) 1)
-                                    (not (eq (first (first keys)) :comm)))
+                                    (not (keys-need-ptr-ops-p keys)))
                                (expr-size (first keys))
                                (multiple-value-bind (_layout total)
                                    (composite-key-layout keys)
@@ -907,11 +929,26 @@
 
 (defun store-key-component (buf offset type expr)
   "Emit the kernel form that fills (buf+offset, size-of-type) with EXPR's
-   value. `comm' uses bpf_get_current_comm; everything else is a plain
-   store of the lowered expression."
-  (if (eq (first expr) :comm)
-      `(whistler::get-current-comm (+ ,buf ,offset) ,+bt-comm-len+)
-      `(whistler::store ,type ,buf ,offset ,(lower-expr expr))))
+   value. String-typed slots (comm / str / kstr) fill the buffer via
+   their helper; everything else is a plain typed store."
+  (cond
+    ((eq (first expr) :comm)
+     `(whistler::get-current-comm (+ ,buf ,offset) ,+bt-comm-len+))
+    ((or (str-call-p expr) (kstr-call-p expr))
+     (let* ((args (getf (cdr expr) :args))
+            (ptr  (lower-expr (first args)))
+            (size (str-key-size expr))
+            (helper (if (str-call-p expr)
+                        (intern "PROBE-READ-USER-STR"   :whistler)
+                        (intern "PROBE-READ-KERNEL-STR" :whistler))))
+       ;; Zero the slot first so any bytes past the str()'s NUL stay
+       ;; defined — the BPF verifier rejects a map_update whose key
+       ;; buffer has uninitialised bytes (probe_read_user_str only
+       ;; writes up to and including the trailing NUL).
+       `(progn
+          (whistler::memset ,buf ,offset 0 ,size)
+          (,helper (+ ,buf ,offset) ,size ,ptr))))
+    (t `(whistler::store ,type ,buf ,offset ,(lower-expr expr)))))
 
 (defun with-key (keys body-fn)
   "Run BODY-FN with the form to use as a map key. For an empty key
@@ -925,7 +962,7 @@
     ((null keys)
      (funcall body-fn 0))
     ((and (= (length keys) 1)
-          (not (eq (first (first keys)) :comm)))
+          (not (keys-need-ptr-ops-p keys)))
      (funcall body-fn (lower-expr (first keys))))
     (t
      (multiple-value-bind (layout total) (composite-key-layout keys)
@@ -1102,11 +1139,15 @@
 
 (defun keys-need-ptr-ops-p (keys)
   "T iff the keys form requires the kernel -ptr map ops (whistler's
-   struct-key path). Triggered by composite keys or a single `comm'
-   key — both produce a stack buffer pointer rather than a u64."
+   struct-key path). Triggered by composite keys or by a single
+   string-typed key (`comm', `str(…)', `kstr(…)') — all of these
+   produce a stack buffer pointer rather than a u64."
   (or (> (length keys) 1)
       (and (= (length keys) 1)
-           (eq (first (first keys)) :comm))))
+           (let ((k (first keys)))
+             (or (eq (first k) :comm)
+                 (str-call-p k)
+                 (kstr-call-p k))))))
 
 (defun gen-percpu-struct-update (mname keys value-form &key on-existing on-init)
   "Common scaffolding for sum/avg/min/max — all of which use a percpu
