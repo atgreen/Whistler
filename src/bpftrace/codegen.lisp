@@ -1127,20 +1127,38 @@
     (t                                     nil)))
 
 (defun rewrite-self-refs (form probe-string func-string)
-  "Walk FORM (an AST), replacing (:PROBE-NAME) with the literal string
-   PROBE-STRING and (:FUNC) with FUNC-STRING. Inside printf args these
-   become :str nodes, so printf's string-slot machinery handles them
-   with no special-casing on the kernel side."
-  (cond
-    ((not (consp form)) form)
-    ((and (eq (first form) :probe-name) (null (rest form)))
-     (list :str probe-string))
-    ((and (eq (first form) :func) (null (rest form)))
-     (cond
-       (func-string (list :str func-string))
-       (t (unsupported "`func' is undefined for this probe type"))))
-    (t (cons (rewrite-self-refs (first form) probe-string func-string)
-             (rewrite-self-refs (rest form)  probe-string func-string)))))
+  "Walk FORM (an AST). Inside printf calls, rewrite (:PROBE-NAME) and
+   (:FUNC) to (:str ...) so they flow through the printf string-slot
+   path. Outside printf they stay as the original builtin nodes —
+   using them as a map key, predicate, or arithmetic operand isn't
+   supported yet (only string-typed printf args). lower-expr's existing
+   :probe-name/:func handlers raise BPFTRACE-UNSUPPORTED for those."
+  (labels ((rewrite-printf-arg (arg)
+             (cond
+               ((not (consp arg)) arg)
+               ((and (eq (first arg) :probe-name) (null (rest arg)))
+                (list :str probe-string))
+               ((and (eq (first arg) :func) (null (rest arg)))
+                (cond
+                  (func-string (list :str func-string))
+                  (t (unsupported "`func' is undefined for this probe type"))))
+               ;; Recurse so nested cases (e.g. ksym(reg("ip")) is fine,
+               ;; though there's no nested probe/func use case we know
+               ;; of) still get processed.
+               (t (cons (rewrite-printf-arg (first arg))
+                        (rewrite-printf-arg (rest arg))))))
+           (walk (f)
+             (cond
+               ((not (consp f)) f)
+               ;; printf(... fmt, args ...) — rewrite each arg only.
+               ((and (eq (first f) :call)
+                     (let ((n (getf (cdr f) :name)))
+                       (and (stringp n) (string= n "printf"))))
+                (let* ((args   (getf (cdr f) :args))
+                       (new    (mapcar #'rewrite-printf-arg args)))
+                  (list :call :name "printf" :args new)))
+               (t (cons (walk (first f)) (walk (rest f)))))))
+    (walk form)))
 
 (defun gen-kernel-prog (spec pred body index sub)
   (multiple-value-bind (ptype section) (spec->section spec)
