@@ -171,10 +171,17 @@
 (defparameter *grammar-source*
   "
   script         = <ws> top-form (<ws> top-form)* <ws>
-  top-form       = function / probe
+  top-form       = function / config-block / probe
   function       = <'fn'> <ws> ident <ws> <'('> <ws> param-list? <ws> <')'> <ws> block
   param-list     = param (<ws> <','> <ws> param)*
   param          = <'$'> ident
+
+  (* bpftrace 0.21+ config block: a top-level `config = { … }' that
+     sets runtime knobs (missing_probes, max_strlen, etc.). We
+     accept-and-ignore — the contents are skipped at AST time so
+     the runtime defaults apply. *)
+  config-block   = <'config'> <ws> <'='> <ws> <'{'> config-body <'}'>
+  config-body    = #'[^}]*'
 
   probe          = probe-specs <ws> predicate? <ws> block
   probe-specs    = probe-spec (<ws> <','> <ws> probe-spec)*

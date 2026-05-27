@@ -112,9 +112,13 @@
    (cons :script
          (loop for top in (all-tagged raw :top-form)
                for inner = (find-if #'consp (children-of top))
-               collect (ecase (tag-of inner)
-                         (:probe    (norm-probe inner))
-                         (:function (norm-function inner)))))))
+               for result = (case (tag-of inner)
+                              (:probe        (norm-probe inner))
+                              (:function     (norm-function inner))
+                              (:config-block nil)  ; accept-and-ignore
+                              (t (error "unexpected top-form: ~S"
+                                        (tag-of inner))))
+               when result collect it))))
 
 (defun norm-function (node)
   "Convert a function definition into (:function :name … :params (…) :body (…))."
