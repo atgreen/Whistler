@@ -95,6 +95,12 @@
                          (#.+btf-kind-var+ 4)
                          (#.+btf-kind-datasec+ (* vlen 12))
                          (#.+btf-kind-enum64+ (* vlen 12))
+                         ;; BTF_KIND_DECL_TAG (17) carries a single
+                         ;; __s32 component_idx after the header.
+                         ;; Without consuming it, every type record
+                         ;; past the first decl_tag desyncs and
+                         ;; type-ids index junk.
+                         (17 4)
                          (t 0))))))
         (make-vmlinux-btf :strtab strtab :types types :type-data type-data)))))
 

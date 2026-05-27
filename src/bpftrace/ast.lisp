@@ -413,6 +413,7 @@
       ((string= name "comm")    '(:comm))
       ((string= name "probe")   '(:probe-name))
       ((string= name "func")    '(:func))
+      ((string= name "curtask") '(:curtask))
       ((string= name "kstack")  '(:kstack))
       ((string= name "ustack")  '(:ustack))
       ((and (>= (length name) 4) (string= (subseq name 0 3) "arg")

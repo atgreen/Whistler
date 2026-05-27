@@ -275,3 +275,20 @@
   ;; Underscores and digits pass through unmodified.
   (is (string= "^__x64_sys_open$"
                (whistler/bpftrace::glob-to-regex "__x64_sys_open"))))
+
+(test codegen-curtask-pid
+  "curtask->pid lowers to a BTF-resolved probe_read_kernel of u32 at
+   task_struct's pid offset."
+  (let* ((src "kprobe:vfs_read { printf(\"%d\\n\", curtask->pid); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (text (format nil "~S" (cdddr (first (getf gen :progs))))))
+    (is (search "PROBE-READ-KERNEL" text))
+    (is (search "GET-CURRENT-TASK" text))
+    (is (search "STRUCT-ALLOC 4" text)
+        "pid is u32 — 4-byte scratch buffer")))
+
+(test codegen-curtask-unknown-field
+  "curtask->bogus signals with the actual field set."
+  (signals whistler/bpftrace:bpftrace-unsupported
+    (whistler/bpftrace:compile-script
+     "kprobe:vfs_read { @ = curtask->no_such_field; }")))
