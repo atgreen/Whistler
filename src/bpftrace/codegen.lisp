@@ -1134,16 +1134,17 @@
       ((and (consp base) (eq (first base) :args))
        (lower-args-field name))
       ((and (consp base) (eq (first base) :curtask))
-       ;; A single field off curtask uses the simple scalar path; the
-       ;; chained-field path also covers it but the offsets-only walk
-       ;; covers more cases (`curtask.mm.start_code') downstream.
-       (let ((tname (cdr (assoc "task_struct" '(("task_struct" . "task_struct"))
-                                :test #'string=))))
-         (declare (ignore tname))
-         (lower-struct-pointer-field "task_struct" name
-                                     '(whistler::get-current-task))))
-      ;; ((struct NAME *)EXPR)->FIELD — type comes from the cast.
-      ((and (consp base) (eq (first base) :cast))
+       (lower-struct-pointer-field "task_struct" name
+                                   '(whistler::get-current-task)))
+      ;; ((struct NAME *)EXPR)->FIELD — when the cast directly wraps a
+      ;; plain value (not another field-chain), use the cast type as
+      ;; the struct for this single-hop access. A cast wrapping a
+      ;; field-chain (e.g. `(struct cgroup *)$memcg.css.cgroup') is
+      ;; just a type annotation for the chain's result — falls through
+      ;; to the :field-chain handler below.
+      ((and (consp base) (eq (first base) :cast)
+            (not (and (consp (getf (cdr base) :expr))
+                      (eq (first (getf (cdr base) :expr)) :field))))
        (lower-struct-pointer-field (getf (cdr base) :type) name
                                    (lower-expr (getf (cdr base) :expr))))
       ;; $var with a recorded cast type — `$sk = (struct sock *)retval;'
@@ -1154,9 +1155,13 @@
         (cdr (assoc (second base) *var-types* :test #'string=))
         name (lower-expr base)))
       ;; Chained field access — e.g. `$sk.__sk_common.skc_family'.
-      ;; Walk inward collecting names; require the root to carry a
-      ;; known struct type via *var-types* or :cast / :curtask.
-      ((and (consp base) (eq (first base) :field))
+      ;; Also catches a :cast whose :expr is itself a field-chain: the
+      ;; cast's type only annotates the chain's result, so we descend
+      ;; past the cast to find the chain's true root.
+      ((or (and (consp base) (eq (first base) :field))
+           (and (consp base) (eq (first base) :cast)
+                (consp (getf (cdr base) :expr))
+                (eq (first (getf (cdr base) :expr)) :field)))
        (multiple-value-bind (root struct-name names)
            (collect-field-chain expr)
          (cond
@@ -1178,19 +1183,25 @@
   "Walk a (possibly nested) :field expression to its root. Returns
    (values ROOT-AST ROOT-STRUCT-NAME FIELD-NAMES) where FIELD-NAMES
    is the list of dotted names from outermost-base to leaf. Returns
-   (nil nil nil) if no struct type can be inferred for the root."
+   (nil nil nil) if no struct type can be inferred for the root.
+   :cast nodes encountered mid-chain are unwrapped — the cast type
+   annotates the chain's *result* for downstream use, not the source,
+   so we descend into the cast's :expr and continue walking."
   (labels ((walk (e)
              (cond
                ((and (consp e) (eq (first e) :field))
                 (multiple-value-bind (r rs names) (walk (getf (cdr e) :base))
                   (values r rs (append names (list (getf (cdr e) :name))))))
+               ;; Mid-chain cast: skip past it, but if we have no other
+               ;; struct-type hint upstream we'll fall back on the cast's
+               ;; type at the root-resolution step below.
+               ((and (consp e) (eq (first e) :cast))
+                (walk (getf (cdr e) :expr)))
                (t (values e nil nil)))))
     (multiple-value-bind (root _rs names) (walk expr)
       (declare (ignore _rs))
       (let ((struct-name
               (cond
-                ((and (consp root) (eq (first root) :cast))
-                 (getf (cdr root) :type))
                 ((and (consp root) (eq (first root) :curtask))
                  "task_struct")
                 ((and (consp root) (eq (first root) :var))
@@ -1226,10 +1237,10 @@
             (incf total-offset offset)
             (cond
               ;; Embedded struct/union — keep walking.
-              ((and (null bpf-type) sub-name (not (eq fname (car (last chain)))))
+              ((and (null bpf-type) sub-name (not (string= fname (car (last chain)))))
                (setf current sub-name))
               ;; Scalar leaf.
-              ((and (eq fname (car (last chain)))
+              ((and (string= fname (car (last chain)))
                     (member size '(1 2 4 8)))
                (setf final-size size)
                (setf final-type (case size
@@ -1832,14 +1843,24 @@
     (walk form)))
 
 (defun infer-var-types (stmts)
-  "Walk STMTS for `$v = (struct X *)EXPR' assignments and return an
-   alist (\"v\" . \"X\"). Loose: only the immediate :cast on the RHS
-   is recognised; intermediate arithmetic on the cast is skipped."
+  "Walk STMTS for `$v = (struct X *)EXPR' (or any RHS that contains
+   a cast at its outermost reachable position) and return an alist
+   (\"v\" . \"X\"). Looks past :field wrappers — bpftrace
+   `(struct X *)$y.a.b' parses with the cast inside the chain, but
+   its annotation still tells us $v's type for downstream uses."
   (let ((acc nil))
-    (labels ((maybe-record (lhs rhs)
-               (when (and (consp lhs) (eq (first lhs) :var)
-                          (consp rhs) (eq (first rhs) :cast))
-                 (push (cons (second lhs) (getf (cdr rhs) :type)) acc)))
+    (labels ((rhs-cast-type (rhs)
+               (cond
+                 ((not (consp rhs)) nil)
+                 ((eq (first rhs) :cast) (getf (cdr rhs) :type))
+                 ((eq (first rhs) :field)
+                  (rhs-cast-type (getf (cdr rhs) :base)))
+                 (t nil)))
+             (maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var))
+                 (let ((ty (rhs-cast-type rhs)))
+                   (when ty
+                     (push (cons (second lhs) ty) acc)))))
              (walk (s)
                (case (first s)
                  (:assign (maybe-record (getf (cdr s) :lhs)
