@@ -1333,9 +1333,19 @@
                    ;; so its output prints before the main loop starts.
                    (when ring-consumer
                      (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
-                   ;; Attach all real probes.
+                   ;; Attach all real probes. Individual attach
+                   ;; failures (e.g. an alternate-target like
+                   ;; `uprobe:libpthread:pthread_create' on a kernel
+                   ;; where the symbol moved into libc) are logged
+                   ;; and skipped; we keep going so the surviving
+                   ;; targets in a comma-separated probe list still
+                   ;; attach.
                    (dolist (entry attach-progs)
-                     (push (attach-probe (cdr entry)) atts))
+                     (handler-case
+                         (push (attach-probe (cdr entry)) atts)
+                       (error (e)
+                         (format *error-output* "~A~%" e)
+                         (force-output *error-output*))))
                    ;; Probes are live — let any waiting external code
                    ;; (e.g. the CLI's pipe-blocked -c child) proceed.
                    (when *post-attach-hook*
