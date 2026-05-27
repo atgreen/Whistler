@@ -191,10 +191,15 @@
   uprobe-spec    = <'uprobe'> <':'> upath <':'> ident
   uretprobe-spec = <'uretprobe'> <':'> upath <':'> ident
   upath          = #'[A-Za-z0-9_./-]+'
-  tracepoint-spec= <'tracepoint'> <':'> ident <':'> ident
-  interval-spec  = <'interval'> <':'> interval-unit <':'> integer
-  profile-spec   = <'profile'> <':'> interval-unit <':'> integer
-  interval-unit  = 's' / 'ms' / 'us' / 'hz'
+  tracepoint-spec= <'tracepoint'> <':'> glob-ident <':'> glob-ident
+  (* Either form is accepted:
+       interval:s:1          -- traditional unit:count
+       interval:1s           -- count + unit suffix
+     Same for profile:.
+  *)
+  interval-spec  = <'interval'> <':'> (interval-unit <':'> integer / integer interval-unit)
+  profile-spec   = <'profile'> <':'> (interval-unit <':'> integer / integer interval-unit)
+  interval-unit  = 'ms' / 'us' / 's' / 'hz'
 
   predicate      = <'/'> <ws> expr <ws> <'/'>
 
@@ -233,12 +238,19 @@
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
-  primary        = cast / parens / func-call / map-access / scalar-var / builtin /
+  primary        = cast / primitive-cast / parens / func-call / map-access / scalar-var / builtin /
                    constant / string-lit / hex-int / integer
   (* C-style struct-pointer cast: open-paren struct ident asterisk
      close-paren expr. Must precede `parens' in the alternates so the
      open-paren disambiguation tries the cast shape first. *)
   cast           = <'('> <ws> <'struct'> <ws> ident <ws> <'*'> <ws> <')'> <ws> primary
+  (* Primitive C cast: (uint64)expr, (int)expr. Treated as a no-op
+     since all values are u64 in our IR; preserves bpftrace
+     compatibility for scripts that lean on integer narrowing. *)
+  primitive-cast = <'('> <ws> int-type-name <ws> <')'> <ws> primary
+  int-type-name  = 'uint64' / 'uint32' / 'uint16' / 'uint8' /
+                   'int64' / 'int32' / 'int16' / 'int8' /
+                   'uint' / 'int'
   (* Bare identifier — used for symbolic constants like AF_INET. Comes
      after builtin and func-call so those keywords / call shapes win
      when applicable. !ident-char anchors the boundary so identifier

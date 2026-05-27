@@ -202,7 +202,7 @@
              (text-of (first-tagged inner :upath))
              (text-of (first-tagged inner :ident))))
       (:tracepoint-spec
-       (let ((idents (all-tagged inner :ident)))
+       (let ((idents (all-tagged inner :glob-ident)))
          (list :tracepoint (text-of (first idents)) (text-of (second idents)))))
       (:interval-spec
        (let* ((unit-node (first-tagged inner :interval-unit))
@@ -394,6 +394,14 @@
                                     (children-of inner))))
          (list :cast :type type-name
                :expr (norm-expr-dispatch sub-primary))))
+      (:primitive-cast
+       ;; (uint64)x, (int)x — drop the type; every value is u64
+       ;; downstream, so the cast is purely textual.
+       (let ((sub (find-if (lambda (c)
+                             (and (consp c)
+                                  (not (eq (tag-of c) :int-type-name))))
+                           (children-of inner))))
+         (norm-expr-dispatch sub)))
       (:constant     (list :constant
                            (text-of (first-tagged inner :ident))))
       (:string-lit   (list :str (strip-quotes (text-of inner))))
