@@ -41,6 +41,9 @@
   value-string-p   ; T when the value slot is a NUL-padded string of
                    ;   `value-size' bytes (set by inference from a
                    ;   string-typed RHS — :str / :func / :probe-name).
+  value-struct     ; struct name (string) when the map stores a struct
+                   ;   pointer — `@m[k] = (struct sk_buff *)x' lets us
+                   ;   propagate the type to `\$v = @m[k]` reads.
   hist-params)     ; for :lhist, the list (MIN MAX STEP); NIL otherwise.
 
 (defun builtin-size (kw)
@@ -236,6 +239,12 @@
              (note-rhs (mref rhs)
                (let ((info (ensure mref)))
                  (cond
+                   ;; `@m[k] = (struct X *)expr' — remember the value
+                   ;; type so a later `\$v = @m[k]' can flow X into
+                   ;; *var-types* for chained field access.
+                   ((and (consp rhs) (eq (first rhs) :cast))
+                    (setf (minfo-value-struct info)
+                          (getf (cdr rhs) :type)))
                    ;; `@m[k] = :str LITERAL' — typically the result of
                    ;; rewrite-self-refs on a `func' / `probe' RHS.
                    ;; Size the value to hold the longest literal, plus
@@ -2115,9 +2124,10 @@
 (defun infer-var-types (stmts)
   "Walk STMTS for `$v = (struct X *)EXPR' (or any RHS that contains
    a cast at its outermost reachable position) and return an alist
-   (\"v\" . \"X\"). Looks past :field wrappers — bpftrace
-   `(struct X *)$y.a.b' parses with the cast inside the chain, but
-   its annotation still tells us $v's type for downstream uses."
+   (\"v\" . \"X\"). Also propagates types through map reads:
+   `$v = @m[k]' picks up @m's value-struct (set when the map was
+   first assigned a cast RHS), letting `$v.field' walks work
+   transparently across an in-kernel `stash + retrieve' hop."
   (let ((acc nil))
     (labels ((rhs-cast-type (rhs)
                (cond
@@ -2125,6 +2135,12 @@
                  ((eq (first rhs) :cast) (getf (cdr rhs) :type))
                  ((eq (first rhs) :field)
                   (rhs-cast-type (getf (cdr rhs) :base)))
+                 ;; `$v = @m[k]' — inherit the map's value-struct.
+                 ((eq (first rhs) :map)
+                  (let ((info (and *map-table*
+                                   (gethash (getf (cdr rhs) :name)
+                                            *map-table*))))
+                    (and info (minfo-value-struct info))))
                  (t nil)))
              (maybe-record (lhs rhs)
                (when (and (consp lhs) (eq (first lhs) :var))
