@@ -47,11 +47,26 @@
   :version "1.8.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
-  :depends-on ("whistler" "whistler/loader" "whistler/bpftrace")
+  :depends-on ("whistler" "whistler/loader"
+               "whistler/symbolize" "whistler/bpftrace")
   :build-operation "program-op"
   :build-pathname "whistler"
   :entry-point "whistler:main"
   :components ())
+
+(defsystem "whistler/symbolize"
+  :description "Standalone /proc/<pid>/maps + ELF symbolizer for user-stack resolution"
+  :version "0.1.0"
+  :author "Anthony Green <green@moxielogic.com>"
+  :license "MIT"
+  :depends-on ()
+  :serial t
+  :pathname "src/symbolize/"
+  :components ((:file "packages")
+               (:file "maps")
+               (:file "elf")
+               (:file "cache")
+               (:file "symbolize")))
 
 (defsystem "whistler/bpftrace"
   :description "bpftrace frontend — parses bpftrace scripts and compiles them via Whistler"
@@ -70,7 +85,8 @@
 
 (defsystem "whistler/tests"
   :description "Whistler test suite"
-  :depends-on ("whistler" "whistler/loader" "whistler/bpftrace" "fiveam")
+  :depends-on ("whistler" "whistler/loader" "whistler/symbolize"
+               "whistler/bpftrace" "fiveam")
   :serial t
   :pathname "tests/"
   :components ((:file "package")
@@ -89,4 +105,5 @@
                (:file "test-programs")
                (:file "test-regalloc")
                (:file "test-torture")
-               (:file "test-bpftrace")))
+               (:file "test-bpftrace")
+               (:file "test-symbolize")))
