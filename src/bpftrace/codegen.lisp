@@ -38,6 +38,9 @@
                    ;   NIL for scalar single-slot keys.
   keyed-p          ; T iff any access used [keys]. Scalar-only `@m =`
                    ;   maps stay NIL so the printer skips the `[…]`.
+  value-string-p   ; T when the value slot is a NUL-padded string of
+                   ;   `value-size' bytes (set by inference from a
+                   ;   string-typed RHS — :str / :func / :probe-name).
   hist-params)     ; for :lhist, the list (MIN MAX STEP); NIL otherwise.
 
 (defun builtin-size (kw)
@@ -233,6 +236,19 @@
              (note-rhs (mref rhs)
                (let ((info (ensure mref)))
                  (cond
+                   ;; `@m[k] = :str LITERAL' — typically the result of
+                   ;; rewrite-self-refs on a `func' / `probe' RHS.
+                   ;; Size the value to hold the longest literal, plus
+                   ;; one byte for the NUL terminator.
+                   ((and (consp rhs) (eq (first rhs) :str))
+                    (let* ((bytes (sb-ext:string-to-octets
+                                   (second rhs) :external-format :utf-8))
+                           (need (1+ (length bytes))))
+                      (setf (minfo-kind info) :scalar
+                            (minfo-value-string-p info) t
+                            (minfo-value-size info)
+                            (max (minfo-value-size info) need
+                                 +bt-func-name-key-len+))))
                    ((and (consp rhs) (eq (first rhs) :call))
                     (let ((fn (getf (cdr rhs) :name)))
                       (cond
@@ -986,6 +1002,15 @@
     ((and (eq (first expr) :var)
           (member (second expr) *ntop-vars* :test #'string-equal))
      :ipv-any)
+    ;; @m[k] where m's value slot is a NUL-padded string — the value
+    ;; lookup returns a pointer to value-size bytes the printf
+    ;; record-emitter copies wholesale.
+    ((and (eq (first expr) :map)
+          (let ((info (and *map-table*
+                           (gethash (getf (cdr expr) :name) *map-table*))))
+            (and info (minfo-value-string-p info))))
+     (let ((info (gethash (getf (cdr expr) :name) *map-table*)))
+       (cons :string (minfo-value-size info))))
     ((or (str-call-p expr) (kstr-call-p expr))
      (let* ((args (getf (cdr expr) :args))
             (n    (when (and (cdr args) (eq (first (second args)) :int))
@@ -1146,7 +1171,33 @@
          ;; Literal string — emit byte-stores. Used for probe/func
          ;; rewrites and any printf("…", "literal") form.
          ((eq (first arg) :str)
-          (lower-printf-string-literal rec off (second arg) size)))))))
+          (lower-printf-string-literal rec off (second arg) size))
+         ;; @m[k] on a string-valued map — look up the entry, then
+         ;; copy SIZE bytes from the value pointer into the record.
+         ;; Missing key (NULL pointer) → leave the slot untouched
+         ;; (init was zero, so the userspace decoder sees an empty
+         ;; string).
+         ((eq (first arg) :map)
+          (let* ((info (gethash (getf (cdr arg) :name) *map-table*))
+                 (mname (minfo-name info))
+                 (keys  (getf (cdr arg) :keys))
+                 (p     (gensym "P"))
+                 (ptr-p (keys-need-ptr-ops-p keys)))
+            (if ptr-p
+                (with-key keys
+                  (lambda (k)
+                    `(whistler:if-let
+                         (,p (whistler::map-lookup-ptr ,mname ,k))
+                       (whistler::probe-read-kernel
+                        (+ ,rec ,off) ,size ,p)
+                       0)))
+                (let ((tmpk (gensym "K")))
+                  `(let* ((,tmpk whistler::u64 ,(lower-expr (first keys))))
+                     (whistler:if-let
+                         (,p (whistler::map-lookup ,mname ,tmpk))
+                       (whistler::probe-read-kernel
+                        (+ ,rec ,off) ,size ,p)
+                       0)))))))))))
 
 (defun lower-printf-string-literal (rec off text size)
   "Emit the kernel-side stores that lay TEXT (UTF-8) into the SIZE-byte
@@ -1677,7 +1728,37 @@
               (destructuring-bind (lo hi step) params
                 (gen-lhist-update mname value-form lo hi step))))
            (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
+      ;; `@m[k] = "literal"' or `= func' (already rewritten to :str).
+      ;; The value slot is value-size bytes wide; lay out the literal
+      ;; and NUL-pad. Uses map-update-ptr via with-key's struct path
+      ;; (key gets the struct-key treatment via the now-wide map info).
+      ((and (consp rhs) (eq (first rhs) :str)
+            (minfo-value-string-p info))
+       (gen-string-set info keys (second rhs)))
       (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
+
+(defun gen-string-set (info keys literal)
+  "Store LITERAL as the NUL-padded contents of @MNAME[KEYS]. The map
+   was sized at infer time to hold value-string-p / value-size bytes.
+   map_update_elem needs a key pointer; for the (common) single
+   scalar-key case we stack-store the key first so we can take its
+   address."
+  (let* ((mname (minfo-name info))
+         (vsize (minfo-value-size info))
+         (buf   (gensym "VBUF"))
+         (tmpk  (gensym "K"))
+         (ptr-p (keys-need-ptr-ops-p keys)))
+    (with-key keys
+      (lambda (k)
+        (if ptr-p
+            `(let ((,buf (whistler::struct-alloc ,vsize)))
+               ,(lower-printf-string-literal buf 0 literal vsize)
+               (whistler::map-update-ptr ,mname ,k ,buf 0))
+            `(let* ((,tmpk whistler::u64 ,k)
+                    (,buf (whistler::struct-alloc ,vsize)))
+               ,(lower-printf-string-literal buf 0 literal vsize)
+               (whistler::map-update-ptr
+                ,mname (whistler::stack-addr ,tmpk) ,buf 0)))))))
 
 (defun gen-sum-update (mname keys value-form)
   "sum(x): incf the percpu-hash entry by x. The per-CPU storage means
@@ -1962,10 +2043,11 @@
     (t                                     nil)))
 
 (defun rewrite-self-refs (form probe-string func-string)
-  "Walk FORM (an AST). Inside printf calls AND inside map keys,
-   rewrite (:PROBE-NAME) and (:FUNC) to (:str ...) so they flow
-   through the string-slot machinery. Outside those two contexts
-   they stay as the original builtin nodes."
+  "Walk FORM (an AST). Inside printf calls, inside map keys, and as
+   the RHS of `@m[k] = func/probe' map assignments, rewrite
+   (:PROBE-NAME) and (:FUNC) to (:str …) so they flow through the
+   string-slot machinery. Outside those contexts they stay as the
+   original builtin nodes."
   (labels ((rewrite-leaf (arg)
              (cond
                ((not (consp arg)) arg)
@@ -1994,6 +2076,15 @@
                                          v))
                         into rest
                       finally (return (cons :map rest))))
+               ;; @m[k] = func/probe — rewrite the RHS so the map's
+               ;; value slot gets the literal section name as a string.
+               ((and (eq (first f) :assign)
+                     (let ((lhs (getf (cdr f) :lhs)))
+                       (and (consp lhs) (eq (first lhs) :map))))
+                (list :assign
+                      :lhs (walk (getf (cdr f) :lhs))
+                      :op  (getf (cdr f) :op)
+                      :rhs (rewrite-leaf (getf (cdr f) :rhs))))
                (t (cons (walk (first f)) (walk (rest f)))))))
     (walk form)))
 
