@@ -355,6 +355,14 @@
       (:scalar-var   (list :var (text-of (first-tagged inner :ident))))
       (:builtin      (norm-builtin inner))
       (:builtin-name (norm-builtin inner)) ; if parens stripped
+      (:cast
+       (let* ((type-name (text-of (first-tagged inner :ident)))
+              (sub-primary (find-if (lambda (c)
+                                      (and (consp c)
+                                           (not (eq (tag-of c) :ident))))
+                                    (children-of inner))))
+         (list :cast :type type-name
+               :expr (norm-expr-dispatch sub-primary))))
       (:constant     (list :constant
                            (text-of (first-tagged inner :ident))))
       (:string-lit   (list :str (strip-quotes (text-of inner))))

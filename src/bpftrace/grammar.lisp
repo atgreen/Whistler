@@ -125,8 +125,12 @@
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
-  primary        = parens / func-call / map-access / scalar-var / builtin /
+  primary        = cast / parens / func-call / map-access / scalar-var / builtin /
                    constant / string-lit / hex-int / integer
+  (* C-style struct-pointer cast: open-paren struct ident asterisk
+     close-paren expr. Must precede `parens' in the alternates so the
+     open-paren disambiguation tries the cast shape first. *)
+  cast           = <'('> <ws> <'struct'> <ws> ident <ws> <'*'> <ws> <')'> <ws> primary
   (* Bare identifier — used for symbolic constants like AF_INET. Comes
      after builtin and func-call so those keywords / call shapes win
      when applicable. !ident-char anchors the boundary so identifier

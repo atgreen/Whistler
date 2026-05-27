@@ -292,3 +292,26 @@
   (signals whistler/bpftrace:bpftrace-unsupported
     (whistler/bpftrace:compile-script
      "kprobe:vfs_read { @ = curtask->no_such_field; }")))
+
+(test parse-struct-cast
+  "(struct foo *)expr parses as a :cast node carrying type and expr."
+  (let* ((ast (whistler/bpftrace::normalize
+               (whistler/bpftrace::parse-script
+                "kprobe:foo { @ = ((struct sock *)arg0)->bar; }")))
+         (stmt (first (getf (cdr (second ast)) :body)))
+         (rhs  (getf (cdr stmt) :rhs))
+         (base (getf (cdr rhs) :base)))
+    (is (eq :field (first rhs)))
+    (is (eq :cast  (first base)))
+    (is (string= "sock" (getf (cdr base) :type)))
+    (is (equal '(:arg 0) (getf (cdr base) :expr)))))
+
+(test codegen-struct-cast-field
+  "((struct sock_common *)arg0)->skc_family lowers to a 2-byte
+   probe-read at the BTF-resolved offset."
+  (let* ((src "kprobe:tcp_sendmsg { @ = ((struct sock_common *)arg0)->skc_family; }")
+         (gen (whistler/bpftrace:compile-script src))
+         (text (format nil "~S" (cdddr (first (getf gen :progs))))))
+    (is (search "PROBE-READ-KERNEL" text))
+    (is (search "STRUCT-ALLOC 2" text)
+        "skc_family is u16 — 2-byte scratch buffer")))

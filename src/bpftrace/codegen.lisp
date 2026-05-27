@@ -300,6 +300,11 @@
     (:var        (var-sym (second expr)))
     (:builtin    (lower-builtin (second expr)))
     (:curtask    '(whistler::get-current-task))
+    ;; A bare cast (no following ->) — just compute the underlying
+    ;; expression. The type annotation is informational; meaningful
+    ;; cast use is inside a (field :base (:cast …) :name ...) form,
+    ;; which lower-field handles.
+    (:cast       (lower-expr (getf (cdr expr) :expr)))
     (:constant   (or (resolve-constant (second expr))
                      (unsupported "unknown identifier `~A' — not in BTF enums or curated #define table"
                                   (second expr))))
@@ -776,45 +781,47 @@
     (cond
       ((and (consp base) (eq (first base) :args))
        (lower-args-field name))
-      ;; curtask->FIELD — kernel BTF gives us the offset and size for
-      ;; any scalar field of task_struct.
       ((and (consp base) (eq (first base) :curtask))
-       (lower-curtask-field name))
+       (lower-struct-pointer-field "task_struct" name
+                                   '(whistler::get-current-task)))
+      ;; ((struct NAME *)EXPR)->FIELD — type comes from the cast.
+      ((and (consp base) (eq (first base) :cast))
+       (lower-struct-pointer-field (getf (cdr base) :type) name
+                                   (lower-expr (getf (cdr base) :expr))))
       (t (unsupported "field access .~A on non-args expressions" name)))))
 
-(defun lower-curtask-field (name)
-  "Lower curtask->NAME for a scalar field of task_struct. Uses BTF
-   to find the field's offset and size; emits bpf_probe_read_kernel
-   into a stack slot and reads back through it."
+(defun lower-struct-pointer-field (struct-name field-name ptr-form)
+  "Generate the kernel-side read for STRUCT-NAME pointer pointed to by
+   PTR-FORM, returning the value of FIELD-NAME. Uses kernel BTF for
+   the field's offset and size. Scalar fields (1/2/4/8 bytes) only —
+   nested struct fields require a chained-cast follow-on."
   (let ((vmbtf (whistler:ensure-vmlinux-btf)))
     (multiple-value-bind (type-id rec)
-        (whistler:btf-find-struct vmbtf "task_struct")
+        (whistler:btf-find-struct vmbtf struct-name)
       (declare (ignore rec))
       (unless type-id
-        (unsupported "curtask->~A: task_struct not found in vmlinux BTF" name))
+        (unsupported "->~A: struct ~A not found in vmlinux BTF"
+                     field-name struct-name))
       (let* ((fields (whistler:btf-struct-fields vmbtf type-id))
-             (cell   (find name fields :test #'string= :key #'first)))
+             (cell   (find field-name fields :test #'string= :key #'first)))
         (unless cell
-          (unsupported "curtask->~A: task_struct has no such field"
-                       name))
-        (let ((field-offset (third cell))
-              (field-size   (fourth cell)))
-          (unless (member field-size '(1 2 4 8))
-            (unsupported "curtask->~A: field is ~D bytes; only scalar (1/2/4/8) fields are wired up"
-                         name field-size))
-          (let ((scratch (gensym "TASK-FIELD"))
-                (type-sym (case field-size
+          (unsupported "->~A: struct ~A has no such field"
+                       field-name struct-name))
+        (let ((offset (third cell))
+              (size   (fourth cell)))
+          (unless (member size '(1 2 4 8))
+            (unsupported "->~A: field is ~D bytes; only scalar (1/2/4/8) fields are wired up"
+                         field-name size))
+          (let ((scratch (gensym "FIELD"))
+                (type-sym (case size
                             (1 (intern "U8"  :whistler))
                             (2 (intern "U16" :whistler))
                             (4 (intern "U32" :whistler))
                             (8 (intern "U64" :whistler)))))
-            ;; struct-alloc returns a stack-buffer pointer of the
-            ;; requested size; we read the kernel bytes into it and
-            ;; load back through the typed accessor.
-            `(let ((,scratch (whistler::struct-alloc ,field-size)))
+            `(let ((,scratch (whistler::struct-alloc ,size)))
                (whistler::probe-read-kernel
-                ,scratch ,field-size
-                (whistler::+ (whistler::get-current-task) ,field-offset))
+                ,scratch ,size
+                (whistler::+ ,ptr-form ,offset))
                (whistler::load ,type-sym ,scratch 0))))))))
 
 (defun lower-args-field (name)
