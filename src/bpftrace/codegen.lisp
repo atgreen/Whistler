@@ -481,6 +481,7 @@
   (case kw
     (:pid    `(whistler::ash (whistler::get-current-pid-tgid) -32))
     (:tid    `(whistler::logand (whistler::get-current-pid-tgid) #xffffffff))
+    (:ppid   (lower-ppid-builtin))
     (:uid    `(whistler::logand (whistler::get-current-uid-gid)  #xffffffff))
     (:gid    `(whistler::ash (whistler::get-current-uid-gid)  -32))
     ;; Match bpftrace: `nsecs` is CLOCK_BOOTTIME (continues counting
@@ -492,6 +493,30 @@
     (:cgroup '(whistler::get-current-cgroup-id))
     (:rand   '(whistler::get-prandom-u32))
     (t       (unsupported "builtin ~A" kw))))
+
+(defun lower-ppid-builtin ()
+  "Parent PID — walk `current_task->real_parent->tgid'. real_parent
+   is a `struct task_struct *' so we probe-read the pointer field
+   (8 bytes), then probe-read tgid (4 bytes) from that pointer."
+  (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+         (task-id (whistler:btf-find-struct vmbtf "task_struct"))
+         (fields (and task-id
+                      (whistler:btf-struct-fields vmbtf task-id)))
+         (rp (find "real_parent" fields :test #'string= :key #'first))
+         (tg (find "tgid"        fields :test #'string= :key #'first))
+         (rp-off (and rp (third rp)))
+         (tg-off (and tg (third tg)))
+         (parent (gensym "PARENT"))
+         (out    (gensym "PPID")))
+    (unless (and rp-off tg-off)
+      (unsupported "ppid: vmlinux BTF missing task_struct.real_parent/tgid"))
+    `(let* ((,parent (whistler::struct-alloc 8)))
+       (whistler::probe-read-kernel
+        ,parent 8 (whistler::+ (whistler::get-current-task) ,rp-off))
+       (let* ((,out (whistler::struct-alloc 4)))
+         (whistler::probe-read-kernel
+          ,out 4 (whistler::+ (whistler::load whistler::u64 ,parent 0) ,tg-off))
+         (whistler::load whistler::u32 ,out 0)))))
 
 (defun lower-arg (n)
   (ecase (first *probe-spec*)
@@ -664,6 +689,7 @@
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
       ((string= name "kaddr")  (lower-kaddr-call (getf (cdr expr) :args)))
+      ((string= name "has_key") (lower-has-key-call (getf (cdr expr) :args)))
       ;; User-defined `fn' — inline the body, substituting the
       ;; formal parameters with the actual argument expressions.
       ((find-user-function name)
@@ -796,6 +822,38 @@
                     (need CAP_SYS_ADMIN to see non-zero addresses)"
                    name))
     addr))
+
+(defun lower-has-key-call (args)
+  "Lower `has_key(@map, key)' to 1 if `bpf_map_lookup_elem' returns a
+   non-null pointer, 0 otherwise. We can't reuse `getmap' here — it
+   dereferences scalar-valued maps, conflating `key present with
+   value 0' and `key absent'. We emit `map-lookup-ptr' (composite key)
+   or `map-lookup' on a stack-allocated key (scalar) and check the
+   raw pointer."
+  (unless (= (length args) 2)
+    (unsupported "has_key needs exactly (@map, key)"))
+  (let* ((mref (first args))
+         (key  (second args)))
+    (unless (and (consp mref) (eq (first mref) :map))
+      (unsupported "has_key first arg must be a @map reference"))
+    (let* ((mname-string (getf (cdr mref) :name))
+           (info  (or (gethash mname-string *map-table*)
+                      (unsupported "has_key: unknown map @~A" mname-string)))
+           (mname (minfo-name info))
+           (p     (gensym "P"))
+           (k     (gensym "K"))
+           (ptr-p (keys-need-ptr-ops-p (list key))))
+      (cond
+        (ptr-p
+         ;; Composite / wide key: with-key gives us a pointer directly.
+         (with-key (list key)
+           (lambda (kp)
+             `(whistler::if (whistler::map-lookup-ptr ,mname ,kp) 1 0))))
+        (t
+         ;; Scalar key: stack-allocate a u64 slot, store the key, look
+         ;; up via map-lookup (which takes a key pointer).
+         `(let* ((,k whistler::u64 ,(lower-expr key)))
+            (whistler::if (whistler::map-lookup ,mname ,k) 1 0)))))))
 
 (defun lower-reg-call (args)
   "Lower reg(\"name\") to a (ctx u64 OFFSET) load against pt_regs."

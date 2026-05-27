@@ -366,6 +366,23 @@
     (let ((m (find :macro (rest ast) :key #'first)))
       (is (equal '("a" "b" "@m") (getf (cdr m) :params))))))
 
+(test codegen-has-key
+  "has_key(@m, k) lowers to a raw-pointer presence check via
+   map-lookup, distinct from `@m[k] != 0' (which would conflate
+   absent vs stored zero)."
+  (let* ((src "kprobe:vfs_read /has_key(@m, tid)/ { @m[tid] = nsecs; }")
+         (gen (whistler/bpftrace:compile-script src))
+         (text (format nil "~S" (cdddr (first (getf gen :progs))))))
+    (is (search "MAP-LOOKUP" text))))
+
+(test codegen-ppid
+  "ppid builtin reads task->real_parent->tgid via two probe-reads."
+  (let* ((src "kprobe:vfs_read { @[ppid] = count(); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (text (format nil "~S" (cdddr (first (getf gen :progs))))))
+    (is (search "PROBE-READ-KERNEL" text))
+    (is (search "GET-CURRENT-TASK" text))))
+
 (test codegen-zero-arg-macro-bare-call
   "A zero-arg `macro NAME() { … }' may be referenced bare (no parens)
    inside a probe body — sysname etc. — and inlines correctly."
