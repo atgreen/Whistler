@@ -676,17 +676,28 @@
        (whistler::store ,(intern "U32" :whistler) ,rec 0 ,tag)
        (whistler::store ,(intern "U32" :whistler) ,rec 4 ,map-id))))
 
+(defvar *time-format-table* nil
+  "Per-generate() alist (ID . FMT-STRING). Each time(FMT) call gets
+   an ID; the kernel emits (tag, id) and userspace looks the format
+   up to strftime it.")
+
 (defun lower-async-time (args)
   "Emit a tagged ringbuf record asking userspace to stamp the current
-   wall-clock time. bpftrace's time() takes an optional strftime
-   format; Phase 3 emits the time only and lets userspace use a
-   sensible default."
-  (when args
-    (unsupported "time() format strings — Phase 3 ships time() bare"))
-  (let ((rec (gensym "REC")))
+   wall-clock time. With no args, uses bpftrace's default
+   `%H:%M:%S\\n'. With one string-literal arg, that strftime format
+   is interned and looked up at print time."
+  (let ((fmt (cond
+               ((null args) "%H:%M:%S~%")
+               ((and (= (length args) 1)
+                     (eq (first (first args)) :str))
+                (second (first args)))
+               (t (unsupported "time() arg must be a string literal"))))
+        (id (1+ (length *time-format-table*)))
+        (rec (gensym "REC")))
+    (push (cons id fmt) *time-format-table*)
     `(whistler:with-ringbuf (,rec ,*print-map-name* 8)
        (whistler::store ,(intern "U32" :whistler) ,rec 0 ,+bt-tag-time+)
-       (whistler::store ,(intern "U32" :whistler) ,rec 4 0))))
+       (whistler::store ,(intern "U32" :whistler) ,rec 4 ,id))))
 
 (defconstant +bt-comm-len+ 16
   "Bytes of `comm' the kernel writes via bpf_get_current_comm.")
@@ -1584,6 +1595,7 @@
          (*test-run-counter* 0)
          (*printf-table* nil)
          (*printf-id-counter* 0)
+         (*time-format-table* nil)
          (*map-id-table* nil)
          (*user-functions* (loop for fn in (script-functions script)
                                  collect (cons (getf (cdr fn) :name)
@@ -1629,6 +1641,7 @@
           :stacks-map (when uses-kstack *stacks-map-name*)
           :stack-depth +bt-stack-depth+
           :printf-table (reverse *printf-table*)
+          :time-format-table (reverse *time-format-table*)
           :map-id-table (reverse *map-id-table*)
           :info (loop for raw being the hash-keys of map-table
                       using (hash-value info)

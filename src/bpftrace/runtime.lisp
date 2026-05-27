@@ -1012,15 +1012,51 @@
                          k (whistler/loader::map-info-key-size info)))
                 (error () nil)))))))))
 
-(defun decode-time-record ()
-  (multiple-value-bind (sec _msec _usec _yr _mo _day) (get-decoded-time)
-    (declare (ignore _msec _usec _yr _mo _day))
-    (multiple-value-bind (s m h) (decode-universal-time (get-universal-time))
-      (declare (ignore sec))
-      (format t "~2,'0D:~2,'0D:~2,'0D~%" h m s))))
+(defun strftime-light (fmt)
+  "A minimal strftime over the CURRENT wall-clock time. Honours the
+   directives bpftrace tools actually use: %Y %y %m %d %H %M %S %j
+   %a %A %b %B %p %T %F %f (microseconds — we have second resolution
+   so this renders as 000000) and %%. Anything else passes through
+   literally."
+  (multiple-value-bind (sec min hr mday mon yr) (get-decoded-time)
+    (declare (ignore))
+    (let ((out (make-string-output-stream)))
+      (loop with i = 0
+            with n = (length fmt)
+            while (< i n) do
+        (let ((c (char fmt i)))
+          (cond
+            ((and (char= c #\%) (< (1+ i) n))
+             (let ((d (char fmt (1+ i))))
+               (case d
+                 (#\Y (format out "~4,'0D" yr))
+                 (#\y (format out "~2,'0D" (mod yr 100)))
+                 (#\m (format out "~2,'0D" mon))
+                 (#\d (format out "~2,'0D" mday))
+                 (#\H (format out "~2,'0D" hr))
+                 (#\M (format out "~2,'0D" min))
+                 (#\S (format out "~2,'0D" sec))
+                 (#\T (format out "~2,'0D:~2,'0D:~2,'0D" hr min sec))
+                 (#\F (format out "~4,'0D-~2,'0D-~2,'0D" yr mon mday))
+                 (#\f (write-string "000000" out))
+                 (#\n (terpri out))
+                 (#\t (write-char #\Tab out))
+                 (#\% (write-char #\% out))
+                 (t   (write-char #\% out) (write-char d out)))
+               (cl:incf i 2)))
+            (t (write-char c out) (cl:incf i)))))
+      (get-output-stream-string out))))
+
+(defun decode-time-record (sap time-format-table)
+  "Format-string id sits at offset 4 (u32). Look up the format and
+   strftime it; id 0 falls back to bpftrace's default `%H:%M:%S\\n'."
+  (let* ((id  (sap-read-u32-le sap 4))
+         (fmt (or (cdr (assoc id time-format-table :test #'=))
+                  "%H:%M:%S~%")))
+    (write-string (strftime-light fmt))))
 
 (defun make-ring-callback (printf-table map-id-table map-alist info-list
-                           &key stacks-info stack-depth)
+                           &key stacks-info stack-depth time-format-table)
   "Build the dispatcher that READ_RING_BUFFER invokes for every record."
   (lambda (sap len)
     (declare (ignore len))
@@ -1030,7 +1066,7 @@
         (1 (decode-print-map-record sap map-id-table map-alist info-list
                                     stacks-info stack-depth))
         (2 (decode-clear-map-record sap map-id-table map-alist))
-        (3 (decode-time-record))
+        (3 (decode-time-record      sap time-format-table))
         (t nil)))
     (force-output)))
 
@@ -1071,6 +1107,7 @@
            ;; resolve after they exit.
            (symbolizer (whistler/symbolize:open-symbolizer))
            (printf-table (getf gen :printf-table))
+           (time-format-table (getf gen :time-format-table))
            (map-id-table (getf gen :map-id-table))
            (info-list-cached info-list)
            (ring-consumer
@@ -1080,7 +1117,8 @@
                 (make-ring-callback printf-table map-id-table
                                     map-alist info-list-cached
                                     :stacks-info stacks-info
-                                    :stack-depth stack-depth))))
+                                    :stack-depth stack-depth
+                                    :time-format-table time-format-table))))
            (begin-progs (remove-if-not
                          (lambda (entry)
                            (begin-section-p
