@@ -61,8 +61,9 @@
 
 (defun load-tracepoint-field-sizes (script)
   "Walk SCRIPT, parse each referenced tracepoint format file, and
-   build *TP-FIELD-SIZES*. Skips silently if a format file can't be
-   read — the caller falls back to a default size."
+   build *TP-FIELD-SIZES*: name → (size . array-size). Skips silently
+   if a format file can't be read — the caller falls back to a
+   default size. array-size > 0 marks a char[]/u8[]-style field."
   (let ((table (make-hash-table :test 'equal)))
     (dolist (probe (script-probes script))
       (dolist (spec (getf (cdr probe) :specs))
@@ -75,10 +76,25 @@
               (dolist (field (ignore-errors
                               (whistler::parse-tracepoint-format
                                (namestring path))))
-                (destructuring-bind (c-name _off size _signed _array) field
-                  (declare (ignore _off _signed _array))
-                  (setf (gethash c-name table) size))))))))
+                (destructuring-bind (c-name _off size _signed array) field
+                  (declare (ignore _off _signed))
+                  (setf (gethash c-name table)
+                        (cons size (or array 0))))))))))
     table))
+
+(defun tp-field-size (name)
+  "Tracepoint args.FIELD width in bytes, or NIL if unknown."
+  (let ((cell (and *tp-field-sizes* (gethash name *tp-field-sizes*))))
+    (cond
+      ((consp cell) (car cell))
+      ((integerp cell) cell)
+      (t nil))))
+
+(defun tp-array-size (name)
+  "If tracepoint args.FIELD is an array, return its element count;
+   otherwise 0 / NIL."
+  (let ((cell (and *tp-field-sizes* (gethash name *tp-field-sizes*))))
+    (cond ((consp cell) (cdr cell)) (t 0))))
 
 (defun str-key-size (expr)
   "Size (in bytes) of a str()/kstr() call when used as a map key —
@@ -121,8 +137,7 @@
          ;; tracefs format file we parsed in load-tracepoint-field-sizes.
          ((and (consp (getf (cdr expr) :base))
                (eq (first (getf (cdr expr) :base)) :args)
-               *tp-field-sizes*
-               (gethash name *tp-field-sizes*)))
+               (tp-field-size name)))
          ;; Unknown: default to 4 (most sched/syscalls fields are u32).
          (t 4))))
     (t        8)))
@@ -426,6 +441,19 @@
    byte stack slot — \`printf(\"%s\", \$v)' copies the bytes directly,
    and comparisons against a string literal use byte-by-byte equality
    (same path as the existing bare-`comm' compare).")
+
+(defvar *string-set-buf* nil
+  "Per-probe scratch buffer symbol shared across all
+   `gen-string-set' calls in the same probe. The BPF stack frame
+   caps at 512 bytes, so populating a `\@reason' lookup table with
+   8 × 64-byte literals (writeback.bt) would blow the budget if
+   each gen-string-set allocated its own slot. Reusing one buffer
+   means the writes overwrite a single 64-byte stack region.")
+
+(defvar *string-set-buf-size* 0
+  "Width of the buffer named by *string-set-buf*; equal to the
+   largest string-typed value-size of any map referenced from the
+   current probe. Sized at gen-kernel-prog setup time.")
 
 (defconstant +bt-ntop-slot-size+ 17
   "1 byte family + 16 bytes address — covers both AF_INET and AF_INET6.")
@@ -1218,11 +1246,23 @@
     ;; (e.g. `gendisk.disk_name' as `char[32]'). printf treats it
     ;; as a NUL-padded string of the array's byte size.
     ((eq (first expr) :field)
-     (multiple-value-bind (_ptr size kind) (analyze-chain expr)
-       (declare (ignore _ptr))
-       (if (and (eq kind :array) (plusp (or size 0)))
-           (cons :string size)
-           :int)))
+     (cond
+       ;; `args.FIELD' where the tracepoint format declared FIELD as
+       ;; an array — render as a string slot sized to the array.
+       ((let ((base (getf (cdr expr) :base))
+              (name (getf (cdr expr) :name))
+              (sz   *tp-field-sizes*))
+          (and (consp base) (eq (first base) :args)
+               sz (gethash name sz)
+               (let ((array-size (tp-array-size name)))
+                 (and array-size (plusp array-size)))))
+        (cons :string (tp-array-size (getf (cdr expr) :name))))
+       (t
+        (multiple-value-bind (_ptr size kind) (analyze-chain expr)
+          (declare (ignore _ptr))
+          (if (and (eq kind :array) (plusp (or size 0)))
+              (cons :string size)
+              :int)))))
     ;; @m[k] where m's value slot is a NUL-padded string — the value
     ;; lookup returns a pointer to value-size bytes the printf
     ;; record-emitter copies wholesale.
@@ -2210,24 +2250,24 @@
                 ,mname (whistler::stack-addr ,tmpk) ,buf 0)))))))
 
 (defun gen-string-set (info keys literal)
-  "Store LITERAL as the NUL-padded contents of @MNAME[KEYS]. The map
-   was sized at infer time to hold value-string-p / value-size bytes.
-   map_update_elem needs a key pointer; for the (common) single
-   scalar-key case we stack-store the key first so we can take its
-   address."
+  "Store LITERAL as the NUL-padded contents of @MNAME[KEYS]. Reuses
+   the per-probe shared *string-set-buf* (allocated once in the
+   prologue) so a BEGIN block initialising N entries doesn't bloat
+   the stack by N × value-size."
   (let* ((mname (minfo-name info))
          (vsize (minfo-value-size info))
-         (buf   (gensym "VBUF"))
+         (buf   *string-set-buf*)
          (tmpk  (gensym "K"))
          (ptr-p (keys-need-ptr-ops-p keys)))
+    (unless buf
+      (unsupported "internal: gen-string-set called outside a probe scope"))
     (with-key keys
       (lambda (k)
         (if ptr-p
-            `(let ((,buf (whistler::struct-alloc ,vsize)))
+            `(progn
                ,(lower-printf-string-literal buf 0 literal vsize)
                (whistler::map-update-ptr ,mname ,k ,buf 0))
-            `(let* ((,tmpk whistler::u64 ,k)
-                    (,buf (whistler::struct-alloc ,vsize)))
+            `(let* ((,tmpk whistler::u64 ,k))
                ,(lower-printf-string-literal buf 0 literal vsize)
                (whistler::map-update-ptr
                 ,mname (whistler::stack-addr ,tmpk) ,buf 0)))))))
@@ -2755,6 +2795,31 @@
       (mapc #'walk stmts))
     acc))
 
+(defun probe-string-buf-size (body)
+  "Walk BODY for `@m[k] = :str / :func / :probe-name / :comm' map
+   assignments and return the largest value-size of any string-typed
+   target map. Zero means no buffer needed."
+  (let ((m 0))
+    (labels ((maybe-bump (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :map)
+                          (consp rhs)
+                          (member (first rhs)
+                                  '(:str :func :probe-name :comm)))
+                 (let ((info (and *map-table*
+                                  (gethash (getf (cdr lhs) :name)
+                                           *map-table*))))
+                   (when info
+                     (setf m (max m (minfo-value-size info)))))))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-bump (getf (cdr s) :lhs)
+                                      (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk body))
+    m))
+
 (defun gen-kernel-prog (spec pred body index sub)
   (multiple-value-bind (ptype section) (spec->section spec)
     (let* ((*probe-spec* spec)
@@ -2769,6 +2834,12 @@
            (body      (expand-tuple-vars body))
            (body      (drop-tuple-assignments body))
            (pred      (when pred (expand-tuple-vars pred)))
+           ;; One shared scratch buffer for all string-valued map
+           ;; writes in this probe (writeback.bt has 8, would blow
+           ;; the 512-byte BPF stack if each got its own slot).
+           (*string-set-buf-size* (probe-string-buf-size body))
+           (*string-set-buf*
+             (when (plusp *string-set-buf-size*) (gensym "STRBUF")))
            (prog-name (intern (format nil "BT-PROBE-~D-~D" index sub) :whistler))
            (vars      (collect-vars body))
            (body-forms (lower-stmts body))
@@ -2797,7 +2868,14 @@
                              (is-comm `(,v (whistler::struct-alloc
                                             ,+bt-comm-len+)))
                              (t `(,v 0)))))
-           (with-vars (if vars
+           ;; Prepend the shared string buffer to the bindings if used.
+           (var-inits (if *string-set-buf*
+                          (cons `(,*string-set-buf*
+                                  (whistler::struct-alloc
+                                   ,*string-set-buf-size*))
+                                var-inits)
+                          var-inits))
+           (with-vars (if var-inits
                           `((let* ,var-inits ,@gated 0))
                           (append gated '(0)))))
       `(whistler:defprog ,prog-name

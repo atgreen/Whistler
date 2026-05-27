@@ -920,15 +920,21 @@
               (list :const byte-size const-val)
               key-arg)))))
 
-(defun emit-key-to-stack (ctx key-arg)
+(defun emit-key-to-stack (ctx key-arg &optional target-size)
   "Store a key value on the stack and return the stack offset.
    KEY-ARG may be a vreg (integer) or (:imm N) from constant propagation.
+   TARGET-SIZE, if given, is the map's declared key-size — when it
+   exceeds the natural width of the key value, we allocate the full
+   slot, zero-fill the upper bytes, and store the value at offset 0
+   so the verifier sees an initialised key.
+
    Reuses existing stack slot if the same key was previously stored.
    Uses st-mem for constant keys (saves 1 insn vs mov+stx-mem)."
   (let* ((imm-val (imm-arg-value key-arg))
          (vreg-type (if imm-val nil (gethash key-arg (emit-ctx-vreg-types ctx))))
-         (byte-size (if imm-val 4 (ir-type-to-byte-size vreg-type)))
-         (cache-key (key-cache-key ctx key-arg byte-size))
+         (val-size (if imm-val 4 (ir-type-to-byte-size vreg-type)))
+         (slot-size (max val-size (or target-size 0)))
+         (cache-key (key-cache-key ctx key-arg slot-size))
          (cached (gethash cache-key (emit-ctx-key-cache ctx))))
     (if cached
         cached
@@ -936,13 +942,20 @@
                              (ir-type-to-bpf-size (or vreg-type 'u64))))
                (const-val (or imm-val
                               (gethash key-arg (emit-ctx-const-values ctx))))
-               (offset (ectx-alloc-stack ctx byte-size "map key temporaries")))
+               (offset (ectx-alloc-stack ctx slot-size "map key temporaries")))
+          ;; If the slot is wider than the value, the lower bytes get
+          ;; the value and the upper bytes need explicit zeros so the
+          ;; verifier doesn't see uninitialised stack on map_*_elem.
+          (when (> slot-size val-size)
+            (loop for i from val-size below slot-size
+                  do (ectx-emit ctx (whistler/bpf:emit-st-mem
+                                     whistler/bpf:+bpf-b+
+                                     whistler/bpf:+bpf-reg-10+
+                                     (+ offset i) 0))))
           (if (and const-val (typep const-val '(signed-byte 32)))
-              ;; Constant key: use st-mem (1 insn)
               (ectx-emit ctx (whistler/bpf:emit-st-mem
                               bpf-size
                               whistler/bpf:+bpf-reg-10+ offset const-val))
-              ;; Variable key: load to register then store
               (let ((src-reg (vreg-to-physical ctx key-arg whistler/bpf:+bpf-reg-3+)))
                 (ectx-emit ctx (whistler/bpf:emit-stx-mem
                                 bpf-size
@@ -1021,10 +1034,21 @@
     (ectx-emit ctx (whistler/bpf:emit-call whistler/bpf:+bpf-func-map-lookup-elem+))
     (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+)))
 
+(defun map-by-name (ctx map-name)
+  (let ((name-str (symbol-name map-name)))
+    (find name-str (ir-program-maps (emit-ctx-ir-prog ctx))
+          :key (lambda (m) (symbol-name (whistler/compiler:bpf-map-name m)))
+          :test #'string=)))
+
+(defun map-declared-key-size (ctx map-name)
+  (let ((m (map-by-name ctx map-name)))
+    (and m (whistler/compiler:bpf-map-key-size m))))
+
 (defun emit-map-lookup-insn (ctx dst args)
   (let* ((map-name (map-arg-name (first args)))
          (key-vreg (second args))
-         (key-offset (emit-key-to-stack ctx key-vreg)))
+         (key-offset (emit-key-to-stack
+                      ctx key-vreg (map-declared-key-size ctx map-name))))
     ;; R1 = map fd
     (emit-map-fd ctx map-name whistler/bpf:+bpf-reg-1+)
     ;; R2 = &key
@@ -1040,7 +1064,8 @@
          (val-vreg (third args))
          (flags-arg (fourth args))
          ;; Store key and val to stack first
-         (key-offset (emit-key-to-stack ctx key-vreg))
+         (key-offset (emit-key-to-stack
+                      ctx key-vreg (map-declared-key-size ctx map-name)))
          (val-offset (emit-key-to-stack ctx val-vreg)))
     ;; Load flags into R4 BEFORE r1-r3 setup clobbers caller-saved registers
     (let ((flags-imm (imm-arg-value flags-arg)))
@@ -1111,7 +1136,8 @@
 (defun emit-map-delete-insn (ctx dst args)
   (let* ((map-name (map-arg-name (first args)))
          (key-vreg (second args))
-         (key-offset (emit-key-to-stack ctx key-vreg)))
+         (key-offset (emit-key-to-stack
+                      ctx key-vreg (map-declared-key-size ctx map-name))))
     (emit-map-fd ctx map-name whistler/bpf:+bpf-reg-1+)
     (emit-stack-ptr ctx key-offset whistler/bpf:+bpf-reg-2+)
     (ectx-emit ctx (whistler/bpf:emit-call whistler/bpf:+bpf-func-map-delete-elem+))

@@ -790,11 +790,22 @@
                  (accessor (intern (format nil "TP-~a" (string-upcase lisp-name))
                                    (symbol-package category/event)))
                  (type (tracepoint-type size signed-p array-size)))
-            (when type
-              (push `(defmacro ,accessor ()
-                       '(ctx ,type ,offset))
-                    forms))
-            ;; For array fields, generate a -ptr accessor
+            (cond
+              ;; Scalar field — accessor returns the field's value.
+              (type
+               (push `(defmacro ,accessor ()
+                        '(ctx ,type ,offset))
+                     forms))
+              ;; Array field — bare TP-NAME returns the pointer to
+              ;; the array bytes (same as TP-NAME-PTR). Lets
+              ;; `args.disk_name' / `args.name' flow through to
+              ;; printf %s without the caller needing to switch to
+              ;; the -PTR form.
+              ((plusp array-size)
+               (push `(defmacro ,accessor ()
+                        '(+ (ctx u64 0) ,offset))
+                     forms)))
+            ;; For array fields, also keep the -ptr alias.
             (when (plusp array-size)
               (let ((ptr-name (intern (format nil "TP-~a-PTR"
                                              (string-upcase lisp-name))
