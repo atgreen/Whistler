@@ -124,6 +124,11 @@
     (:comm    16)
     (:func        +bt-func-name-key-len+)
     (:probe-name  +bt-func-name-key-len+)
+    ;; A string literal that was the result of rewrite-self-refs
+    ;; folding `func' / `probe' into a fixed slot. Same width as the
+    ;; original :func/:probe-name so the composite-key layout and
+    ;; store-key-component agree on slot size.
+    (:str         +bt-func-name-key-len+)
     (:kstack  4)
     (:ustack  4)
     (:call
@@ -181,6 +186,9 @@
                         ((or (eq (first e) :func)
                              (eq (first e) :probe-name))
                          +bt-func-name-key-len+)
+                        ;; A literal string key (from func/probe rewrite)
+                        ;; occupies a func-name-sized slot, NUL-padded.
+                        ((eq (first e) :str) +bt-func-name-key-len+)
                         ((or (str-call-p e) (kstr-call-p e))
                          (str-key-size e))
                         (t 8))
@@ -188,6 +196,7 @@
                         ((eq (first e) :comm) u8)
                         ((or (eq (first e) :func)
                              (eq (first e) :probe-name)) u8)
+                        ((eq (first e) :str) u8)
                         ((or (str-call-p e) (kstr-call-p e)) u8)
                         (t u64))
            collect (list offset size type e)
@@ -2282,14 +2291,17 @@
 (defun keys-need-ptr-ops-p (keys)
   "T iff the keys form requires the kernel -ptr map ops (whistler's
    struct-key path). Triggered by composite keys or by a single
-   string-typed key (`comm', `str(…)', `kstr(…)', `func', `probe').
-   All of these produce a stack buffer pointer rather than a u64."
+   string-typed key (`comm', `str(…)', `kstr(…)', `func', `probe',
+   or a bare :str literal — the latter is what rewrite-self-refs
+   produces for `@[func]' / `@[probe]' inside map keys, so the
+   downstream path needs to recognise it the same way)."
   (or (> (length keys) 1)
       (and (= (length keys) 1)
            (let ((k (first keys)))
              (or (eq (first k) :comm)
                  (eq (first k) :func)
                  (eq (first k) :probe-name)
+                 (eq (first k) :str)
                  (str-call-p k)
                  (kstr-call-p k))))))
 
