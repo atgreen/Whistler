@@ -409,6 +409,13 @@
    family byte + 16 address bytes) so the assignment can write either
    family and the matching `printf(\"%s\", \$v)' can emit the slot.")
 
+(defvar *comm-vars* nil
+  "Per-probe list of VAR-NAME strings whose value comes from `comm'
+   or from a string-valued map. Each is backed by a TASK_COMM_LEN
+   byte stack slot — \`printf(\"%s\", \$v)' copies the bytes directly,
+   and comparisons against a string literal use byte-by-byte equality
+   (same path as the existing bare-`comm' compare).")
+
 (defconstant +bt-ntop-slot-size+ 17
   "1 byte family + 16 bytes address — covers both AF_INET and AF_INET6.")
 (defvar *map-table* nil)
@@ -653,36 +660,55 @@
          `(whistler::ctx ,(intern "U64" :whistler) ,(* nargs 8)))))))
 
 (defun comm-string-comparison (op raw-lhs raw-rhs)
-  "Handle `comm == \"literal\"' / `comm != \"literal\"' as a byte-by-byte
-   compare against a get_current_comm buffer. Returns the lowered form
-   or NIL if the operands don't match the pattern."
-  (let ((lit (cond ((and (consp raw-lhs) (eq (first raw-lhs) :comm)
-                         (consp raw-rhs) (eq (first raw-rhs) :str))
-                    (second raw-rhs))
-                   ((and (consp raw-rhs) (eq (first raw-rhs) :comm)
-                         (consp raw-lhs) (eq (first raw-lhs) :str))
-                    (second raw-lhs)))))
-    (when lit
-      (let* ((bytes (sb-ext:string-to-octets lit :external-format :utf-8))
-             (n     (length bytes))
-             (buf   (gensym "CMBUF"))
-             ;; Compare each byte of the literal plus a NUL terminator
-             ;; (so "bash" doesn't spuriously match "bashish").
-             (clauses
-               (loop for i from 0 below (min n +bt-comm-len+)
-                     collect `(whistler::= (whistler::load
-                                            ,(intern "U8" :whistler)
-                                            ,buf ,i)
-                                           ,(aref bytes i))))
-             (nul-check
-               (when (< n +bt-comm-len+)
-                 `(whistler::= (whistler::load ,(intern "U8" :whistler)
-                                               ,buf ,n)
-                               0)))
-             (all-eq `(whistler::and ,@clauses ,@(and nul-check (list nul-check)))))
-        `(let ((,buf (whistler::struct-alloc ,+bt-comm-len+)))
-           (whistler::get-current-comm ,buf ,+bt-comm-len+)
-           ,(if (eq op :!=) `(whistler::not ,all-eq) all-eq))))))
+  "Handle string-equality comparisons against a `comm'-typed value:
+   either bare `comm == \"literal\"' (compares to get_current_comm)
+   or `\$v == \"literal\"' / `\"literal\" == \$v' where \$v is in
+   *comm-vars* (compares to \$v's 16-byte slot). Returns NIL if the
+   operands don't fit either shape."
+  (labels ((str? (e) (and (consp e) (eq (first e) :str) (second e)))
+           (comm-or-var-slot (e)
+             (cond
+               ;; Bare `comm' — synthesise a fresh slot and fill from
+               ;; bpf_get_current_comm. Returns (BUF-BIND TIP) where
+               ;; BUF-BIND is the (let …) wrapper and TIP is the buf sym.
+               ((and (consp e) (eq (first e) :comm))
+                (let ((b (gensym "CMBUF")))
+                  (values b `(progn (whistler::get-current-comm
+                                     ,b ,+bt-comm-len+)))))
+               ;; \$v in *comm-vars* — its symbol IS the slot pointer.
+               ((and (consp e) (eq (first e) :var)
+                     (member (second e) *comm-vars* :test #'string-equal))
+                (values (var-sym (second e)) nil)))))
+    (multiple-value-bind (lhs-buf lhs-init) (comm-or-var-slot raw-lhs)
+      (declare (ignore lhs-init))
+      (multiple-value-bind (rhs-buf rhs-init) (comm-or-var-slot raw-rhs)
+        (declare (ignore rhs-init))
+        (let* ((slot (or lhs-buf rhs-buf))
+               (lit  (or (and lhs-buf (str? raw-rhs))
+                         (and rhs-buf (str? raw-lhs)))))
+          (when (and slot lit)
+            (let* ((bytes (sb-ext:string-to-octets lit :external-format :utf-8))
+                   (n     (length bytes))
+                   (clauses
+                     (loop for i from 0 below (min n +bt-comm-len+)
+                           collect `(whistler::= (whistler::load
+                                                  ,(intern "U8" :whistler)
+                                                  ,slot ,i)
+                                                 ,(aref bytes i))))
+                   (nul-check
+                     (when (< n +bt-comm-len+)
+                       `(whistler::= (whistler::load ,(intern "U8" :whistler)
+                                                     ,slot ,n)
+                                     0)))
+                   (all-eq `(whistler::and ,@clauses ,@(and nul-check (list nul-check)))))
+              (if (or (and (consp raw-lhs) (eq (first raw-lhs) :comm))
+                      (and (consp raw-rhs) (eq (first raw-rhs) :comm)))
+                  ;; bare-comm: synthesise the slot.
+                  `(let ((,slot (whistler::struct-alloc ,+bt-comm-len+)))
+                     (whistler::get-current-comm ,slot ,+bt-comm-len+)
+                     ,(if (eq op :!=) `(whistler::not ,all-eq) all-eq))
+                  ;; \$v slot: just compare in place.
+                  (if (eq op :!=) `(whistler::not ,all-eq) all-eq)))))))))
 
 (defun lower-bin (expr)
   (let* ((op  (getf (cdr expr) :op))
@@ -1076,6 +1102,11 @@
     ((and (eq (first expr) :var)
           (member (second expr) *ntop-vars* :test #'string-equal))
      :ipv-any)
+    ;; A `\$v' backed by a 16-byte comm slot — same as a bare-comm
+    ;; reference for printf purposes.
+    ((and (eq (first expr) :var)
+          (member (second expr) *comm-vars* :test #'string-equal))
+     (cons :string +bt-comm-len+))
     ;; @m[k] where m's value slot is a NUL-padded string — the value
     ;; lookup returns a pointer to value-size bytes the printf
     ;; record-emitter copies wholesale.
@@ -1248,6 +1279,15 @@
          ;; rewrites and any printf("…", "literal") form.
          ((eq (first arg) :str)
           (lower-printf-string-literal rec off (second arg) size))
+         ;; A \$v in *comm-vars* — copy SIZE bytes from \$v's slot
+         ;; into the record.
+         ((and (eq (first arg) :var)
+               (member (second arg) *comm-vars* :test #'string-equal))
+          (let ((src (lower-expr arg))
+                (i   (gensym "I")))
+            `(whistler::dotimes (,i ,size)
+               (whistler::store whistler::u8 ,rec (+ ,off ,i)
+                                (whistler::load whistler::u8 ,src ,i)))))
          ;; @m[k] on a string-valued map — look up the entry, then
          ;; copy SIZE bytes from the value pointer into the record.
          ;; Missing key (NULL pointer) → leave the slot untouched
@@ -1690,6 +1730,18 @@
                  (consp rhs) (eq (first rhs) :map)
                  (member (second lhs) *ntop-vars* :test #'string-equal))
             (lower-ntop-map-copy sym rhs))
+           ;; `$v = comm' — write TASK_COMM_LEN bytes into $v's
+           ;; 16-byte slot via bpf_get_current_comm.
+           ((and (eq op :=)
+                 (consp rhs) (eq (first rhs) :comm)
+                 (member (second lhs) *comm-vars* :test #'string-equal))
+            `(whistler::get-current-comm ,sym ,+bt-comm-len+))
+           ;; `$v = @m[k]' on a comm-typed $v whose map's value is a
+           ;; string slot — copy the bytes into $v's buffer.
+           ((and (eq op :=)
+                 (consp rhs) (eq (first rhs) :map)
+                 (member (second lhs) *comm-vars* :test #'string-equal))
+            (lower-string-map-copy sym rhs))
            (t
             (ecase op
               (:=  `(setf ,sym ,(lower-expr rhs)))
@@ -1745,6 +1797,33 @@
                        (t (setf current-tid (sixth cell))))))
           (values `(whistler::+ ,(root-ptr-form root) ,total)
                   leaf-size leaf-kind))))))
+
+(defun lower-string-map-copy (slot-sym map-expr)
+  "Lower `\$v = @m[k]' where \$v is comm-typed and m's value slot is
+   a string. Looks up the map, copies the bytes into SLOT-SYM's
+   buffer; missing key leaves the slot at its (zero) init."
+  (let* ((mname-string (getf (cdr map-expr) :name))
+         (info  (or (gethash mname-string *map-table*)
+                    (unsupported "unknown map @~A" mname-string)))
+         (mname (minfo-name info))
+         (vsize (minfo-value-size info))
+         (keys  (getf (cdr map-expr) :keys))
+         (p     (gensym "P"))
+         (i     (gensym "I"))
+         (ptr-p (keys-need-ptr-ops-p keys)))
+    (flet ((copy-body (kform)
+             `(whistler:if-let
+                  (,p (whistler::map-lookup-ptr ,mname ,kform))
+                (whistler::dotimes (,i ,vsize)
+                  (whistler::store
+                   whistler::u8 ,slot-sym ,i
+                   (whistler::load whistler::u8 ,p ,i)))
+                0)))
+      (if ptr-p
+          (with-key keys #'copy-body)
+          (let ((tmpk (gensym "K")))
+            `(let* ((,tmpk whistler::u64 ,(lower-expr (first keys))))
+               ,(copy-body `(whistler::stack-addr ,tmpk))))))))
 
 (defun lower-ntop-map-copy (slot-sym map-expr)
   "Lower `\$v = @m[k]' where \$v is ntop-typed and m's value slot is
@@ -2399,6 +2478,31 @@
                (t (cons (walk (first f)) (walk (rest f)))))))
     (walk form)))
 
+(defun infer-comm-vars (stmts)
+  "Return a list of var-name strings whose value comes from `comm'
+   or from a string-valued map. Walks if/while bodies."
+  (let ((acc nil))
+    (labels ((string-map-read-p (e)
+               (and (consp e) (eq (first e) :map)
+                    (let ((info (and *map-table*
+                                     (gethash (getf (cdr e) :name)
+                                              *map-table*))))
+                      (and info (minfo-value-string-p info)))))
+             (maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var)
+                          (or (and (consp rhs) (eq (first rhs) :comm))
+                              (string-map-read-p rhs)))
+                 (pushnew (second lhs) acc :test #'string=)))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-record (getf (cdr s) :lhs)
+                                        (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk stmts))
+    acc))
+
 (defun infer-ntop-vars (stmts)
   "Return a list of var-name strings that hold an `ntop(…)' result.
    Walks the body — including nested if/while — recording any
@@ -2470,6 +2574,7 @@
     (let* ((*probe-spec* spec)
            (*var-types*  (infer-var-types body))
            (*ntop-vars*  (infer-ntop-vars body))
+           (*comm-vars*  (infer-comm-vars body))
            (*tuple-vars* (infer-tuple-vars body))
            (probe-str (format nil "~A" section))
            (func-str  (probe-func-name spec))
@@ -2486,7 +2591,8 @@
                       `((when ,pred-form ,@body-forms))
                       body-forms))
            ;; Initialise each var. ntop-typed vars get a pointer to a
-           ;; per-probe 17-byte stack slot; everything else starts 0.
+           ;; 17-byte slot, comm-typed vars get a 16-byte slot,
+           ;; everything else starts 0.
            (var-inits
              (loop for v in vars
                    for name = (symbol-name v)
@@ -2496,9 +2602,15 @@
                    for is-ntop = (and as-bt
                                       (member as-bt *ntop-vars*
                                               :test #'string-equal))
-                   collect (if is-ntop
-                               `(,v (whistler::struct-alloc ,+bt-ntop-slot-size+))
-                               `(,v 0))))
+                   for is-comm = (and as-bt
+                                      (member as-bt *comm-vars*
+                                              :test #'string-equal))
+                   collect (cond
+                             (is-ntop `(,v (whistler::struct-alloc
+                                            ,+bt-ntop-slot-size+)))
+                             (is-comm `(,v (whistler::struct-alloc
+                                            ,+bt-comm-len+)))
+                             (t `(,v 0)))))
            (with-vars (if vars
                           `((let* ,var-inits ,@gated 0))
                           (append gated '(0)))))
