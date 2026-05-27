@@ -117,6 +117,7 @@
                               (:function     (norm-function inner))
                               (:macro-decl   (norm-macro inner))
                               (:config-block nil)  ; accept-and-ignore
+                              (:map-decl     nil)  ; accept-and-ignore
                               (t (error "unexpected top-form: ~S"
                                         (tag-of inner))))
                when result collect it))))

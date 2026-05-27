@@ -171,7 +171,14 @@
 (defparameter *grammar-source*
   "
   script         = <ws> top-form (<ws> top-form)* <ws>
-  top-form       = function / macro-decl / config-block / probe
+  top-form       = function / macro-decl / config-block / map-decl / probe
+  (* `let @m = lruhash(N);' (or `hashmap(N)') at top level declares
+     a map with an explicit type / capacity. whistler bpftrace
+     infers all of this from usage at first reference; we accept
+     the declaration so existing tools parse, but discard it at
+     AST time — usage-based inference takes over. *)
+  map-decl       = <'let'> !ident-char <ws> <'@'> ident <ws> <'='> <ws> map-type-call <ws> <';'>
+  map-type-call  = ident <ws> <'('> <ws> integer <ws> <')'>
   function       = <'fn'> <ws> ident <ws> <'('> <ws> param-list? <ws> <')'> <ws> block
   (* bpftrace `macro NAME(args) { body }' — pure inline expansion
      at every call site. Params accept the same `$var' as `fn' plus
