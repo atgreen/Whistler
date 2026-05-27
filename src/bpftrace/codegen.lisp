@@ -798,6 +798,7 @@
 (defconstant +bt-tag-print-map+ 1)
 (defconstant +bt-tag-clear-map+ 2)
 (defconstant +bt-tag-time+      3)
+(defconstant +bt-tag-cat+       4)
 
 (defvar *printf-table* nil
   "Per-generate() list of (ID FMT-STRING ARG-TYPES) entries.
@@ -829,6 +830,8 @@
                                                 "clear"))
       ((string= name "zero")   0)
       ((string= name "time")   (lower-async-time
+                                (getf (cdr expr) :args)))
+      ((string= name "cat")    (lower-async-cat
                                 (getf (cdr expr) :args)))
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
@@ -1059,6 +1062,26 @@
    an ID; the kernel emits (tag, id) and userspace looks the format
    up to strftime it.")
 
+(defvar *cat-paths-table* nil
+  "Per-generate() alist (ID . PATH). cat(PATH) registers the path
+   under a unique ID; the kernel emits (tag, id) and userspace
+   reads the file and dumps its contents at print-loop time.")
+
+(defun lower-async-cat (args)
+  "Emit a tagged ringbuf record asking userspace to read and dump
+   the contents of the file named in PATH-ARG."
+  (unless (and (= (length args) 1)
+               (consp (first args))
+               (eq (first (first args)) :str))
+    (unsupported "cat() arg must be a string literal path"))
+  (let* ((path (second (first args)))
+         (id (1+ (length *cat-paths-table*)))
+         (rec (gensym "REC")))
+    (push (cons id path) *cat-paths-table*)
+    `(whistler:with-ringbuf (,rec ,*print-map-name* 8)
+       (whistler::store ,(intern "U32" :whistler) ,rec 0 ,+bt-tag-cat+)
+       (whistler::store ,(intern "U32" :whistler) ,rec 4 ,id))))
+
 (defun lower-async-time (args)
   "Emit a tagged ringbuf record asking userspace to stamp the current
    wall-clock time. With no args, uses bpftrace's default
@@ -1151,6 +1174,10 @@
     ((named-call-p expr "ksym") :ksym)
     ((named-call-p expr "usym") :usym)
     ((named-call-p expr "ntop") (ntop-arg-type expr))
+    ;; cgroup_path(cgrp_id) — bpftrace returns the v2 cgroup path
+    ;; for the given id by scanning /sys/fs/cgroup at print time.
+    ;; The wire format is just the u64 id; userspace formats.
+    ((named-call-p expr "cgroup_path") :cgroup-path)
     ((named-call-p expr "strftime")
      ;; Register the format string and emit a (:strftime . ID) slot.
      ;; The wire format is just the u64 timestamp; the runtime looks
@@ -1191,6 +1218,7 @@
     ((eq arg-type :ipv4) 4)
     ((eq arg-type :ipv6) 16)
     ((eq arg-type :ipv-any) +bt-ntop-slot-size+)
+    ((eq arg-type :cgroup-path) 8)
     ((and (consp arg-type) (eq (car arg-type) :string))   (cdr arg-type))
     ((and (consp arg-type) (eq (car arg-type) :strftime)) 8)  ; just the u64 timestamp
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
@@ -1269,6 +1297,11 @@
      (let* ((args (getf (cdr arg) :args))
             (ptr  (lower-expr (second args))))
        `(whistler::probe-read-kernel (+ ,rec ,off) 16 ,ptr)))
+    ((eq ty :cgroup-path)
+     ;; Store the u64 cgroup id; userspace looks the path up by
+     ;; scanning /sys/fs/cgroup at decode time.
+     (let ((cgid (lower-expr (first (getf (cdr arg) :args)))))
+       `(whistler::store ,(intern "U64" :whistler) ,rec ,off ,cgid)))
     ((eq ty :ipv-any)
      ;; ARG is a `\$v' that points at its 17-byte ntop slot. Copy the
      ;; whole slot (1 byte family + 16 bytes address) into the record.
@@ -2811,6 +2844,7 @@
          (*printf-table* nil)
          (*printf-id-counter* 0)
          (*time-format-table* nil)
+         (*cat-paths-table* nil)
          (*map-id-table* nil)
          (*user-functions* (loop for fn in (script-functions script)
                                  collect (cons (getf (cdr fn) :name)
@@ -2868,6 +2902,7 @@
           :stack-depth +bt-stack-depth+
           :printf-table (reverse *printf-table*)
           :time-format-table (reverse *time-format-table*)
+          :cat-paths-table (reverse *cat-paths-table*)
           :map-id-table (reverse *map-id-table*)
           :info (loop for raw being the hash-keys of map-table
                       using (hash-value info)

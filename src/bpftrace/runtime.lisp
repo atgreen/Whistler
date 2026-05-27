@@ -713,6 +713,29 @@
       (let ((key (string-downcase (substitute #\_ #\- (symbol-name sym)))))
         (cdr (assoc key map-alist :test #'string=))))))
 
+(defun resolve-cgroup-path (cgroup-id)
+  "Return the v2 cgroup path that matches CGROUP-ID by scanning
+   /sys/fs/cgroup for a directory whose `cgroup.id' file contains
+   the same number. Falls back to a `cgroup_id=N' placeholder when
+   the scan can't find a match (no permissions, cgroupv1, etc.)."
+  (or (ignore-errors
+        (cgroup-path-scan "/sys/fs/cgroup/" cgroup-id))
+      (format nil "cgroup_id=~D" cgroup-id)))
+
+(defun cgroup-path-scan (root cgroup-id)
+  (labels ((id-file (dir)
+             (let ((p (merge-pathnames "cgroup.id" dir)))
+               (and (probe-file p)
+                    (with-open-file (s p)
+                      (parse-integer (read-line s nil "") :junk-allowed t)))))
+           (walk (dir)
+             (when (eql (id-file dir) cgroup-id)
+               (return-from cgroup-path-scan (namestring dir)))
+             (dolist (sub (ignore-errors (directory
+                                          (merge-pathnames "*/" dir))))
+               (walk sub))))
+    (walk (pathname root))))
+
 (defun find-elapsed-map (gen map-alist)
   (let ((sym (getf gen :elapsed-map)))
     (when sym
@@ -951,6 +974,10 @@
                                       ((eq ty :ipv6)
                                        (prog1 (format-ipv6 sap off)
                                          (incf off 16)))
+                                      ((eq ty :cgroup-path)
+                                       (let ((cgid (sap-read-u64-le sap off)))
+                                         (incf off 8)
+                                         (resolve-cgroup-path cgid)))
                                       ((eq ty :ipv-any)
                                        ;; 1 family byte + 16 bytes addr.
                                        ;; Family AF_INET (2) → v4 of bytes
@@ -1119,8 +1146,21 @@
                   "%H:%M:%S~%")))
     (write-string (strftime-light fmt))))
 
+(defun decode-cat-record (sap cat-paths-table)
+  "Read the file named by the id at offset 4 and write its contents."
+  (let* ((id (sap-read-u32-le sap 4))
+         (path (cdr (assoc id cat-paths-table :test #'=))))
+    (when path
+      (handler-case
+          (with-open-file (s path :direction :input)
+            (loop for line = (read-line s nil nil)
+                  while line
+                  do (write-line line)))
+        (error () (format t "cat(\"~A\"): unable to read~%" path))))))
+
 (defun make-ring-callback (printf-table map-id-table map-alist info-list
-                           &key stacks-info stack-depth time-format-table)
+                           &key stacks-info stack-depth time-format-table
+                                cat-paths-table)
   "Build the dispatcher that READ_RING_BUFFER invokes for every record."
   (lambda (sap len)
     (declare (ignore len))
@@ -1131,6 +1171,7 @@
                                     stacks-info stack-depth))
         (2 (decode-clear-map-record sap map-id-table map-alist))
         (3 (decode-time-record      sap time-format-table))
+        (4 (decode-cat-record       sap cat-paths-table))
         (t nil)))
     (force-output)))
 
@@ -1175,6 +1216,7 @@
            (symbolizer (whistler/symbolize:open-symbolizer))
            (printf-table (getf gen :printf-table))
            (time-format-table (getf gen :time-format-table))
+           (cat-paths-table (getf gen :cat-paths-table))
            (map-id-table (getf gen :map-id-table))
            (info-list-cached info-list)
            (ring-consumer
@@ -1185,7 +1227,8 @@
                                     map-alist info-list-cached
                                     :stacks-info stacks-info
                                     :stack-depth stack-depth
-                                    :time-format-table time-format-table))))
+                                    :time-format-table time-format-table
+                                    :cat-paths-table cat-paths-table))))
            (begin-progs (remove-if-not
                          (lambda (entry)
                            (begin-section-p
