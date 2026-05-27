@@ -49,6 +49,13 @@
 - [Ring Buffer Consumer](./loader/ringbuf.md)
 - [Inline BPF Sessions](./loader/sessions.md)
 
+# bpftrace Frontend
+
+- [Overview](./bpftrace/index.md)
+- [CLI Reference](./bpftrace/cli.md)
+- [Surface Language](./bpftrace/surface.md)
+- [Examples](./bpftrace/examples.md)
+
 # Compiler Internals
 
 - [Compilation Model](./internals/compilation.md)

@@ -97,3 +97,26 @@ You can also use inline BPF sessions that compile and load in the same form:
 ```
 
 One file, one language, no intermediate artifacts.
+
+## The bpftrace frontend
+
+The same Whistler binary runs scripts written in bpftrace's surface
+language. Parser, AST passes, codegen — all in the same SBCL image,
+reusing the standard Whistler IR pipeline. No clang, no LLVM, no
+separate bpftrace install.
+
+```sh
+sudo whistler bpftrace -e \
+  'tracepoint:syscalls:sys_enter_openat
+     { printf("%-16s %s\n", comm, str(args->filename)); }'
+```
+
+It supports the bulk of bpftrace's day-to-day surface — probes
+(kprobe / kretprobe / kfunc / tracepoint / uprobe / profile / interval /
+BEGIN / END, with wildcards and multi-target specs), all the standard
+aggregations (`count`, `sum`, `avg`, `min`, `max`, `stats`, `hist`,
+`lhist`), `str` / `ksym` / `usym` / `ntop` / `reg`, `printf` with
+format flags, symbolic constants from BTF, struct casts, user-defined
+`fn`, `while` loops, and the usual CLI flags (`-e`, `-l`, `-p`, `-c`,
+`--dump`). See [the bpftrace chapter](./bpftrace/index.md) for the
+full reference.
