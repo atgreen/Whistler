@@ -32,12 +32,40 @@
   key-size         ; bytes (set by inference; 0 if scalar-only)
   value-size       ; bytes
   max-entries
-  key-builtin)     ; hint for printing; :pid / :arg / NIL
+  key-builtin      ; hint for printing; :pid / :arg / NIL
+  keyed-p)         ; T iff any access used [keys]. Scalar-only `@m =`
+                   ;   maps stay NIL so the printer skips the `[…]`.
 
 (defun builtin-size (kw)
   (case kw
     ((:pid :tid :uid :gid :cpu) 4)
     (t 8)))
+
+(defvar *tp-field-sizes* nil
+  "Hash table FIELD-NAME (string) → byte size, populated once per
+   generate() from every tracepoint format file referenced by the
+   script. NIL outside generate().")
+
+(defun load-tracepoint-field-sizes (script)
+  "Walk SCRIPT, parse each referenced tracepoint format file, and
+   build *TP-FIELD-SIZES*. Skips silently if a format file can't be
+   read — the caller falls back to a default size."
+  (let ((table (make-hash-table :test 'equal)))
+    (dolist (probe (rest script))
+      (dolist (spec (getf (cdr probe) :specs))
+        (when (eq (first spec) :tracepoint)
+          (let* ((cat (substitute #\_ #\- (second spec)))
+                 (event (substitute #\_ #\- (third spec)))
+                 (path (ignore-errors
+                        (whistler::find-tracepoint-format-path cat event))))
+            (when path
+              (dolist (field (ignore-errors
+                              (whistler::parse-tracepoint-format
+                               (namestring path))))
+                (destructuring-bind (c-name _off size _signed _array) field
+                  (declare (ignore _off _signed _array))
+                  (setf (gethash c-name table) size))))))))
+    table))
 
 (defun expr-size (expr)
   "Best-effort byte-size for EXPR when used as a map key. Must match
@@ -50,15 +78,51 @@
     (:retval  8)
     (:var     8)
     (:bin     8)
-    ;; args->FIELD: tracepoint fields are u32 in the vast majority of
-    ;; sched_*, syscalls_*, block_* tracepoints (pid, tid, prev_pid,
-    ;; next_pid, prio, state, dev, ...). Default to 4. Phase 2 should
-    ;; parse the tracepoint format file for exact widths.
-    (:field   (if (and (consp (getf (cdr expr) :base))
-                       (eq (first (getf (cdr expr) :base)) :args))
-                  4
-                  8))
+    (:field
+     (let ((name (getf (cdr expr) :name)))
+       (cond
+         ;; tracepoint args->FIELD: look up the real size from the
+         ;; tracefs format file we parsed in load-tracepoint-field-sizes.
+         ((and (consp (getf (cdr expr) :base))
+               (eq (first (getf (cdr expr) :base)) :args)
+               *tp-field-sizes*
+               (gethash name *tp-field-sizes*)))
+         ;; Unknown: default to 4 (most sched/syscalls fields are u32).
+         (t 4))))
     (t        8)))
+
+(defun size->type (size)
+  "Whistler integer type symbol for a 1/2/4/8-byte slot."
+  (ecase size
+    (1 (intern "U8"  :whistler))
+    (2 (intern "U16" :whistler))
+    (4 (intern "U32" :whistler))
+    (8 (intern "U64" :whistler))))
+
+(defun align-up (n alignment)
+  (* alignment (ceiling n alignment)))
+
+(defun composite-key-layout (keys)
+  "Plan the on-stack layout for a composite map key. Every component
+   takes a full u64 slot (zero-extending narrower types), giving total
+   = 8*N bytes. This is wasteful but has three nice properties:
+
+     * The buffer is always > 8 bytes for N ≥ 2, which trips whistler's
+       struct-key-map-p test (`key-size > 8`) so getmap / setmap /
+       remmap / incf-map auto-dispatch to map-lookup-ptr et al.
+     * Every byte is initialized (BPF zero-extends u32/u16 stores into
+       u64 registers), so the verifier won't reject the buffer for
+       containing uninitialized bytes.
+     * Two probes referencing the same composite key produce byte-
+       identical layouts, so lookups match writes.
+
+   Returns (values LAYOUT TOTAL-BYTES). Each layout entry is
+   (OFFSET 8 U64-TYPE-SYM EXPR)."
+  (let ((u64 (size->type 8)))
+    (values (loop for e in keys
+                  for offset from 0 by 8
+                  collect (list offset 8 u64 e))
+            (* 8 (length keys)))))
 
 (defun key-hint (expr)
   (case (first expr)
@@ -85,9 +149,12 @@
                (let ((info (ensure mref))
                      (keys (getf (cdr mref) :keys)))
                  (when keys
-                   (setf (minfo-key-size info)
-                         (max (minfo-key-size info)
-                              (apply #'+ (mapcar #'expr-size keys))))
+                   (setf (minfo-keyed-p info) t)
+                   (multiple-value-bind (_layout total)
+                       (composite-key-layout keys)
+                     (declare (ignore _layout))
+                     (setf (minfo-key-size info)
+                           (max (minfo-key-size info) total)))
                    (when (and (null (minfo-key-builtin info))
                               (= (length keys) 1))
                      (setf (minfo-key-builtin info) (key-hint (first keys)))))))
@@ -185,7 +252,11 @@
     (:tid    `(whistler::logand (whistler::get-current-pid-tgid) #xffffffff))
     (:uid    `(whistler::logand (whistler::get-current-uid-gid)  #xffffffff))
     (:gid    `(whistler::ash (whistler::get-current-uid-gid)  -32))
-    (:nsecs  '(whistler::ktime-get-ns))
+    ;; Match bpftrace: `nsecs` is CLOCK_BOOTTIME (continues counting
+    ;; while the machine is suspended), not CLOCK_MONOTONIC. Without
+    ;; this, a laptop that slept for an hour shows latencies offset by
+    ;; an hour vs the real bpftrace tool.
+    (:nsecs  '(whistler::ktime-get-boot-ns))
     (:cpu    '(whistler::get-smp-processor-id))
     (:cgroup '(whistler::get-current-cgroup-id))
     (:rand   '(whistler::get-prandom-u32))
@@ -243,18 +314,67 @@
                       ,(lower-expr (getf (cdr expr) :then))
                       ,(lower-expr (getf (cdr expr) :else))))
 
+(defparameter *exit-map-name* (intern "--BT-EXIT--" :whistler)
+  "Hidden array map used as a kernel→user `exit()` flag.")
+
+(defparameter *print-map-name* (intern "--BT-PRINT--" :whistler)
+  "Hidden ringbuf map used to ferry kernel-side printf records back
+   to the userspace runtime, which formats and writes them to stdout.")
+
+(defvar *printf-table* nil
+  "Per-generate() list of (ID . (FMT-STRING ARG-COUNT)) entries. The
+   runtime gets this verbatim and uses ID to recover the format
+   string when it pops a record off the ringbuf.")
+
+(defvar *printf-id-counter* 0
+  "Per-generate() counter for unique printf event IDs.")
+
 (defun lower-call (expr)
   (let ((name (getf (cdr expr) :name)))
     (cond
       ((string= name "count") (unsupported "count() must be on the RHS of @map = …"))
       ((string= name "hist")  (unsupported "hist() must be on the RHS of @map = …"))
       ((string= name "lhist") (unsupported "lhist() — Phase 1 ships hist() only"))
-      ((string= name "exit")  0)            ; exit() is userspace-only
-      ((string= name "printf") 0)           ; printf() is userspace-only
+      ((string= name "exit")
+       ;; Set the exit flag the userspace print loop polls every tick.
+       `(setf (whistler:getmap ,*exit-map-name* 0) 1))
+      ((string= name "printf") (lower-printf (getf (cdr expr) :args)))
       ((string= name "clear") 0)
       ((string= name "zero")  0)
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       (t (unsupported "function ~A" name)))))
+
+(defun lower-printf (args)
+  "Lower a bpftrace `printf(\"FMT\", arg1, …)` to a ringbuf-submit.
+
+   Layout of each record:
+     offset 0:  u32 event-id  (index into the printf-table)
+     offset 4:  u32 nargs     (echoed for the userspace decoder's sanity)
+     offset 8+: u64 args …    (every arg widened to 64 bits)
+
+   At codegen time we register (id . (fmt-string nargs)) in
+   *PRINTF-TABLE*, which the runtime gets via :printf-table in the
+   generate() plist. At runtime, a ring-consumer reads each record,
+   recovers the format string by ID, and printf-formats to stdout."
+  (unless args
+    (unsupported "printf() with no format string"))
+  (let ((fmt (first args)))
+    (unless (eq (first fmt) :str)
+      (unsupported "printf() format must be a string literal"))
+    (let* ((fmt-str (second fmt))
+           (extra-args (rest args))
+           (nargs (length extra-args))
+           (id (incf *printf-id-counter*))
+           (size (+ 8 (* 8 nargs)))
+           (rec (gensym "REC")))
+      (push (list id fmt-str nargs) *printf-table*)
+      `(whistler:with-ringbuf (,rec ,*print-map-name* ,size)
+         (whistler::store ,(intern "U32" :whistler) ,rec 0 ,id)
+         (whistler::store ,(intern "U32" :whistler) ,rec 4 ,nargs)
+         ,@(loop for a in extra-args
+                 for off from 8 by 8
+                 collect `(whistler::store ,(intern "U64" :whistler)
+                                           ,rec ,off ,(lower-expr a)))))))
 
 (defun lower-field (expr)
   (let ((base (getf (cdr expr) :base))
@@ -264,20 +384,42 @@
        (list (w-sym (concatenate 'string "tp-" name))))
       (t (unsupported "field access .~A on non-args expressions" name)))))
 
-(defun lower-key-form (keys)
+(defun with-key (keys body-fn)
+  "Run BODY-FN with the form to use as a map key. For scalar (zero or
+   one component) keys, BODY-FN gets the bare integer expression. For
+   composite keys, wraps the call in a let* that allocates a stack
+   buffer, stores each component at its layout offset, and passes the
+   buffer pointer symbol to BODY-FN. The map's declared :key-size (>8
+   for composites) triggers whistler's auto-dispatch to -ptr ops."
   (cond
-    ((null keys)           0)
-    ((= (length keys) 1)   (lower-expr (first keys)))
-    (t (unsupported "composite map keys (~D parts) — Phase 1 supports 1 key"
-                    (length keys)))))
+    ((null keys)         (funcall body-fn 0))
+    ((= (length keys) 1) (funcall body-fn (lower-expr (first keys))))
+    (t
+     (multiple-value-bind (layout total) (composite-key-layout keys)
+       (let ((k (gensym "K")))
+         `(let* ((,k ,(intern "U64" :whistler)
+                  (whistler::struct-alloc ,total)))
+            ,@(loop for entry in layout
+                    for (offset _size type expr) = entry
+                    collect `(whistler::store ,type ,k ,offset
+                                              ,(lower-expr expr)))
+            ,(funcall body-fn k)))))))
+
+(defun lower-key-form (keys)
+  "Single-value form for scalar key callers (hist bucket lookup, etc.).
+   For composite keys, prefer WITH-KEY which builds the stack buffer."
+  (cond
+    ((null keys)         0)
+    ((= (length keys) 1) (lower-expr (first keys)))
+    (t (unsupported "composite keys cannot appear in this position"))))
 
 (defun lower-map-read (expr)
   (let* ((info (or (gethash (or (getf (cdr expr) :name) "@") *map-table*)
                    (unsupported "unknown map @~A" (getf (cdr expr) :name))))
          (mname (minfo-name info))
-         (keys  (getf (cdr expr) :keys))
-         (key   (lower-key-form keys)))
-    `(whistler:getmap ,mname ,key)))
+         (keys  (getf (cdr expr) :keys)))
+    (with-key keys
+      (lambda (k) `(whistler:getmap ,mname ,k)))))
 
 ;;; ========== Statement lowering ==========
 
@@ -350,25 +492,30 @@
   (let* ((info (or (gethash (or (getf (cdr mref) :name) "@") *map-table*)
                    (error "internal: missing map ~A" (getf (cdr mref) :name))))
          (mname (minfo-name info))
-         (key   (lower-key-form (getf (cdr mref) :keys))))
+         (keys  (getf (cdr mref) :keys)))
     (cond
       ((and (consp rhs) (eq (first rhs) :call))
        (let ((fn (getf (cdr rhs) :name)))
          (cond
            ((string= fn "count")
-            `(whistler:incf (whistler:getmap ,mname ,key)))
+            (with-key keys
+              (lambda (k) `(whistler:incf (whistler:getmap ,mname ,k)))))
            ((string= fn "hist")
+            (when (rest keys)
+              (unsupported "@m[k1,…] = hist(x) — per-key histograms not yet supported"))
             (gen-hist-update mname (lower-expr (first (getf (cdr rhs) :args)))))
            ((string= fn "lhist")
             (unsupported "lhist() — Phase 1 ships hist() only"))
-           (t (gen-scalar-set mname key (lower-expr rhs) op)))))
-      (t (gen-scalar-set mname key (lower-expr rhs) op)))))
+           (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
+      (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
 
-(defun gen-scalar-set (mname key value op)
-  (ecase op
-    (:=  `(setf (whistler:getmap ,mname ,key) ,value))
-    (:+= `(whistler:incf (whistler:getmap ,mname ,key) ,value))
-    (:-= `(whistler:decf (whistler:getmap ,mname ,key) ,value))))
+(defun gen-scalar-set (mname keys value op)
+  (with-key keys
+    (lambda (k)
+      (ecase op
+        (:=  `(setf (whistler:getmap ,mname ,k) ,value))
+        (:+= `(whistler:incf (whistler:getmap ,mname ,k) ,value))
+        (:-= `(whistler:decf (whistler:getmap ,mname ,k) ,value))))))
 
 (defun gen-hist-update (mname value-form)
   (let ((val  (gensym "V"))
@@ -386,10 +533,12 @@
          (info  (or (gethash (or (getf (cdr lhs) :name) "@") *map-table*)
                     (error "internal: missing map ~A" (getf (cdr lhs) :name))))
          (mname (minfo-name info))
-         (key   (lower-key-form (getf (cdr lhs) :keys))))
-    (ecase op
-      (:inc `(whistler:incf (whistler:getmap ,mname ,key)))
-      (:dec `(whistler:decf (whistler:getmap ,mname ,key))))))
+         (keys  (getf (cdr lhs) :keys)))
+    (with-key keys
+      (lambda (k)
+        (ecase op
+          (:inc `(whistler:incf (whistler:getmap ,mname ,k)))
+          (:dec `(whistler:decf (whistler:getmap ,mname ,k))))))))
 
 (defun lower-expr-stmt (stmt)
   (let ((e (second stmt)))
@@ -400,25 +549,39 @@
               (info (or (gethash (or (getf (cdr arg) :name) "@") *map-table*)
                         (error "internal: delete of unknown @map")))
               (mname (minfo-name info)))
-         `(whistler:remmap ,mname ,(lower-key-form (getf (cdr arg) :keys)))))
-      ;; clear/zero/printf/exit are userspace-only — kernel side is a no-op.
+         (with-key (getf (cdr arg) :keys)
+           (lambda (k) `(whistler:remmap ,mname ,k)))))
+      ;; clear/zero/time are userspace-only — kernel side is a no-op.
+      ;; (exit and printf are intentionally NOT in this list so lower-call
+      ;; handles them: exit sets the bt-exit flag, printf becomes a
+      ;; bpf_trace_printk to /sys/kernel/tracing/trace_pipe.)
       ((and (consp e) (eq (first e) :call)
             (member (getf (cdr e) :name)
-                    '("clear" "zero" "printf" "exit" "time")
+                    '("clear" "zero" "time")
                     :test #'string=))
        0)
       (t (lower-expr e)))))
 
 ;;; ========== Probe lowering ==========
 
-(defparameter *kernel-spec-tags* '(:kprobe :kretprobe :tracepoint))
+(defparameter *kernel-spec-tags* '(:kprobe :kretprobe :tracepoint :begin :end))
 
 (defun spec->section (spec)
   (ecase (first spec)
     (:kprobe     (values :kprobe       (format nil "kprobe/~A" (second spec))))
     (:kretprobe  (values :kretprobe    (format nil "kretprobe/~A" (second spec))))
     (:tracepoint (values :tracepoint
-                         (format nil "tracepoint/~A/~A" (second spec) (third spec))))))
+                         (format nil "tracepoint/~A/~A" (second spec) (third spec))))
+    ;; BEGIN/END compile to SYSCALL programs invoked once via
+    ;; BPF_PROG_TEST_RUN. The "test_run/" prefix flags them so the
+    ;; runtime skips the attach path.
+    (:begin      (values :kprobe (format nil "test_run/begin_~D"
+                                         (incf *test-run-counter*))))
+    (:end        (values :kprobe (format nil "test_run/end_~D"
+                                         (incf *test-run-counter*))))))
+
+(defvar *test-run-counter* 0
+  "Per-generate() counter used to keep BEGIN/END section names unique.")
 
 (defun gen-probe-forms (probe index)
   "Return ((kernel-form …) (user-spec …)) for PROBE — multiple specs
@@ -525,16 +688,63 @@
 
 ;;; ========== Public entry ==========
 
+(defun script-uses-exit-p (script)
+  "Walk SCRIPT and return T if any call to `exit()` appears anywhere
+   in any probe body. Used to decide whether to inject the hidden
+   __bt-exit__ flag map."
+  (labels ((walk (form)
+             (cond
+               ((not (consp form)) nil)
+               ((and (eq (first form) :call)
+                     (string= (getf (cdr form) :name) "exit"))
+                t)
+               (t (some #'walk form)))))
+    (some (lambda (probe) (walk (getf (cdr probe) :body)))
+          (rest script))))
+
+(defun script-uses-printf-p (script)
+  "T iff the script calls printf() anywhere — used to decide whether
+   to inject the hidden bt-print ringbuf map."
+  (labels ((walk (form)
+             (cond
+               ((not (consp form)) nil)
+               ((and (eq (first form) :call)
+                     (string= (getf (cdr form) :name) "printf"))
+                t)
+               (t (some #'walk form)))))
+    (some (lambda (probe) (walk (getf (cdr probe) :body)))
+          (rest script))))
+
 (defun generate (script)
   "Translate normalised SCRIPT to a plist:
-     :maps        (defmap forms)
-     :progs       (defprog/preamble forms, one per kernel probe)
-     :user-probes (list of (:spec … :body …) for BEGIN/END/interval)
-     :info        (raw-name :name :kind :key-builtin :key-size :value-size :max-entries)"
-  (let* ((map-table (infer-maps script))
+     :maps          (defmap forms)
+     :progs         (defprog/preamble forms, one per kernel probe)
+     :user-probes   (list of (:spec … :body …) for BEGIN/END/interval)
+     :info          (raw-name :name :kind :key-builtin :key-size :value-size :max-entries)
+     :exit-map      symbol of the hidden bt-exit map, if exit() is used
+     :print-map     symbol of the hidden bt-print ringbuf, if printf() is used
+     :printf-table  ((id fmt-string nargs) …) for ringbuf-record decoding"
+  (let* ((*tp-field-sizes* (load-tracepoint-field-sizes script))
+         (*test-run-counter* 0)
+         (*printf-table* nil)
+         (*printf-id-counter* 0)
+         (map-table (infer-maps script))
          (*map-table* map-table)
          (maps      (loop for info being the hash-values of map-table
                           collect (gen-defmap info)))
+         (uses-exit (script-uses-exit-p script))
+         (uses-printf (script-uses-printf-p script))
+         (exit-map-form
+           (when uses-exit
+             `(whistler:defmap ,*exit-map-name*
+                :type :array :key-size 4 :value-size 1 :max-entries 1)))
+         (print-map-form
+           (when uses-printf
+             ;; max-entries = ringbuf byte capacity (must be a power
+             ;; of two ≥ page size). 256 KiB is plenty for one-liners
+             ;; and biolatency-class banners.
+             `(whistler:defmap ,*print-map-name*
+                :type :ringbuf :max-entries 262144)))
          (probes    nil)
          (user      nil)
          (tp-preamble (gen-deftracepoint-preamble script)))
@@ -543,9 +753,14 @@
           do (multiple-value-bind (kforms us) (gen-probe-forms probe i)
                (setf probes (append probes kforms)
                      user   (append user us))))
-    (list :maps maps
+    (list :maps (append (when exit-map-form  (list exit-map-form))
+                        (when print-map-form (list print-map-form))
+                        maps)
           :progs (append tp-preamble probes)
           :user-probes user
+          :exit-map (when uses-exit *exit-map-name*)
+          :print-map (when uses-printf *print-map-name*)
+          :printf-table (reverse *printf-table*)
           :info (loop for raw being the hash-keys of map-table
                       using (hash-value info)
                       collect (list (or raw "@")
@@ -553,5 +768,9 @@
                                     :kind (minfo-kind info)
                                     :key-builtin (minfo-key-builtin info)
                                     :key-size (minfo-key-size info)
+                                    :key-parts (if (> (minfo-key-size info) 8)
+                                                   (/ (minfo-key-size info) 8)
+                                                   1)
+                                    :keyed-p (minfo-keyed-p info)
                                     :value-size (minfo-value-size info)
                                     :max-entries (minfo-max-entries info))))))

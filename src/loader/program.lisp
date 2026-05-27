@@ -55,6 +55,15 @@
          (and (>= (length section-name) 10)
               (string= (subseq section-name 0 10) "uretprobe/")))
      +bpf-prog-type-kprobe+)
+    ;; bpftrace BEGIN/END: RAW_TRACEPOINT programs invoked once from
+    ;; userspace via BPF_PROG_TEST_RUN. (bpftrace itself does exactly
+    ;; this; see attached_probe.cpp: case ProbeType::special → return
+    ;; BPF_PROG_TYPE_RAW_TRACEPOINT.) SYSCALL would also support
+    ;; test_run, but requires BPF_F_SLEEPABLE and a stricter ctx
+    ;; layout — raw_tracepoint avoids both.
+    ((and (>= (length section-name) 9)
+          (string= (subseq section-name 0 9) "test_run/"))
+     +bpf-prog-type-raw-tracepoint+)
     ((and (>= (length section-name) 11)
           (string= (subseq section-name 0 11) "tracepoint/"))
      +bpf-prog-type-tracepoint+)
@@ -118,8 +127,13 @@
   "Load a BPF program into the kernel. Returns the prog FD.
    EXPECTED-ATTACH-TYPE is required for cgroup program types.
    On failure, retries with logging and signals bpf-verifier-error."
-  (let ((buf (make-attr-buf))
-        (insn-count (/ (length insns) 8)))
+  (let* ((buf (make-attr-buf))
+         (insn-count (/ (length insns) 8))
+         ;; SYSCALL programs require BPF_F_SLEEPABLE; nothing else
+         ;; needs special flags at load time.
+         (prog-flags (if (= prog-type +bpf-prog-type-syscall+)
+                         +bpf-f-sleepable+
+                         0)))
     (sb-sys:with-pinned-objects (insns)
       (let ((license-bytes (sb-ext:string-to-octets license :null-terminate t)))
         (sb-sys:with-pinned-objects (license-bytes)
@@ -128,6 +142,7 @@
           (put-ptr buf 8 (sb-sys:vector-sap insns))
           (put-ptr buf 16 (sb-sys:vector-sap license-bytes))
           (put-u32 buf 24 log-level)
+          (put-u32 buf 44 prog-flags)
           (when expected-attach-type
             (put-u32 buf 68 expected-attach-type))
           (when attach-btf-id
@@ -149,6 +164,7 @@
                   (put-u32 buf 24 6)  ; log_level = stats + detailed
                   (put-u32 buf 28 log-buf-size)
                   (put-ptr buf 32 (sb-sys:vector-sap log-buf))
+                  (put-u32 buf 44 prog-flags)
                   (when expected-attach-type
                     (put-u32 buf 68 expected-attach-type))
                   (when attach-btf-id
@@ -163,3 +179,18 @@
                                :context "prog-load"
                                :errno (bpf-error-errno e)
                                :log log-str)))))))))))))
+
+(defun prog-test-run (prog-fd)
+  "Invoke a loaded BPF program once via BPF_PROG_TEST_RUN. Mirrors
+   what libbpf's `bpf_prog_test_run_opts(fd, NULL)` does — every
+   field zero, no ctx, no data, repeat=0, attr size = offsetofend of
+   the full `test` struct (80, including the 4-byte padding after
+   batch_size for u64 alignment). bpftrace fires BEGIN/END this way.
+   Returns R0."
+  (let ((buf (make-attr-buf)))
+    (put-u32 buf 0 prog-fd)
+    (%bpf +bpf-prog-test-run+ buf 80 "prog-test-run")
+    (logior (aref buf 4)
+            (ash (aref buf 5) 8)
+            (ash (aref buf 6) 16)
+            (ash (aref buf 7) 24))))

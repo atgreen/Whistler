@@ -1,0 +1,19 @@
+// biolatency-tp.bt — block I/O latency histogram, microseconds.
+//
+// Uses block tracepoints, which (unlike kprobe:blk_account_io_start)
+// are stable across kernel versions. The composite (dev, sector) key
+// uniquely identifies an in-flight request.
+
+BEGIN {
+  printf("Tracing block I/O latency. Hit Ctrl-C to summarise.\n");
+}
+
+tracepoint:block:block_rq_issue {
+  @start[args->dev, args->sector] = nsecs;
+}
+
+tracepoint:block:block_rq_complete /@start[args->dev, args->sector]/ {
+  $delta = nsecs - @start[args->dev, args->sector];
+  @usecs = hist($delta / 1000);
+  delete(@start[args->dev, args->sector]);
+}

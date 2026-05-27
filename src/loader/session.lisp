@@ -86,9 +86,11 @@
 ;;; ========== Integer key/value encoding ==========
 
 (defun encode-int-key (value size)
-  "Encode an integer as a little-endian byte array of SIZE bytes."
+  "Encode an integer as a little-endian byte array of SIZE bytes.
+   Handles widths > 8 bytes (composite keys) by writing every byte of
+   the bignum, not just the low 64 bits."
   (let ((buf (make-array size :element-type '(unsigned-byte 8) :initial-element 0)))
-    (loop for i below (min size 8)
+    (loop for i below size
           do (setf (aref buf i) (logand (ash value (* i -8)) #xff)))
     buf))
 

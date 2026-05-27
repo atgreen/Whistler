@@ -90,15 +90,14 @@
 ;;; ========== Pretty-printing maps ==========
 
 (defun map-keys (info)
-  "Walk the map (or array) and return a list of integer keys present."
+  "Walk the map (or array) and return a list of integer keys present.
+   First call passes nil so the kernel returns the first key — passing
+   a concrete zero key would *skip* key 0 if it happened to be in the
+   map (e.g. `@m = …` stores at key 0)."
   (let ((keys nil)
         (cur  nil))
     (loop
-      (let ((next (whistler/loader::map-get-next-key
-                   info
-                   (or cur (whistler/loader::encode-int-key
-                            0
-                            (whistler/loader::map-info-key-size info))))))
+      (let ((next (whistler/loader::map-get-next-key info cur)))
         (unless next (return))
         (push (whistler/loader::decode-int-value next) keys)
         (setf cur next)))
@@ -125,9 +124,19 @@
         (dotimes (i n) (when (< i width) (setf (char out i) #\@)))
         out)))
 
-(defun format-key (key)
-  "Render KEY (an integer) as bpftrace does: bare decimal."
-  (format nil "~D" key))
+(defun format-key (key &key (parts 1))
+  "Render KEY (an integer) as bpftrace does. For composite keys (PARTS > 1)
+   we recovered KEY by decoding 8*PARTS little-endian bytes into one big
+   integer — split it back into PARTS 8-byte components and render as
+   `a, b`. For scalar keys, bare decimal."
+  (cond
+    ((<= parts 1) (format nil "~D" key))
+    (t
+     (with-output-to-string (s)
+       (loop for i below parts
+             for v = (logand (ash key (* i -64)) #xffffffffffffffff)
+             do (when (plusp i) (write-string ", " s))
+                (format s "~D" v))))))
 
 (defun si-number (n)
   "bpftrace-style SI suffix: 1024 → \"1K\", 1048576 → \"1M\"."
@@ -165,16 +174,21 @@
                      count
                      (render-bar count maxc 52)))))
 
-(defun print-scalar-map (label info)
-  "Print a hash map's contents in bpftrace's END-dump style:
-   @LABEL[key]: count, one per line, sorted ascending by count.
-   Anonymous maps (`@[k]++` with no name) print as `@[k]: …`."
+(defun print-scalar-map (label info &key (key-parts 1) keyed-p)
+  "Print a hash map's contents in bpftrace's END-dump style.
+   KEY-PARTS > 1 means a composite key — split the bignum back into
+   8-byte components. KEYED-P=NIL means the script never used `[k]`
+   (bare `@m = …`); bpftrace renders those as `@m: value` without the
+   `[index]` part."
   (let* ((keys (map-keys info))
          (pairs (sort (mapcar (lambda (k) (cons k (lookup-int info k))) keys)
                       #'< :key #'cdr))
          (prefix (if (or (null label) (string= label "@")) "@" (format nil "@~A" label))))
     (dolist (kv pairs)
-      (format t "~A[~A]: ~D~%" prefix (format-key (car kv)) (cdr kv)))))
+      (if keyed-p
+          (format t "~A[~A]: ~D~%"
+                  prefix (format-key (car kv) :parts key-parts) (cdr kv))
+          (format t "~A: ~D~%" prefix (cdr kv))))))
 
 (defun print-all-maps (info-list map-alist)
   "Dump every known map in bpftrace END style."
@@ -182,6 +196,7 @@
     (let* ((raw-name    (first info-rec))
            (mname       (getf (cdr info-rec) :name))
            (kind        (getf (cdr info-rec) :kind))
+           (key-parts   (or (getf (cdr info-rec) :key-parts) 1))
            (alist-key   (string-downcase
                          (substitute #\_ #\- (symbol-name mname))))
            (entry       (assoc alist-key map-alist :test #'string=))
@@ -189,7 +204,9 @@
       (when mapinfo
         (case kind
           (:hist (print-hist raw-name mapinfo))
-          (t     (print-scalar-map raw-name mapinfo)))))))
+          (t     (print-scalar-map raw-name mapinfo
+                                   :key-parts key-parts
+                                   :keyed-p (getf (cdr info-rec) :keyed-p))))))))
 
 ;;; ========== Userspace BEGIN/END ==========
 
@@ -211,37 +228,184 @@
 
 (defvar *bpftrace-running* nil)
 
+(defun exit-flag-set-p (exit-info)
+  "Read the hidden bt-exit map and return T if the kernel side set the
+   flag. EXIT-INFO is the whistler/loader::map-info or NIL if the
+   script doesn't use exit()."
+  (and exit-info
+       (let ((v (whistler/loader::map-lookup-int exit-info 0)))
+         (and v (plusp v)))))
+
+(defun find-exit-map (gen map-alist)
+  "Look up the bt-exit map's map-info from MAP-ALIST, if any."
+  (let ((sym (getf gen :exit-map)))
+    (when sym
+      (let ((key (string-downcase (substitute #\_ #\- (symbol-name sym)))))
+        (cdr (assoc key map-alist :test #'string=))))))
+
+(defun find-print-map (gen map-alist)
+  (let ((sym (getf gen :print-map)))
+    (when sym
+      (let ((key (string-downcase (substitute #\_ #\- (symbol-name sym)))))
+        (cdr (assoc key map-alist :test #'string=))))))
+
+;;; ========== printf record decoding ==========
+
+(defun sap-read-u32-le (sap offset)
+  (sb-sys:sap-ref-32 sap offset))
+
+(defun sap-read-u64-le (sap offset)
+  (sb-sys:sap-ref-64 sap offset))
+
+(defun signed-64 (u)
+  "Reinterpret a 64-bit unsigned integer as signed."
+  (if (>= u (ash 1 63)) (- u (ash 1 64)) u))
+
+(defun format-printf (fmt args)
+  "Minimal C-style printf: walks FMT looking for %d/%i/%u/%lld/%llu/
+   %x/%lx/%llx/%X/%p/%c/%% specifiers and consumes one ARG each. %s
+   is not supported in Phase 1 (would require pulling string bytes
+   through the ringbuf). Returns the formatted output string."
+  (with-output-to-string (s)
+    (loop with i = 0
+          with n = (length fmt)
+          with rest = args
+          while (< i n)
+          for c = (char fmt i)
+          do (cond
+               ((not (char= c #\%))
+                (write-char c s) (incf i))
+               ;; Two-char sequences
+               ((and (< (1+ i) n) (char= (char fmt (1+ i)) #\%))
+                (write-char #\% s) (incf i 2))
+               ;; Parse [%][l|ll][d|i|u|x|X|p|c|s]
+               (t
+                (let ((j (1+ i)))
+                  ;; consume "l" or "ll"
+                  (loop while (and (< j n) (char= (char fmt j) #\l))
+                        do (incf j))
+                  (when (>= j n) (write-char c s) (return))
+                  (let ((spec (char fmt j))
+                        (arg  (pop rest)))
+                    (case spec
+                      ((#\d #\i)
+                       (format s "~D" (signed-64 (or arg 0))))
+                      ((#\u)
+                       (format s "~D" (or arg 0)))
+                      ((#\x #\p)
+                       (format s "~(~X~)" (or arg 0)))
+                      ((#\X)
+                       (format s "~X" (or arg 0)))
+                      ((#\c)
+                       (write-char (code-char (logand (or arg 0) #xff)) s))
+                      ((#\s)
+                       (write-string "<str>" s))
+                      (t
+                       (write-char #\% s)
+                       (write-char spec s))))
+                  (setf i (1+ j))))))))
+
+(defun make-printf-callback (printf-table)
+  "Return a lambda suitable for OPEN-RING-CONSUMER: pops an event from
+   the ringbuf, looks up its format string in PRINTF-TABLE, and writes
+   the formatted output to stdout."
+  (lambda (sap len)
+    (declare (ignore len))
+    (let* ((id   (sap-read-u32-le sap 0))
+           (n    (sap-read-u32-le sap 4))
+           (entry (find id printf-table :key #'first :test #'=)))
+      (when entry
+        (let ((fmt   (second entry))
+              (args  (loop for k below n
+                           collect (sap-read-u64-le sap (+ 8 (* k 8))))))
+          (write-string (format-printf fmt args))
+          (force-output))))))
+
+(defun test-run-section-p (section)
+  "T iff SECTION is one of our synthetic BEGIN/END sections."
+  (and section
+       (>= (length section) 9)
+       (string= (subseq section 0 9) "test_run/")))
+
+(defun begin-section-p (section)
+  (and (test-run-section-p section)
+       (>= (length section) 15)
+       (string= (subseq section 9 15) "begin_")))
+
+(defun end-section-p (section)
+  (and (test-run-section-p section)
+       (>= (length section) 13)
+       (string= (subseq section 9 13) "end_")))
+
 (defun run-generated (gen)
-  "Bring up GEN as a live BPF session and block until Ctrl-C.
-   Maps are dumped once on exit, matching real bpftrace's behavior
-   for scripts without an explicit interval: probe."
+  "Bring up GEN as a live BPF session and block until either Ctrl-C
+   or a kernel-side exit() flips the bt-exit flag. BEGIN/END probes
+   are kernel programs invoked via BPF_PROG_TEST_RUN; everything
+   else attaches normally."
   (multiple-value-bind (map-specs prog-specs info-list)
       (compile-generated gen)
     (let* ((map-alist  (whistler/loader::session-create-maps map-specs))
            (prog-alist (whistler/loader::session-load-progs prog-specs map-alist))
            (atts       nil)
-           (user       (getf gen :user-probes)))
+           (exit-info  (find-exit-map gen map-alist))
+           (print-info (find-print-map gen map-alist))
+           (printf-table (getf gen :printf-table))
+           (ring-consumer
+             (when print-info
+               (whistler/loader::open-ring-consumer
+                print-info (make-printf-callback printf-table))))
+           (begin-progs (remove-if-not
+                         (lambda (entry)
+                           (begin-section-p
+                            (whistler/loader::prog-info-section-name (cdr entry))))
+                         prog-alist))
+           (end-progs   (remove-if-not
+                         (lambda (entry)
+                           (end-section-p
+                            (whistler/loader::prog-info-section-name (cdr entry))))
+                         prog-alist))
+           (attach-progs (remove-if
+                          (lambda (entry)
+                            (test-run-section-p
+                             (whistler/loader::prog-info-section-name (cdr entry))))
+                          prog-alist)))
       (unwind-protect
            (handler-case
                (progn
-                 (dolist (entry prog-alist)
+                 ;; BEGIN — kernel test_run, before any attaches.
+                 (dolist (b begin-progs)
+                   (whistler/loader::prog-test-run
+                    (whistler/loader::prog-info-fd (cdr b))))
+                 ;; Drain anything BEGIN already wrote to the ringbuf
+                 ;; so its output prints before the main loop starts.
+                 (when ring-consumer
+                   (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
+                 ;; Attach all real probes.
+                 (dolist (entry attach-progs)
                    (push (attach-probe (cdr entry)) atts))
-                 ;; BEGIN probes
-                 (dolist (p user)
-                   (when (eq (first (getf p :spec)) :begin)
-                     (run-user-probe p)))
-                 ;; Sleep until interrupted.
+                 ;; Poll-sleep until interrupted or exit() fires.
+                 ;; Drain the printf ringbuf on every tick.
                  (setf *bpftrace-running* t)
                  (handler-case
-                     (loop while *bpftrace-running* do (sleep 1))
+                     (loop while (and *bpftrace-running*
+                                      (not (exit-flag-set-p exit-info)))
+                           do (if ring-consumer
+                                  (whistler/loader::ring-poll
+                                   ring-consumer :timeout-ms 100)
+                                  (sleep 0.1)))
                    (sb-sys:interactive-interrupt ()
                      (format t "~&^C~%"))))
              (bpftrace-attach-error (e)
                (format *error-output* "~&~A~%" e)))
-        ;; END probes + final dump.
-        (dolist (p user)
-          (when (eq (first (getf p :spec)) :end)
-            (run-user-probe p)))
+        ;; END — kernel test_run, then drain any final printf output,
+        ;; then dump maps.
+        (dolist (e end-progs)
+          (handler-case
+              (whistler/loader::prog-test-run
+               (whistler/loader::prog-info-fd (cdr e)))
+            (error () nil)))
+        (when ring-consumer
+          (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
         (print-all-maps info-list map-alist)
         (dolist (a atts) (handler-case (whistler/loader::detach a) (error () nil)))
         (dolist (e prog-alist)

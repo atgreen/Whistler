@@ -59,8 +59,13 @@
          (gen (whistler/bpftrace:compile-script src))
          (maps (getf gen :maps))
          (progs (getf gen :progs)))
-    (is (= 2 (length maps)) "two maps inferred (start, usecs)")
-    (is (= 2 (length progs)) "two kernel probes generated")
+    ;; @start + @usecs + a hidden bt-print ringbuf (BEGIN's printf
+    ;; now compiles to a ringbuf-submit). No bt-exit map because no
+    ;; exit() call here.
+    (is (= 3 (length maps)) "two @maps + bt-print ringbuf")
+    ;; Two real kprobes plus BEGIN + END (both now compile to BPF
+    ;; programs run via BPF_PROG_TEST_RUN).
+    (is (= 4 (length progs)) "two kprobes + BEGIN + END as BPF programs")
     ;; The histogram map is a percpu-array.
     (is (find-if (lambda (m)
                    (and (eq (third m) :type)

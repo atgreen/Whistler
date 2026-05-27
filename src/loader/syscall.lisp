@@ -39,6 +39,7 @@
 (defconstant +bpf-prog-load+ 5)
 (defconstant +bpf-obj-pin+ 6)
 (defconstant +bpf-obj-get+ 7)
+(defconstant +bpf-prog-test-run+ 10)
 (defconstant +bpf-link-create+ 28)
 
 ;;; ========== BPF map types ==========
@@ -62,6 +63,9 @@
 (defconstant +bpf-prog-type-cgroup-sock-addr+ 18)
 (defconstant +bpf-prog-type-tracing+ 26)
 (defconstant +bpf-prog-type-lsm+ 29)
+(defconstant +bpf-prog-type-syscall+ 31)
+(defconstant +bpf-prog-type-raw-tracepoint+ 17)
+(defconstant +bpf-f-sleepable+ #x10)
 
 ;;; ========== BPF commands (attach/detach) ==========
 
