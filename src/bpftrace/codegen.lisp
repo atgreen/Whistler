@@ -1118,6 +1118,15 @@
     ((and (eq (first expr) :var)
           (member (second expr) *comm-vars* :test #'string-equal))
      (cons :string +bt-comm-len+))
+    ;; A field chain whose leaf is a fixed-size byte array
+    ;; (e.g. `gendisk.disk_name' as `char[32]'). printf treats it
+    ;; as a NUL-padded string of the array's byte size.
+    ((eq (first expr) :field)
+     (multiple-value-bind (_ptr size kind) (analyze-chain expr)
+       (declare (ignore _ptr))
+       (if (and (eq kind :array) (plusp (or size 0)))
+           (cons :string size)
+           :int)))
     ;; @m[k] where m's value slot is a NUL-padded string — the value
     ;; lookup returns a pointer to value-size bytes the printf
     ;; record-emitter copies wholesale.
@@ -1299,6 +1308,12 @@
             `(whistler::dotimes (,i ,size)
                (whistler::store whistler::u8 ,rec (+ ,off ,i)
                                 (whistler::load whistler::u8 ,src ,i)))))
+         ;; A field-chain whose leaf is a char[] / u8[] array — emit
+         ;; one probe_read_kernel of SIZE bytes from the chain's
+         ;; computed pointer.
+         ((eq (first arg) :field)
+          `(whistler::probe-read-kernel
+            (+ ,rec ,off) ,size ,(lower-chain-as-ptr arg)))
          ;; @m[k] on a string-valued map — look up the entry, then
          ;; copy SIZE bytes from the value pointer into the record.
          ;; Missing key (NULL pointer) → leave the slot untouched
@@ -1397,34 +1412,36 @@
 
 (defun collect-field-chain (expr)
   "Walk a (possibly nested) :field expression to its root. Returns
-   (values ROOT-AST ROOT-STRUCT-NAME FIELD-NAMES) where FIELD-NAMES
-   is the list of dotted names from outermost-base to leaf. Returns
-   (nil nil nil) if no struct type can be inferred for the root.
-   :cast nodes encountered mid-chain are unwrapped — the cast type
-   annotates the chain's *result* for downstream use, not the source,
-   so we descend into the cast's :expr and continue walking."
-  (labels ((walk (e)
-             (cond
-               ((and (consp e) (eq (first e) :field))
-                (multiple-value-bind (r rs names) (walk (getf (cdr e) :base))
-                  (values r rs (append names (list (getf (cdr e) :name))))))
-               ;; Mid-chain cast: skip past it, but if we have no other
-               ;; struct-type hint upstream we'll fall back on the cast's
-               ;; type at the root-resolution step below.
-               ((and (consp e) (eq (first e) :cast))
-                (walk (getf (cdr e) :expr)))
-               (t (values e nil nil)))))
-    (multiple-value-bind (root _rs names) (walk expr)
-      (declare (ignore _rs))
-      (let ((struct-name
-              (cond
-                ((and (consp root) (eq (first root) :curtask))
-                 "task_struct")
-                ((and (consp root) (eq (first root) :var))
-                 (cdr (assoc (second root) *var-types* :test #'string=))))))
-        (if struct-name
-            (values root struct-name names)
-            (values nil nil nil))))))
+   (values ROOT-AST ROOT-STRUCT-NAME FIELD-NAMES). Casts encountered
+   in the chain are unwrapped — but the *outermost* enclosing cast
+   stays as the chain's struct hint when nothing better is upstream,
+   so `(struct bio *)arg1.bi_bdev.bd_disk.disk_name' walks against
+   struct bio."
+  (let ((cast-hint nil))
+    (labels ((walk (e)
+               (cond
+                 ((and (consp e) (eq (first e) :field))
+                  (multiple-value-bind (r rs names) (walk (getf (cdr e) :base))
+                    (values r rs (append names (list (getf (cdr e) :name))))))
+                 ;; Mid-chain cast: remember its type as a fallback
+                 ;; hint, then descend into the cast's value.
+                 ((and (consp e) (eq (first e) :cast))
+                  (setf cast-hint (or cast-hint (getf (cdr e) :type)))
+                  (walk (getf (cdr e) :expr)))
+                 (t (values e nil nil)))))
+      (multiple-value-bind (root _rs names) (walk expr)
+        (declare (ignore _rs))
+        (let ((struct-name
+                (cond
+                  ((and (consp root) (eq (first root) :curtask))
+                   "task_struct")
+                  ((and (consp root) (eq (first root) :var))
+                   (or (cdr (assoc (second root) *var-types* :test #'string=))
+                       cast-hint))
+                  (t cast-hint))))
+          (if struct-name
+              (values root struct-name names)
+              (values nil nil nil)))))))
 
 (defun lower-chained-field (root-ptr-form root-struct-name chain)
   "Walk BTF for each name in CHAIN, summing offsets through embedded
@@ -1762,52 +1779,80 @@
 
 (defun analyze-chain (expr)
   "If EXPR is a recognisable field chain, return (values PTR-FORM
-   LEAF-SIZE LEAF-KIND) where PTR-FORM points at the leaf, LEAF-SIZE
-   is its byte size, and LEAF-KIND is :scalar or :array. Walks by
-   the field's raw type-id at each hop so anonymous unions/structs
-   (like `struct in6_addr::in6_u') keep their offsets — looking them
-   up by struct-name would fail since they have empty BTF names."
+   LEAF-SIZE LEAF-KIND) where PTR-FORM is a Whistler expression
+   pointing at the leaf, LEAF-SIZE is its byte size, and LEAF-KIND
+   is :scalar or :array. Walks by raw BTF type-id at each hop and
+   inserts probe_read_kernel deref bindings whenever a mid-chain
+   pointer field is crossed — so chains like
+   `(struct bio *)arg1.bi_bdev.bd_disk.disk_name' (two pointer hops
+   ending in a char[]) round-trip into a let* that yields the
+   correct leaf-pointer."
   (when (and (consp expr) (eq (first expr) :field))
     (multiple-value-bind (root struct-name names)
         (collect-field-chain expr)
       (when (and root struct-name)
         (let* ((vmbtf (whistler:ensure-vmlinux-btf))
                (current-tid (whistler:btf-find-struct vmbtf struct-name))
-               (total 0)
+               (cur-ptr (root-ptr-form root))
+               (segment-offset 0)
+               (deref-bindings nil)
                (leaf-size nil)
                (leaf-kind nil))
           (unless current-tid
             (unsupported "chain: struct ~A not in vmlinux BTF" struct-name))
-          (loop for (fname . rest) on names
-                for last? = (null rest)
-                do (let* ((fields (whistler:btf-struct-fields vmbtf current-tid))
-                          (cell (find fname fields :test #'string= :key #'first)))
-                     (unless cell
-                       (unsupported "chain ~A: no such field" fname))
-                     (incf total (third cell))
-                     (cond
-                       (last?
-                        (cond
-                          ((and (null (second cell))
-                                (stringp (fifth cell))
-                                (string= (fifth cell) "array"))
-                           ;; Recompute the array's byte size since
-                           ;; btf-resolve-type returns 0 for arrays
-                           ;; (the rec :size field isn't populated;
-                           ;; the array struct that follows carries
-                           ;; elem-type + nelems).
-                           (multiple-value-bind (_etype nelems esize)
-                               (whistler:btf-resolve-array vmbtf (sixth cell))
-                             (declare (ignore _etype))
-                             (setf leaf-size (* (or nelems 0) (or esize 0))))
-                           (setf leaf-kind :array))
-                          (t
-                           (setf leaf-size (fourth cell))
-                           (setf leaf-kind :scalar))))
-                       ;; Mid-chain: advance into the field's type by id.
-                       (t (setf current-tid (sixth cell))))))
-          (values `(whistler::+ ,(root-ptr-form root) ,total)
-                  leaf-size leaf-kind))))))
+          (labels ((start-new-segment-by-deref ()
+                     (let ((scratch (gensym "DEREF"))
+                           (ptrvar  (gensym "PTR")))
+                       (push (list scratch `(whistler::struct-alloc 8))
+                             deref-bindings)
+                       (push (list ptrvar
+                                   `(progn
+                                      (whistler::probe-read-kernel
+                                       ,scratch 8
+                                       (whistler::+ ,cur-ptr ,segment-offset))
+                                      (whistler::load whistler::u64 ,scratch 0)))
+                             deref-bindings)
+                       (setf cur-ptr ptrvar
+                             segment-offset 0))))
+            (loop for (fname . rest) on names
+                  for last? = (null rest)
+                  do (let* ((fields (whistler:btf-struct-fields vmbtf current-tid))
+                            (cell (find fname fields :test #'string= :key #'first)))
+                       (unless cell
+                         (unsupported "chain ~A: no such field" fname))
+                       (incf segment-offset (third cell))
+                       (cond
+                         (last?
+                          (cond
+                            ((and (null (second cell))
+                                  (stringp (fifth cell))
+                                  (string= (fifth cell) "array"))
+                             (multiple-value-bind (_etype nelems esize)
+                                 (whistler:btf-resolve-array vmbtf (sixth cell))
+                               (declare (ignore _etype))
+                               (setf leaf-size (* (or nelems 0) (or esize 0))))
+                             (setf leaf-kind :array))
+                            (t
+                             (setf leaf-size (fourth cell))
+                             (setf leaf-kind :scalar))))
+                         ;; Mid-chain pointer field — deref and continue.
+                         ((and (eql (fourth cell) 8)
+                               (stringp (fifth cell))
+                               (string= (fifth cell) "ptr"))
+                          (let ((target (whistler:btf-ptr-target-type-id
+                                         vmbtf (sixth cell))))
+                            (unless target
+                              (unsupported "chain ~A: pointer target unknown"
+                                           fname))
+                            (start-new-segment-by-deref)
+                            (setf current-tid target)))
+                         ;; Mid-chain embedded struct/union.
+                         (t (setf current-tid (sixth cell)))))))
+          (let ((ptr `(whistler::+ ,cur-ptr ,segment-offset)))
+            (values (if deref-bindings
+                        `(let* ,(reverse deref-bindings) ,ptr)
+                        ptr)
+                    leaf-size leaf-kind)))))))
 
 (defun lower-string-map-copy (slot-sym map-expr)
   "Lower `\$v = @m[k]' where \$v is comm-typed and m's value slot is
