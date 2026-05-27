@@ -195,3 +195,29 @@
          (prog (first (getf gen :progs))))
     (is (eq :tracing (getf (third prog) :type)))
     (is (string= "fexit/vfs_read" (getf (third prog) :section)))))
+
+(test codegen-probe-and-func-builtins
+  "probe/func rewrite to string literals before printf-arg classification."
+  (let* ((src "kprobe:vfs_read { printf(\"%s %s\\n\", probe, func); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (entry (first (getf gen :printf-table))))
+    (is (equal '((:string . 16) (:string . 9)) (third entry))
+        "two string slots: kprobe/vfs_read\\0 (16) and vfs_read\\0 (9)")))
+
+(test codegen-kstr-uses-kernel-helper
+  "kstr() lowers to bpf_probe_read_kernel_str (helper 115)."
+  (let* ((src "kprobe:vfs_read { printf(\"%s\\n\", kstr(arg1)); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (prog (first (getf gen :progs)))
+         (body (cdddr prog))
+         (text (format nil "~S" body)))
+    (is (search "PROBE-READ-KERNEL-STR" text)
+        "kernel-str helper is used for kstr()")))
+
+(test codegen-stats-uses-percpu-hash
+  "stats() lands as :stats kind with avg's (count,sum) wire format."
+  (let* ((src "kretprobe:vfs_read { @us[comm] = stats(retval); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (info (first (getf gen :info))))
+    (is (eq :stats (getf (cdr info) :kind)))
+    (is (= 16 (getf (cdr info) :value-size)))))

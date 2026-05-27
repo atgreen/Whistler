@@ -417,11 +417,22 @@
                                    (:avg (multiple-value-bind (c s)
                                              (reduce-avg info k)
                                            (if (zerop c) 0 (floor s c))))
+                                   ;; stats() pre-computes a tagged
+                                   ;; sentinel that the line formatter
+                                   ;; pretty-prints below.
+                                   (:stats (multiple-value-bind (c s)
+                                               (reduce-avg info k)
+                                             (list :stats c s)))
                                    ((:min) (reduce-min/max info k :min))
                                    ((:max) (reduce-min/max info k :max))
                                    (t     (lookup-int info k)))))
                        keys)
-                      #'< :key #'cdr))
+                      #'<
+                      :key (lambda (kv)
+                             (let ((v (cdr kv)))
+                               (if (and (consp v) (eq (car v) :stats))
+                                   (third v)  ; sort by total
+                                   v)))))
          (prefix (if (or (null label) (string= label "@")) "@" (format nil "@~A" label))))
     (multiple-value-bind (stack-idx pid-idx user-p)
         (when key-types (composite-stack-info key-types))
@@ -451,15 +462,27 @@
                    (cdr kv))))
         (keyed-p
          (dolist (kv pairs)
-           (format t "~A[~A]: ~D~%"
+           (format t "~A[~A]: ~A~%"
                    prefix
                    (format-key (car kv)
                                :parts key-parts
                                :key-builtin key-builtin)
-                   (cdr kv))))
+                   (format-scalar-value (cdr kv)))))
         (t
          (dolist (kv pairs)
-           (format t "~A: ~D~%" prefix (cdr kv))))))))
+           (format t "~A: ~A~%" prefix (format-scalar-value (cdr kv)))))))))
+
+(defun format-scalar-value (v)
+  "Render a scalar map's value cell. Most values are integers; stats()
+   threads a (:stats COUNT SUM) sentinel that pretty-prints as
+   `count NN, average AA, total TT`, mirroring bpftrace."
+  (cond
+    ((and (consp v) (eq (first v) :stats))
+     (let ((c (second v))
+           (s (third v)))
+       (format nil "count ~D, average ~D, total ~D"
+               c (if (zerop c) 0 (floor s c)) s)))
+    (t (format nil "~D" v))))
 
 (defun print-all-maps (info-list map-alist &key stacks-info stack-depth
                                                 symbolizer)

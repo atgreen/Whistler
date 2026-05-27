@@ -231,6 +231,9 @@
                                (minfo-value-size info) 16))
                         ((string= fn "avg")
                          (setf (minfo-kind info) :avg
+                               (minfo-value-size info) 16))
+                        ((string= fn "stats")
+                         (setf (minfo-kind info) :stats
                                (minfo-value-size info) 16)))))
                    (t (when (eq (minfo-kind info) :counter)
                         (setf (minfo-kind info) :scalar)))))))
@@ -275,7 +278,7 @@
                  ;; sum/min/max/avg use percpu-hash so concurrent
                  ;; updates from different CPUs don't race (no atomics
                  ;; needed; userspace reduces across CPUs at print time).
-                 ((:sum :avg :min :max)    :percpu-hash)
+                 ((:sum :avg :stats :min :max) :percpu-hash)
                  (t                        :hash))))
     `(whistler:defmap ,(minfo-name info)
        :type ,mtype
@@ -536,7 +539,8 @@
        (let ((n (getf (cdr expr) :name)))
          (and (stringp n) (string= n name)))))
 
-(defun str-call-p (expr) (named-call-p expr "str"))
+(defun str-call-p  (expr) (named-call-p expr "str"))
+(defun kstr-call-p (expr) (named-call-p expr "kstr"))
 
 (defun printf-arg-type (expr)
   "Classify a printf arg into one of:
@@ -547,11 +551,18 @@
   (cond
     ((eq (first expr) :comm)
      (cons :string +bt-comm-len+))
-    ((str-call-p expr)
+    ((or (str-call-p expr) (kstr-call-p expr))
      (let* ((args (getf (cdr expr) :args))
             (n    (when (and (cdr args) (eq (first (second args)) :int))
                     (second (second args)))))
        (cons :string (or n +bt-str-default-len+))))
+    ;; A bare string literal (produced by rewrite-self-refs for
+    ;; probe/func, or by the user writing printf("x", "y")) lands as
+    ;; a fixed-size NUL-padded slot just long enough to hold it.
+    ((eq (first expr) :str)
+     (let* ((s (second expr))
+            (len (1+ (length (sb-ext:string-to-octets s :external-format :utf-8)))))
+       (cons :string len)))
     ((named-call-p expr "ksym") :ksym)
     ((named-call-p expr "usym") :usym)
     ((named-call-p expr "ntop") (ntop-arg-type expr))
@@ -656,18 +667,34 @@
          ((str-call-p arg)
           (let* ((args (getf (cdr arg) :args))
                  (ptr  (lower-expr (first args)))
-                 (helper (str-helper-for-probe)))
-            `(,helper (+ ,rec ,off) ,size ,ptr))))))))
+                 (helper (intern "PROBE-READ-USER-STR" :whistler)))
+            `(,helper (+ ,rec ,off) ,size ,ptr)))
+         ((kstr-call-p arg)
+          (let* ((args (getf (cdr arg) :args))
+                 (ptr  (lower-expr (first args))))
+            `(,(intern "PROBE-READ-KERNEL-STR" :whistler)
+              (+ ,rec ,off) ,size ,ptr)))
+         ;; Literal string — emit byte-stores. Used for probe/func
+         ;; rewrites and any printf("…", "literal") form.
+         ((eq (first arg) :str)
+          (lower-printf-string-literal rec off (second arg) size)))))))
 
-(defun str-helper-for-probe ()
-  "Which probe_read_*_str helper str() resolves to. bpftrace defaults
-   to bpf_probe_read_user_str — covers uprobe args, tracepoint
-   `filename'/`pathname' (which point to user memory even though the
-   tracepoint is in-kernel), and pt_regs args in kprobes that were
-   themselves passed user pointers. A separate kstr() builtin can
-   cover the rare kernel-string case."
-  (declare (ignorable *probe-spec*))
-  (intern "PROBE-READ-USER-STR" :whistler))
+(defun lower-printf-string-literal (rec off text size)
+  "Emit the kernel-side stores that lay TEXT (UTF-8) into the SIZE-byte
+   record slot at OFF, NUL-padding the tail."
+  (let* ((bytes (sb-ext:string-to-octets text :external-format :utf-8))
+         (n     (length bytes))
+         (stores '()))
+    (dotimes (i n)
+      (push `(whistler::store ,(intern "U8" :whistler)
+                              ,rec (+ ,off ,i) ,(aref bytes i))
+            stores))
+    (loop for i from n below size do
+      (push `(whistler::store ,(intern "U8" :whistler)
+                              ,rec (+ ,off ,i) 0)
+            stores))
+    `(progn ,@(nreverse stores))))
+
 
 (defun lower-field (expr)
   (let ((base (getf (cdr expr) :base))
@@ -816,6 +843,11 @@
                                 (lower-expr (first (getf (cdr rhs) :args)))
                                 :max))
            ((string= fn "avg")
+            (gen-avg-update mname keys
+                            (lower-expr (first (getf (cdr rhs) :args)))))
+           ;; stats(x) shares avg's (count, sum) wire format; the
+           ;; runtime reducer is the only thing that differs.
+           ((string= fn "stats")
             (gen-avg-update mname keys
                             (lower-expr (first (getf (cdr rhs) :args)))))
            ((string= fn "hist")
@@ -1084,9 +1116,39 @@
                (t (push (list :spec spec :body body) user-specs))))
     (values (nreverse kernel-forms) (nreverse user-specs))))
 
+(defun probe-func-name (spec)
+  "Return the function name a probe spec attaches to, or NIL when the
+   spec has no `func` (BEGIN/END/interval/profile)."
+  (case (first spec)
+    ((:kprobe :kretprobe :kfunc :kretfunc) (second spec))
+    ((:uprobe :uretprobe)                  (third spec))
+    (:tracepoint                           (format nil "~A:~A"
+                                                   (second spec) (third spec)))
+    (t                                     nil)))
+
+(defun rewrite-self-refs (form probe-string func-string)
+  "Walk FORM (an AST), replacing (:PROBE-NAME) with the literal string
+   PROBE-STRING and (:FUNC) with FUNC-STRING. Inside printf args these
+   become :str nodes, so printf's string-slot machinery handles them
+   with no special-casing on the kernel side."
+  (cond
+    ((not (consp form)) form)
+    ((and (eq (first form) :probe-name) (null (rest form)))
+     (list :str probe-string))
+    ((and (eq (first form) :func) (null (rest form)))
+     (cond
+       (func-string (list :str func-string))
+       (t (unsupported "`func' is undefined for this probe type"))))
+    (t (cons (rewrite-self-refs (first form) probe-string func-string)
+             (rewrite-self-refs (rest form)  probe-string func-string)))))
+
 (defun gen-kernel-prog (spec pred body index sub)
   (multiple-value-bind (ptype section) (spec->section spec)
     (let* ((*probe-spec* spec)
+           (probe-str (format nil "~A" section))
+           (func-str  (probe-func-name spec))
+           (body      (rewrite-self-refs body probe-str func-str))
+           (pred      (when pred (rewrite-self-refs pred probe-str func-str)))
            (prog-name (intern (format nil "BT-PROBE-~D-~D" index sub) :whistler))
            (vars      (collect-vars body))
            (body-forms (lower-stmts body))
