@@ -35,6 +35,10 @@ is built for that shape:
   relocations are emitted automatically.
 - **Interactive development.** Full REPL. Compile, load, attach, inspect maps,
   iterate — all from one Lisp image.
+- **bpftrace-compatible frontend.** The same binary runs bpftrace-syntax
+  scripts (`whistler bpftrace -e 'kprobe:vfs_read { @[comm] = count(); }'`)
+  with the surface language [documented below](#bpftrace-frontend) — no
+  separate bpftrace install needed.
 
 If you already have a C/libbpf workflow, Whistler is not trying to replace
 it wholesale. It targets cases where you want a language and compiler designed
@@ -53,14 +57,19 @@ around eBPF itself.
 
 ## Getting started
 
-For Common Lisp work, the intended default is the interactive loader workflow:
+Three entry points depending on what you're after:
 
-1. `make repl-loader`
-2. Work in the `whistler-loader-user` package
-3. Use `with-bpf-session` to compile, load, attach, and inspect from one image
+1. **Run a bpftrace script** — `sudo whistler bpftrace -e '<script>'`.
+   No separate language to learn; if you already know bpftrace, just point
+   `whistler bpftrace` at your script. See [bpftrace frontend](#bpftrace-frontend).
 
-Use the CLI when you want a `.bpf.o` artifact for CI, packaging, or external
-tooling.
+2. **Interactive Lisp** — `make repl-loader`, then work in
+   `whistler-loader-user`. Use `with-bpf-session` to compile, load, attach,
+   and inspect from one image. This is the intended default for writing
+   Whistler programs directly.
+
+3. **CLI artifact** — `whistler compile X.lisp -o X.bpf.o` produces a
+   `.bpf.o` for CI, packaging, or external tooling.
 
 ### Requirements
 
@@ -393,6 +402,78 @@ compiles at macroexpand time, and the bytecode is embedded as a literal:
 ```
 
 One file, one language. No intermediate artifacts or separate build steps.
+
+## bpftrace frontend
+
+`whistler/bpftrace` runs scripts written in [bpftrace](https://github.com/bpftrace/bpftrace)'s
+surface language. It parses the script, lowers it through the same SSA/regalloc
+pipeline the rest of Whistler uses, and attaches the resulting BPF programs via
+the pure-CL loader. Same self-contained binary — no clang, no LLVM, no libbpf.
+
+```sh
+sudo ./whistler bpftrace \
+  -e 'tracepoint:syscalls:sys_enter_openat
+        { @[comm] = count(); }'
+^C
+@[Hyprland]:        1
+@[code]:            17
+@[ptyxis]:          43
+...
+```
+
+### CLI options
+
+`whistler bpftrace` matches bpftrace's day-to-day workflow flags:
+
+| Flag | Behaviour |
+|---|---|
+| `-e PROGRAM` | Inline script text |
+| `-l [PATTERN]` | List kernel probes matching glob — `whistler bpftrace -l 'kprobe:tcp_*'` |
+| `-p PID` | Inject `/pid == PID/` predicate on every probe |
+| `-c 'CMD'` | Spawn CMD ptrace-stopped, attach probes, resume; exit when child exits |
+| `--dump` | Print generated Whistler forms and exit (no kernel load) |
+| `-V` | Version |
+| `-h` | Help |
+
+`-c` uses `PTRACE_TRACEME`/`SIGSTOP` to stop the child at the exec entry,
+attaches probes, then `PTRACE_DETACH`s — matching bpftrace's behaviour so
+short-lived commands have probes live for their full lifetime.
+
+### Surface language coverage
+
+Almost everything you'd write in a typical bpftrace script:
+
+- **Probes**: `kprobe`, `kretprobe`, `kfunc`, `kretfunc`, `uprobe`, `uretprobe`,
+  `tracepoint`, `profile`, `interval`, `BEGIN`, `END`. Wildcards
+  (`kprobe:tcp_*`) and multi-target specs (`kprobe:foo,kprobe:bar`).
+- **Aggregations**: `count()`, `sum(x)`, `avg(x)`, `min(x)`, `max(x)`,
+  `stats(x)`, `hist(x)`, `lhist(x, min, max, step)`.
+- **Async actions**: `printf` (with `%-16s`/`%05d` flags), `print(@m)`,
+  `clear(@m)`, `zero(@m)`, `delete(@m[k])`, `time()`, `exit()`.
+- **String / address builtins**: `str(ptr [, n])`, `kstr(ptr [, n])`,
+  `ksym(addr)`, `usym(addr)`, `ntop([af,] addr)`, `reg("ip"|"sp"|…)`.
+- **Variables**: `pid`, `tid`, `uid`, `gid`, `comm`, `nsecs`, `cpu`,
+  `retval`, `curtask`, `args`, `probe`, `func`, `arg0..arg9`, `kstack`,
+  `ustack`, `$local` variables, `@global` and `@map[k1, k2, ...]`.
+- **Symbolic constants**: `AF_INET`, `O_RDONLY`, `IPPROTO_TCP`, etc. —
+  resolved from kernel BTF enums + a curated `#define` table, no C
+  headers required.
+- **Struct access**: `curtask->pid`, `((struct sock_common *)arg0)->skc_family`
+  (BTF-resolved field offsets, scalar fields).
+- **Control flow**: `if`/`else`, ternary `?:`, filter predicates `/expr/`,
+  `while` loops, user-defined `fn`.
+
+The script-side text below produces a working `opensnoop`:
+
+```sh
+sudo ./whistler bpftrace \
+  -e 'tracepoint:syscalls:sys_enter_openat
+        { printf("%-16s %s\n", comm, str(args->filename)); }'
+```
+
+Userspace stack frames are symbolized via a pure-CL ELF / DWARF
+`.debug_line` reader (`whistler/symbolize`), so `@[ustack]` renders with
+real symbol names + `file:line` when debuginfo is installed.
 
 ## Documentation
 
