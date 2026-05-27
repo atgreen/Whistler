@@ -78,8 +78,8 @@
                    uprobe-spec / tracepoint-spec
   begin-spec     = 'BEGIN'
   end-spec       = 'END'
-  kprobe-spec    = <'kprobe'> <':'> ident
-  kretprobe-spec = <'kretprobe'> <':'> ident
+  kprobe-spec    = <'kprobe'> <':'> glob-ident
+  kretprobe-spec = <'kretprobe'> <':'> glob-ident
   kfunc-spec     = <'kfunc'> <':'> ('vmlinux' <':'>)? ident
   kretfunc-spec  = <'kretfunc'> <':'> ('vmlinux' <':'>)? ident
   uprobe-spec    = <'uprobe'> <':'> upath <':'> ident
@@ -147,6 +147,9 @@
                    'arg5' / 'arg6' / 'arg7' / 'arg8' / 'arg9'
 
   ident          = #'[A-Za-z_][A-Za-z0-9_]*'
+  (* `glob-ident' is `ident' that also accepts `*' anywhere — used
+     for wildcard probe targets like `kprobe:tcp_*'. *)
+  glob-ident     = #'[A-Za-z_*][A-Za-z0-9_*]*'
   <ident-char>   = #'[A-Za-z0-9_]'
   string-lit     = #'\"([^\"\\\\]|\\\\.)*\"'
   hex-int        = #'0[xX][0-9A-Fa-f]+'

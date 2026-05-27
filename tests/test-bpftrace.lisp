@@ -257,3 +257,21 @@
   (signals whistler/bpftrace:bpftrace-unsupported
     (whistler/bpftrace:compile-script
      "BEGIN { @ = COMPLETELY_BOGUS_THING; exit(); }")))
+
+(test parse-kprobe-wildcard
+  "kprobe:tcp_* parses with the asterisk preserved on the spec."
+  (let* ((ast (whistler/bpftrace::normalize
+               (whistler/bpftrace::parse-script
+                "kprobe:tcp_* { @ = count(); }")))
+         (spec (first (getf (cdr (second ast)) :specs))))
+    (is (equal '(:kprobe "tcp_*") spec))))
+
+(test glob-to-regex
+  "Glob translation only expands `*' to `.*' and quotes regex metachars."
+  (is (string= "^tcp_.*$"
+               (whistler/bpftrace::glob-to-regex "tcp_*")))
+  (is (string= "^.*read.*$"
+               (whistler/bpftrace::glob-to-regex "*read*")))
+  ;; Underscores and digits pass through unmodified.
+  (is (string= "^__x64_sys_open$"
+               (whistler/bpftrace::glob-to-regex "__x64_sys_open"))))

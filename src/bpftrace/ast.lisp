@@ -164,8 +164,10 @@
     (ecase (tag-of inner)
       (:begin-spec      '(:begin))
       (:end-spec        '(:end))
-      (:kprobe-spec     (list :kprobe (text-of (first-tagged inner :ident))))
-      (:kretprobe-spec  (list :kretprobe (text-of (first-tagged inner :ident))))
+      (:kprobe-spec     (list :kprobe
+                              (text-of (first-tagged inner :glob-ident))))
+      (:kretprobe-spec  (list :kretprobe
+                              (text-of (first-tagged inner :glob-ident))))
       ;; kfunc[:vmlinux]:funcname — last :ident is the function. The
       ;; optional "vmlinux" token is silently dropped; we only support
       ;; the vmlinux module today.

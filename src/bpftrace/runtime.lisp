@@ -125,6 +125,97 @@
   "Dynamically bound by RUN-GENERATED while a session is up. Used by
    the printer to symbolise ustack frames.")
 
+(defun glob-to-regex (pattern)
+  "Translate a shell-style glob (only `*' is special — bpftrace doesn't
+   use `?' or character classes for probe globs) into a CL regex
+   string. Other characters are quoted to stay literal."
+  (with-output-to-string (s)
+    (write-string "^" s)
+    (loop for c across pattern do
+      (cond
+        ((char= c #\*) (write-string ".*" s))
+        ;; Quote regex metachars; identifier set is conservative.
+        ((find c ".+()[]{}^$|\\") (write-char #\\ s) (write-char c s))
+        (t (write-char c s))))
+    (write-string "$" s)))
+
+(defvar *attachable-funcs* nil
+  "Cached list of kernel functions the kprobe machinery is willing to
+   attach to. Built from /sys/kernel/tracing/available_filter_functions
+   when readable (canonical), otherwise filtered from /proc/kallsyms.
+   Either way, names containing `.' (compiler-generated specialisations
+   like .cold, .constprop.0, .isra.0, .part.0) are dropped — they
+   show up in kallsyms but perf_event_open rejects them.")
+
+(defun load-attachable-funcs ()
+  "Populate *attachable-funcs*. Tries tracefs first; falls back to
+   kallsyms with the same filtering rules."
+  (or
+   ;; (1) tracefs canonical list
+   (handler-case
+       (with-open-file (s "/sys/kernel/tracing/available_filter_functions"
+                          :direction :input)
+         (loop for line = (read-line s nil nil)
+               while line
+               for space = (position #\Space line)
+               for name = (subseq line 0 (or space (length line)))
+               unless (find #\. name)
+                 collect name))
+     (error () nil))
+   ;; (2) kallsyms fallback
+   (progn
+     (when (null *kallsyms*) (load-kallsyms))
+     (loop for entry across (or *kallsyms* #())
+           for name = (cdr entry)
+           unless (find #\. name)
+             collect name))))
+
+(defun attachable-funcs ()
+  (or *attachable-funcs*
+      (setf *attachable-funcs* (load-attachable-funcs))))
+
+(defun kallsyms-functions-matching (pattern)
+  "Return every attachable kernel function whose name matches glob
+   PATTERN."
+  (let ((rx (cl-ppcre:create-scanner (glob-to-regex pattern))))
+    (loop for name in (attachable-funcs)
+          when (cl-ppcre:scan rx name)
+            collect name)))
+
+(defun attach-kprobe-glob (fd target &key retprobe)
+  "Attach FD as a kprobe on TARGET. If TARGET contains `*', enumerate
+   /proc/kallsyms and attach to every match, returning a composite
+   attachment that detaches them all on close."
+  (cond
+    ((find #\* target)
+     (let ((names (kallsyms-functions-matching target)))
+       (when (null names)
+         (error "kprobe:~A matched no functions" target))
+       (format t ";; Attaching kprobe:~A to ~D function~:p — sequential ~
+                   perf_event_open is ~Dms-ish per attach, please wait...~%"
+               target (length names) (* 2 (length names)))
+       (force-output)
+       (let* ((attachments
+                (loop for name in names
+                      collect (handler-case
+                                  (whistler/loader:attach-kprobe
+                                   fd name :retprobe retprobe)
+                                (error () nil))))
+              (live (remove nil attachments)))
+         (format t ";; kprobe:~A attached on ~D of ~D function~:p.~%"
+                 target (length live) (length names))
+         (when (null live)
+           (error "kprobe:~A: none of ~D candidates accepted the probe"
+                  target (length names)))
+         (whistler/loader::make-attachment
+          :type (if retprobe :kretprobe :kprobe)
+          :perf-fds nil
+          :prog-fd fd
+          :cleanup (lambda ()
+                     (dolist (a live)
+                       (handler-case (whistler/loader:detach a) (error () nil))))))))
+    (t (whistler/loader:attach-kprobe fd target :retprobe retprobe))))
+
 (defun attach-probe (prog-info)
   "Inspect the program's section name and call the appropriate attach-*.
    Translates BPF errors into BPFTRACE-ATTACH-ERROR with hints."
@@ -138,9 +229,9 @@
     (handler-case
         (cond
           ((string= kind "kprobe")
-           (whistler/loader:attach-kprobe fd target))
+           (attach-kprobe-glob fd target))
           ((string= kind "kretprobe")
-           (whistler/loader:attach-kprobe fd target :retprobe t))
+           (attach-kprobe-glob fd target :retprobe t))
           ((string= kind "uprobe")
            (multiple-value-bind (path sym) (parse-uprobe-target section 7)
              (unless (and path sym)
