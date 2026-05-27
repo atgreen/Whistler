@@ -10,6 +10,21 @@ allowed-tools: Bash Read Edit Write Grep Glob
 
 Follow these steps exactly, stopping on any failure.
 
+## 0. Anchor at the repo root
+
+Every subsequent shell command assumes the current directory is the
+top of the Whistler checkout. If the slash command was invoked from
+elsewhere, `make` and the `examples/` lookups fail. Do this once at
+the start:
+
+```bash
+cd "$(git -C "$CLAUDE_PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null \
+       || git rev-parse --show-toplevel)"
+```
+
+If that fails (not inside a git repo at all), stop and ask the user
+to run the command from inside the Whistler checkout.
+
 ## 1. Determine version
 
 If the user provided a version (`$ARGUMENTS`), validate that it matches `MAJOR.MINOR.PATCH` where each component is a non-negative integer (e.g. `1.7.0`). If it doesn't, stop and tell the user.
