@@ -273,8 +273,11 @@
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
-  primary        = cast / primitive-cast / tuple / parens / func-call / map-access / scalar-var / builtin /
+  primary        = cast / primitive-cast / offsetof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
                    constant / string-lit / hex-int / integer
+  (* offsetof(struct NAME, FIELD) — resolved to an integer constant
+     at compile time via BTF. *)
+  offsetof-expr  = <'offsetof'> <ws> <'('> <ws> <'struct'> <ws> ident <ws> <','> <ws> ident <ws> <')'>
   (* `(e1, e2, …)' — bpftrace tuple literal. Always 2+ elements so
      it doesn't conflict with the parenthesised single expression
      form. Components must be simple (pure) — biosnoop uses them as

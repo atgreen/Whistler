@@ -424,6 +424,17 @@
   (ecase (first expr)
     (:int        (second expr))
     (:str        (second expr))
+    (:offsetof
+     (let* ((struct-name (getf (cdr expr) :struct))
+            (field-name  (getf (cdr expr) :field))
+            (vmbtf (whistler:ensure-vmlinux-btf))
+            (tid (whistler:btf-find-struct vmbtf struct-name))
+            (fields (and tid (whistler:btf-struct-fields vmbtf tid)))
+            (cell (find field-name fields :test #'string= :key #'first)))
+       (unless cell
+         (unsupported "offsetof(struct ~A, ~A): no such field"
+                      struct-name field-name))
+       (third cell)))
     (:var        (var-sym (second expr)))
     (:builtin
      ;; bpftrace allows a zero-arg `macro' to be referenced bare —

@@ -454,6 +454,9 @@
                              (lambda (c)
                                (and (consp c) (not (eq (tag-of c) :ident))))
                              (children-of inner)))))
+      (:offsetof-expr
+       (let* ((idents (mapcar #'text-of (all-tagged inner :ident))))
+         (list :offsetof :struct (first idents) :field (second idents))))
       (:hex-int      (list :int (parse-integer (text-of inner) :start 2 :radix 16)))
       (:integer      (list :int (parse-integer-with-exp (text-of inner))))
       (t (error "unexpected primary: ~S" inner)))))
