@@ -130,6 +130,45 @@
                                          (getf proto :vlen))))
                      (values id (or nargs 0))))))
 
+(defun btf-enum-values (vmbtf)
+  "Walk every BTF_KIND_ENUM / ENUM64 in VMBTF and return a hash table
+   mapping each member name (string) → its integer value. Used to
+   resolve bare identifiers like AF_INET in bpftrace scripts without
+   parsing kernel headers."
+  (let* ((strtab (vmlinux-btf-strtab vmbtf))
+         (types  (vmlinux-btf-types vmbtf))
+         (data   (vmlinux-btf-type-data vmbtf))
+         (out    (make-hash-table :test 'equal)))
+    (loop for id from 1 below (length types)
+          for rec = (aref types id)
+          when rec do
+      (let ((kind (getf rec :kind))
+            (vlen (getf rec :vlen))
+            (off  (getf rec :data-off)))
+        (cond
+          ((= kind +btf-kind-enum+)
+           (dotimes (i vlen)
+             (let* ((mo   (+ off (* i 8)))
+                    (n-off (btf-u32 data mo))
+                    (raw   (btf-u32 data (+ mo 4)))
+                    (val   (if (>= raw #x80000000)   ; sign-extend
+                               (- raw (ash 1 32))
+                               raw))
+                    (name  (btf-string strtab n-off)))
+               (when (plusp (length name))
+                 (setf (gethash name out) val)))))
+          ((= kind +btf-kind-enum64+)
+           (dotimes (i vlen)
+             (let* ((mo   (+ off (* i 12)))
+                    (n-off (btf-u32 data mo))
+                    (lo    (btf-u32 data (+ mo 4)))
+                    (hi    (btf-u32 data (+ mo 8)))
+                    (val   (logior lo (ash hi 32)))
+                    (name  (btf-string strtab n-off)))
+               (when (plusp (length name))
+                 (setf (gethash name out) val)))))) ))
+    out))
+
 (defun btf-func-params (vmbtf name)
   "Find the kernel FUNC named NAME and return its parameter list as
    ((PARAM-NAME . CTX-OFFSET-IN-BYTES) ...). Empty list if the

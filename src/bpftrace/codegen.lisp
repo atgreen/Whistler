@@ -299,6 +299,9 @@
     (:str        (second expr))
     (:var        (var-sym (second expr)))
     (:builtin    (lower-builtin (second expr)))
+    (:constant   (or (resolve-constant (second expr))
+                     (unsupported "unknown identifier `~A' — not in BTF enums or curated #define table"
+                                  (second expr))))
     (:arg        (lower-arg (second expr)))
     (:retval     (lower-retval))
     (:comm       (unsupported "comm only usable as printf arg or @map[comm] key"))
@@ -317,6 +320,72 @@
     (:field      (lower-field expr))
     (:index      (unsupported "array indexing outside @maps"))
     (:map        (lower-map-read expr))))
+
+;;; ========== Symbolic constants ==========
+;;;
+;;; bpftrace scripts routinely reference identifiers like AF_INET or
+;;; O_RDONLY. We resolve them at codegen time from two sources:
+;;;
+;;;   1. Kernel BTF — every BTF_KIND_ENUM / ENUM64 member is interned
+;;;      as a (name . value) pair on first access. Covers IPPROTO_*,
+;;;      TCP_*, and the modern enum-ified families that the kernel has
+;;;      moved over to BTF.
+;;;
+;;;   2. A curated table of POSIX/Linux #define constants that are
+;;;      *not* in BTF (most of these live in libc/system headers as
+;;;      preprocessor macros, not enums). Tiny — ~200 entries cover
+;;;      what scripts in the wild actually reach for.
+
+(defparameter *curated-constants*
+  '(;; Socket address families
+    ("AF_UNSPEC" . 0)  ("AF_UNIX" . 1)
+    ("AF_INET" . 2)    ("AF_INET6" . 10)
+    ("AF_NETLINK" . 16) ("AF_PACKET" . 17)
+    ;; IPPROTO
+    ("IPPROTO_IP" . 0) ("IPPROTO_ICMP" . 1) ("IPPROTO_TCP" . 6)
+    ("IPPROTO_UDP" . 17) ("IPPROTO_IPV6" . 41) ("IPPROTO_ICMPV6" . 58)
+    ;; open(2) flags
+    ("O_RDONLY" . 0) ("O_WRONLY" . 1) ("O_RDWR" . 2)
+    ("O_CREAT" . #x40) ("O_EXCL" . #x80) ("O_TRUNC" . #x200)
+    ("O_APPEND" . #x400) ("O_NONBLOCK" . #x800) ("O_DIRECTORY" . #x10000)
+    ("O_CLOEXEC" . #x80000) ("O_PATH" . #x200000)
+    ;; mmap protection / flags
+    ("PROT_NONE" . 0) ("PROT_READ" . 1) ("PROT_WRITE" . 2) ("PROT_EXEC" . 4)
+    ("MAP_SHARED" . 1) ("MAP_PRIVATE" . 2) ("MAP_ANONYMOUS" . #x20)
+    ;; mode bits (S_IF*)
+    ("S_IFMT"  . #xf000) ("S_IFSOCK" . #xc000) ("S_IFLNK" . #xa000)
+    ("S_IFREG" . #x8000) ("S_IFBLK" . #x6000) ("S_IFDIR" . #x4000)
+    ("S_IFCHR" . #x2000) ("S_IFIFO" . #x1000)
+    ("S_IRWXU" . #o0700) ("S_IRUSR" . #o0400) ("S_IWUSR" . #o0200) ("S_IXUSR" . #o0100)
+    ("S_IRWXG" . #o0070) ("S_IRGRP" . #o0040) ("S_IWGRP" . #o0020) ("S_IXGRP" . #o0010)
+    ("S_IRWXO" . #o0007) ("S_IROTH" . #o0004) ("S_IWOTH" . #o0002) ("S_IXOTH" . #o0001)
+    ;; BPF map types / flags also surface in scripts
+    ("BPF_ANY" . 0) ("BPF_NOEXIST" . 1) ("BPF_EXIST" . 2)
+    ;; PERF/clock
+    ("CLOCK_REALTIME" . 0) ("CLOCK_MONOTONIC" . 1) ("CLOCK_BOOTTIME" . 7))
+  "Linux constants commonly referenced in bpftrace scripts that don't
+   appear in kernel BTF (they're #defines, not enums).")
+
+(defvar *constant-cache* nil
+  "Lazily-populated hash table mapping name → integer. First lookup
+   builds it from BTF enums + the curated table.")
+
+(defun constants-table ()
+  (or *constant-cache*
+      (setf *constant-cache*
+            (let ((tbl (handler-case (whistler:btf-enum-values
+                                      (whistler:ensure-vmlinux-btf))
+                         (error () (make-hash-table :test 'equal)))))
+              ;; Curated entries override BTF only on conflict — order
+              ;; lets us pin values for portability.
+              (dolist (e *curated-constants*)
+                (setf (gethash (car e) tbl) (cdr e)))
+              tbl))))
+
+(defun resolve-constant (name)
+  "Look NAME up in the BTF + curated constants table. Returns the
+   integer value or NIL."
+  (gethash name (constants-table)))
 
 (defun lower-builtin (kw)
   (case kw
@@ -571,10 +640,14 @@
 (defun ntop-arg-type (expr)
   "Decide whether an ntop(...) call produces an IPv4 (4-byte) or
    IPv6 (16-byte) slot. Single-arg form is always v4. Two-arg form
-   inspects the family literal (AF_INET=2, AF_INET6=10)."
+   inspects the family literal — accepts both the bare integer
+   (e.g. 2 / 10) and the symbolic constant (AF_INET / AF_INET6)."
   (let* ((args (getf (cdr expr) :args))
-         (af   (when (and (cdr args) (eq (first (first args)) :int))
-                 (second (first args)))))
+         (first (first args))
+         (af    (when (cdr args)
+                  (case (first first)
+                    (:int      (second first))
+                    (:constant (resolve-constant (second first)))))))
     (cond
       ((null af)         :ipv4)
       ((eql af 2)        :ipv4)

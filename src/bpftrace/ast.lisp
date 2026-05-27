@@ -353,6 +353,8 @@
       (:scalar-var   (list :var (text-of (first-tagged inner :ident))))
       (:builtin      (norm-builtin inner))
       (:builtin-name (norm-builtin inner)) ; if parens stripped
+      (:constant     (list :constant
+                           (text-of (first-tagged inner :ident))))
       (:string-lit   (list :str (strip-quotes (text-of inner))))
       (:hex-int      (list :int (parse-integer (text-of inner) :start 2 :radix 16)))
       (:integer      (list :int (parse-integer (text-of inner))))

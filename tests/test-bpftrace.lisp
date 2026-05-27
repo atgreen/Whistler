@@ -238,3 +238,22 @@
   (signals whistler/bpftrace:bpftrace-unsupported
     (whistler/bpftrace:compile-script
      "kfunc:vfs_read { @ = args->nope; }")))
+
+(test codegen-curated-constant-af-inet
+  "AF_INET (from the curated table) lowers as a literal 2."
+  (let* ((src "BEGIN { @ = AF_INET; exit(); }")
+         (gen (whistler/bpftrace:compile-script src)))
+    (is (= 1 (length (getf gen :progs))))))
+
+(test codegen-btf-enum-constant
+  "BTF enum values resolve when /sys/kernel/btf/vmlinux is readable.
+   IPPROTO_TCP is in the curated table too, so it works regardless."
+  (is (= 6 (whistler/bpftrace::resolve-constant "IPPROTO_TCP")))
+  (is (= 2 (whistler/bpftrace::resolve-constant "AF_INET")))
+  (is (= 10 (whistler/bpftrace::resolve-constant "AF_INET6"))))
+
+(test codegen-unknown-constant-signals
+  "Identifier that resolves to neither BTF enum nor curated table."
+  (signals whistler/bpftrace:bpftrace-unsupported
+    (whistler/bpftrace:compile-script
+     "BEGIN { @ = COMPLETELY_BOGUS_THING; exit(); }")))

@@ -126,7 +126,12 @@
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
   primary        = parens / func-call / map-access / scalar-var / builtin /
-                   string-lit / hex-int / integer
+                   constant / string-lit / hex-int / integer
+  (* Bare identifier — used for symbolic constants like AF_INET. Comes
+     after builtin and func-call so those keywords / call shapes win
+     when applicable. !ident-char anchors the boundary so identifier
+     prefixes don't match. *)
+  constant       = ident !ident-char
   parens         = <'('> <ws> expr <ws> <')'>
   func-call      = ident <ws> <'('> <ws> arg-list? <ws> <')'>
   arg-list       = expr (<ws> <','> <ws> expr)*
