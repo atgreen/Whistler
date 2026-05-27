@@ -275,7 +275,10 @@
     (:retval     (lower-retval))
     (:comm       (unsupported "comm only usable as printf arg or @map[comm] key"))
     (:kstack     `(whistler::get-stackid (whistler::ctx-ptr) ,*stacks-map-name* 0))
-    (:ustack     (unsupported "ustack — Phase 4 ships kernel stacks (kstack) only"))
+    ;; BPF_F_USER_STACK = 1 << 8 — flag tells the kernel to walk the
+    ;; userspace stack of the current task instead of the kernel one.
+    (:ustack     `(whistler::get-stackid (whistler::ctx-ptr) ,*stacks-map-name*
+                                         ,(ash 1 8)))
     (:args       (unsupported "args without ->field"))
     (:probe-name (unsupported "probe builtin"))
     (:func       (unsupported "func builtin"))
@@ -814,7 +817,8 @@
 ;;; ========== Probe lowering ==========
 
 (defparameter *kernel-spec-tags*
-  '(:kprobe :kretprobe :tracepoint :begin :end :interval :profile))
+  '(:kprobe :kretprobe :uprobe :uretprobe
+    :tracepoint :begin :end :interval :profile))
 
 (defun interval-period-ns (spec)
   "Convert an :interval probe spec to a period in nanoseconds.
@@ -834,6 +838,10 @@
   (ecase (first spec)
     (:kprobe     (values :kprobe       (format nil "kprobe/~A" (second spec))))
     (:kretprobe  (values :kretprobe    (format nil "kretprobe/~A" (second spec))))
+    (:uprobe     (values :uprobe
+                         (format nil "uprobe/~A:~A" (second spec) (third spec))))
+    (:uretprobe  (values :uretprobe
+                         (format nil "uretprobe/~A:~A" (second spec) (third spec))))
     (:tracepoint (values :tracepoint
                          (format nil "tracepoint/~A/~A" (second spec) (third spec))))
     ;; BEGIN/END compile to SYSCALL programs invoked once via
@@ -1003,12 +1011,12 @@
           (rest script))))
 
 (defun script-uses-kstack-p (script)
-  "T iff `kstack' appears anywhere — gates injection of the hidden
-   bt-stacks stack-trace map."
+  "T iff `kstack' or `ustack' appears anywhere — gates injection of
+   the hidden bt-stacks stack-trace map (shared by both)."
   (labels ((walk (form)
              (cond
                ((not (consp form)) nil)
-               ((eq (first form) :kstack) t)
+               ((or (eq (first form) :kstack) (eq (first form) :ustack)) t)
                (t (some #'walk form)))))
     (some (lambda (probe) (walk (getf (cdr probe) :body)))
           (rest script))))

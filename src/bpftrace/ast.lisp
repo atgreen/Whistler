@@ -127,6 +127,14 @@
       (:end-spec        '(:end))
       (:kprobe-spec     (list :kprobe (text-of (first-tagged inner :ident))))
       (:kretprobe-spec  (list :kretprobe (text-of (first-tagged inner :ident))))
+      (:uprobe-spec
+       (list :uprobe
+             (text-of (first-tagged inner :upath))
+             (text-of (first-tagged inner :ident))))
+      (:uretprobe-spec
+       (list :uretprobe
+             (text-of (first-tagged inner :upath))
+             (text-of (first-tagged inner :ident))))
       (:tracepoint-spec
        (let ((idents (all-tagged inner :ident)))
          (list :tracepoint (text-of (first idents)) (text-of (second idents)))))

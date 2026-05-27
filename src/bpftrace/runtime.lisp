@@ -111,6 +111,16 @@
                (string= (subseq tail 0 5) "freq_"))
       (parse-integer tail :start 5 :junk-allowed t))))
 
+(defun parse-uprobe-target (section prefix-len)
+  "Split a section like `uprobe/PATH:SYMBOL' (PREFIX-LEN is 7) into
+   (PATH SYMBOL). The path can contain `/' characters, so we split
+   on the LAST colon."
+  (let* ((tail (subseq section prefix-len))
+         (last-colon (position #\: tail :from-end t)))
+    (when last-colon
+      (values (subseq tail 0 last-colon)
+              (subseq tail (1+ last-colon))))))
+
 (defun attach-probe (prog-info)
   "Inspect the program's section name and call the appropriate attach-*.
    Translates BPF errors into BPFTRACE-ATTACH-ERROR with hints."
@@ -127,6 +137,20 @@
            (whistler/loader:attach-kprobe fd target))
           ((string= kind "kretprobe")
            (whistler/loader:attach-kprobe fd target :retprobe t))
+          ((string= kind "uprobe")
+           (multiple-value-bind (path sym) (parse-uprobe-target section 7)
+             (unless (and path sym)
+               (error 'bpftrace-attach-error
+                      :section section :target target
+                      :reason "uprobe target must be PATH:SYMBOL"))
+             (whistler/loader:attach-uprobe fd path sym)))
+          ((string= kind "uretprobe")
+           (multiple-value-bind (path sym) (parse-uprobe-target section 10)
+             (unless (and path sym)
+               (error 'bpftrace-attach-error
+                      :section section :target target
+                      :reason "uretprobe target must be PATH:SYMBOL"))
+             (whistler/loader:attach-uprobe fd path sym :retprobe t)))
           ((string= kind "tracepoint")
            (whistler/loader:attach-tracepoint fd section))
           ((string= kind "interval")
@@ -336,12 +360,14 @@
                       #'< :key #'cdr))
          (prefix (if (or (null label) (string= label "@")) "@" (format nil "@~A" label))))
     (cond
-      ;; Stack keys render as a multi-line block of symbolised IPs.
-      ((eq key-builtin :kstack)
+      ;; Stack keys render as a multi-line block — symbolised for
+      ;; kstack, hex for ustack (per-process maps not yet wired up).
+      ((or (eq key-builtin :kstack) (eq key-builtin :ustack))
        (dolist (kv pairs)
          (format t "~A[~%~A~%]: ~D~%"
                  prefix
-                 (format-stack (car kv) stacks-info (or stack-depth 32))
+                 (format-stack (car kv) stacks-info (or stack-depth 32)
+                               :user-p (eq key-builtin :ustack))
                  (cdr kv))))
       (keyed-p
        (dolist (kv pairs)
@@ -454,12 +480,12 @@
            (cell (assoc (- neg) *errno-names*)))
       (or (cdr cell) (format nil "-~D" (- neg))))))
 
-(defun format-stack (stack-id stacks-info depth)
-  "Render a kstack key as bpftrace's indented multi-line stack:
-       kfunc1+0x12
-       kfunc2+0x34
-       …
-   Returns the formatted block as a string (no trailing newline)."
+(defun format-stack (stack-id stacks-info depth &key user-p)
+  "Render a kstack/ustack key as bpftrace's indented multi-line stack.
+   Kernel stacks resolve against /proc/kallsyms; userspace stacks
+   need per-process /proc/<pid>/maps for proper symbolisation (not
+   yet wired up — addresses render as hex, and `@[pid, ustack]'
+   composite keys are the path to real names later)."
   (with-output-to-string (s)
     (let ((errname (stackid-errno stack-id)))
       (if errname
@@ -469,7 +495,10 @@
                 (loop for ip in ips
                       for first-p = t then nil
                       do (unless first-p (terpri s))
-                         (format s "        ~A" (resolve-symbol ip)))
+                         (format s "        ~A"
+                                 (if user-p
+                                     (format nil "0x~16,'0X" ip)
+                                     (resolve-symbol ip))))
                 (format s "        <stack id ~D unavailable>" stack-id)))))))
 
 ;;; ========== printf record decoding ==========

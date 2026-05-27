@@ -73,11 +73,15 @@
   probe          = probe-specs <ws> predicate? <ws> block
   probe-specs    = probe-spec (<ws> <','> <ws> probe-spec)*
   probe-spec     = begin-spec / end-spec / profile-spec / interval-spec /
-                   kretprobe-spec / kprobe-spec / tracepoint-spec
+                   kretprobe-spec / kprobe-spec / uretprobe-spec /
+                   uprobe-spec / tracepoint-spec
   begin-spec     = 'BEGIN'
   end-spec       = 'END'
   kprobe-spec    = <'kprobe'> <':'> ident
   kretprobe-spec = <'kretprobe'> <':'> ident
+  uprobe-spec    = <'uprobe'> <':'> upath <':'> ident
+  uretprobe-spec = <'uretprobe'> <':'> upath <':'> ident
+  upath          = #'[A-Za-z0-9_./-]+'
   tracepoint-spec= <'tracepoint'> <':'> ident <':'> ident
   interval-spec  = <'interval'> <':'> interval-unit <':'> integer
   profile-spec   = <'profile'> <':'> interval-unit <':'> integer
