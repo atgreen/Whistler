@@ -914,6 +914,7 @@
                                  ((#\X)     (format nil "~X" (or arg 0)))
                                  ((#\c)     (string (code-char (logand (or arg 0) #xff))))
                                  ((#\s)     (if (stringp arg) arg ""))
+                                 ((#\r)     (if (stringp arg) arg ""))
                                  (t         (format nil "%~C" spec)))))
                     (write-string (pad-str text width left-align-p pad) s))
                   (setf i (1+ j))))))))
@@ -974,6 +975,22 @@
                                       ((eq ty :ipv6)
                                        (prog1 (format-ipv6 sap off)
                                          (incf off 16)))
+                                      ((eq ty :buf)
+                                       ;; u32 len + 64 bytes payload.
+                                       (let* ((len (sap-read-u32-le sap off))
+                                              (cap 64)
+                                              (effective (min len cap))
+                                              (s (with-output-to-string (out)
+                                                   (dotimes (k effective)
+                                                     (let ((b (sb-sys:sap-ref-8
+                                                               sap (+ off 4 k))))
+                                                       (cond
+                                                         ((or (< b 32) (>= b 127))
+                                                          (format out "\\x~2,'0X" b))
+                                                         (t (write-char
+                                                             (code-char b) out))))))))
+                                         (incf off (+ 4 cap))
+                                         s))
                                       ((eq ty :cgroup-path)
                                        (let ((cgid (sap-read-u64-le sap off)))
                                          (incf off 8)

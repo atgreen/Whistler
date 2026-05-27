@@ -1103,6 +1103,11 @@
 (defconstant +bt-comm-len+ 16
   "Bytes of `comm' the kernel writes via bpf_get_current_comm.")
 
+(defconstant +bt-buf-max-len+ 64
+  "Cap on bpftrace buf(ptr, len) capture, matching bpftrace's default
+   max_strlen. Records reserve a fixed (4 + +bt-buf-max-len+) bytes;
+   the actual byte count is the leading u32.")
+
 (defconstant +bt-str-default-len+ 64
   "Default buffer size used by str(ptr) — matches bpftrace's default.")
 
@@ -1178,6 +1183,12 @@
     ;; for the given id by scanning /sys/fs/cgroup at print time.
     ;; The wire format is just the u64 id; userspace formats.
     ((named-call-p expr "cgroup_path") :cgroup-path)
+    ;; buf(ptr, len) — raw byte buffer, capped at +bt-buf-max-len+
+    ;; bytes. Wire format is u32 actual-len followed by that many
+    ;; bytes (zero-padded to the cap so the record stays a fixed
+    ;; size). printf's %r format renders the bytes as an escaped
+    ;; string in userspace.
+    ((named-call-p expr "buf") :buf)
     ((named-call-p expr "strftime")
      ;; Register the format string and emit a (:strftime . ID) slot.
      ;; The wire format is just the u64 timestamp; the runtime looks
@@ -1219,6 +1230,7 @@
     ((eq arg-type :ipv6) 16)
     ((eq arg-type :ipv-any) +bt-ntop-slot-size+)
     ((eq arg-type :cgroup-path) 8)
+    ((eq arg-type :buf) (+ 4 +bt-buf-max-len+))
     ((and (consp arg-type) (eq (car arg-type) :string))   (cdr arg-type))
     ((and (consp arg-type) (eq (car arg-type) :strftime)) 8)  ; just the u64 timestamp
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
@@ -1297,6 +1309,23 @@
      (let* ((args (getf (cdr arg) :args))
             (ptr  (lower-expr (second args))))
        `(whistler::probe-read-kernel (+ ,rec ,off) 16 ,ptr)))
+    ((eq ty :buf)
+     ;; Lay out: u32 len + +bt-buf-max-len+ bytes from PTR. Cap len
+     ;; at +bt-buf-max-len+ so the kernel-side probe-read doesn't
+     ;; exceed the slot. We can't pass a runtime length to
+     ;; probe-read-kernel safely, so we always read the cap and let
+     ;; userspace truncate to the recorded length.
+     (let* ((args (getf (cdr arg) :args))
+            (ptr  (lower-expr (first args)))
+            (len  (lower-expr (second args)))
+            (lvar (gensym "BLEN")))
+       `(let ((,lvar ,len))
+          (whistler::store ,(intern "U32" :whistler) ,rec ,off
+                           (whistler::if (whistler::> ,lvar ,+bt-buf-max-len+)
+                                         ,+bt-buf-max-len+
+                                         ,lvar))
+          (whistler::probe-read-kernel
+           (+ ,rec ,off 4) ,+bt-buf-max-len+ ,ptr))))
     ((eq ty :cgroup-path)
      ;; Store the u64 cgroup id; userspace looks the path up by
      ;; scanning /sys/fs/cgroup at decode time.
