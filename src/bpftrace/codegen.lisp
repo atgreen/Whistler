@@ -44,6 +44,9 @@
   value-struct     ; struct name (string) when the map stores a struct
                    ;   pointer — `@m[k] = (struct sk_buff *)x' lets us
                    ;   propagate the type to `\$v = @m[k]` reads.
+  value-ntop-p     ; T when the value slot is a 17-byte ntop record
+                   ;   (1 family + 16 address bytes). Triggered by
+                   ;   `@m[k] = ntop(…)' inference.
   hist-params)     ; for :lhist, the list (MIN MAX STEP); NIL otherwise.
 
 (defun builtin-size (kw)
@@ -266,6 +269,17 @@
                           (minfo-value-string-p info) t
                           (minfo-value-size info)
                           (max (minfo-value-size info) +bt-comm-len+)))
+                   ;; `@m[k] = ntop(…)' — 17-byte family+address slot.
+                   ;; The value-ntop-p flag drives a special read path
+                   ;; that surfaces in printf as :ipv-any.
+                   ((and (consp rhs) (eq (first rhs) :call)
+                         (stringp (getf (cdr rhs) :name))
+                         (string= (getf (cdr rhs) :name) "ntop"))
+                    (setf (minfo-kind info) :scalar
+                          (minfo-value-ntop-p info) t
+                          (minfo-value-size info)
+                          (max (minfo-value-size info)
+                               +bt-ntop-slot-size+)))
                    ((and (consp rhs) (eq (first rhs) :call))
                     (let ((fn (getf (cdr rhs) :name)))
                       (cond
@@ -852,6 +866,12 @@
     ((and (eq (first form) :builtin) (keywordp (second form)))
      (let* ((sname (string-downcase (symbol-name (second form))))
             (cell  (assoc sname subs :test #'string=)))
+       (cond (cell (cdr cell))
+             (t form))))
+    ;; Bare-name macro params: (:constant "name") string form
+    ;; (lowercase idents that didn't match a builtin name).
+    ((and (eq (first form) :constant) (stringp (second form)))
+     (let ((cell (assoc (second form) subs :test #'string=)))
        (cond (cell (cdr cell))
              (t form))))
     ((and (eq (first form) :map) (stringp (getf (cdr form) :name)))
@@ -1663,6 +1683,13 @@
                  (string= (getf (cdr rhs) :name) "ntop")
                  (member (second lhs) *ntop-vars* :test #'string-equal))
             (lower-ntop-assign sym (getf (cdr rhs) :args)))
+           ;; `$v = @m[k]' on an ntop-typed $v whose map's value is
+           ;; an ntop record — copy the 17 bytes from the map slot
+           ;; into $v's buffer instead of overwriting the pointer.
+           ((and (eq op :=)
+                 (consp rhs) (eq (first rhs) :map)
+                 (member (second lhs) *ntop-vars* :test #'string-equal))
+            (lower-ntop-map-copy sym rhs))
            (t
             (ecase op
               (:=  `(setf ,sym ,(lower-expr rhs)))
@@ -1718,6 +1745,32 @@
                        (t (setf current-tid (sixth cell))))))
           (values `(whistler::+ ,(root-ptr-form root) ,total)
                   leaf-size leaf-kind))))))
+
+(defun lower-ntop-map-copy (slot-sym map-expr)
+  "Lower `\$v = @m[k]' where \$v is ntop-typed and m's value slot is
+   an ntop record. Looks up the map entry, then copies its 17 bytes
+   into SLOT-SYM's buffer; a missing key zeros the slot."
+  (let* ((mname-string (getf (cdr map-expr) :name))
+         (info  (or (gethash mname-string *map-table*)
+                    (unsupported "unknown map @~A" mname-string)))
+         (mname (minfo-name info))
+         (keys  (getf (cdr map-expr) :keys))
+         (p     (gensym "P"))
+         (i     (gensym "I"))
+         (ptr-p (keys-need-ptr-ops-p keys)))
+    (flet ((copy-body (kform)
+             `(whistler:if-let
+                  (,p (whistler::map-lookup-ptr ,mname ,kform))
+                (whistler::dotimes (,i ,+bt-ntop-slot-size+)
+                  (whistler::store
+                   whistler::u8 ,slot-sym ,i
+                   (whistler::load whistler::u8 ,p ,i)))
+                0)))
+      (if ptr-p
+          (with-key keys #'copy-body)
+          (let ((tmpk (gensym "K")))
+            `(let* ((,tmpk whistler::u64 ,(lower-expr (first keys))))
+               ,(copy-body `(whistler::stack-addr ,tmpk))))))))
 
 (defun lower-chain-as-ptr (expr)
   "Pointer-only chain resolution (no final read). Used by ntop's
@@ -1819,6 +1872,10 @@
                 (unsupported "internal: lhist info missing params"))
               (destructuring-bind (lo hi step) params
                 (gen-lhist-update mname value-form lo hi step))))
+           ;; `@m[k] = ntop(…)' — value slot stores 17 bytes
+           ;; (family + address). See gen-ntop-set for the layout.
+           ((and (string= fn "ntop") (minfo-value-ntop-p info))
+            (gen-ntop-set info keys (getf (cdr rhs) :args)))
            (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
       ;; `@m[k] = "literal"' or `= func' (already rewritten to :str).
       ;; The value slot is value-size bytes wide; lay out the literal
@@ -1833,7 +1890,38 @@
       ((and (consp rhs) (eq (first rhs) :comm)
             (minfo-value-string-p info))
        (gen-comm-set info keys))
+      ;; `@m[k] = ntop(…)' — write a 17-byte family+address record
+      ;; into the value slot, using the same encoding as the $var-ntop
+      ;; path so :ipv-any printf reads transparently.
+      ((and (consp rhs) (eq (first rhs) :call)
+            (stringp (getf (cdr rhs) :name))
+            (string= (getf (cdr rhs) :name) "ntop")
+            (minfo-value-ntop-p info))
+       (gen-ntop-set info keys (getf (cdr rhs) :args)))
       (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
+
+(defun gen-ntop-set (info keys ntop-args)
+  "Store an ntop(…) result as @MNAME[KEYS]'s value: reuse the same
+   17-byte layout (1 family + 16 addr) as the \$var-ntop path, then
+   map_update_elem with the buffer pointer."
+  (let* ((mname (minfo-name info))
+         (vsize (minfo-value-size info))
+         (buf   (gensym "VBUF"))
+         (tmpk  (gensym "K"))
+         (ptr-p (keys-need-ptr-ops-p keys)))
+    (with-key keys
+      (lambda (k)
+        (let ((write `(progn
+                        ,(lower-ntop-assign buf ntop-args)
+                        (whistler::map-update-ptr
+                         ,mname ,(if ptr-p k `(whistler::stack-addr ,tmpk))
+                         ,buf 0))))
+          (if ptr-p
+              `(let ((,buf (whistler::struct-alloc ,vsize)))
+                 ,write)
+              `(let* ((,tmpk whistler::u64 ,k)
+                      (,buf (whistler::struct-alloc ,vsize)))
+                 ,write)))))))
 
 (defun gen-comm-set (info keys)
   "Store the current task's TASK_COMM_LEN bytes as @MNAME[KEYS]'s
@@ -2314,16 +2402,22 @@
 (defun infer-ntop-vars (stmts)
   "Return a list of var-name strings that hold an `ntop(…)' result.
    Walks the body — including nested if/while — recording any
-   `\$v = ntop(...)' assignment (or compound update). Used to back
-   those vars with a 17-byte stack slot in the probe prologue."
+   `\$v = ntop(...)' assignment AND any `\$v = @m[k]' where @m's
+   value slot was marked value-ntop-p by infer-maps."
   (let ((acc nil))
     (labels ((ntop-call-p (e)
                (and (consp e) (eq (first e) :call)
                     (stringp (getf (cdr e) :name))
                     (string= (getf (cdr e) :name) "ntop")))
+             (ntop-map-read-p (e)
+               (and (consp e) (eq (first e) :map)
+                    (let ((info (and *map-table*
+                                     (gethash (getf (cdr e) :name)
+                                              *map-table*))))
+                      (and info (minfo-value-ntop-p info)))))
              (maybe-record (lhs rhs)
                (when (and (consp lhs) (eq (first lhs) :var)
-                          (ntop-call-p rhs))
+                          (or (ntop-call-p rhs) (ntop-map-read-p rhs)))
                  (pushnew (second lhs) acc :test #'string=)))
              (walk (s)
                (case (first s)
