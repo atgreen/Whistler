@@ -1,6 +1,6 @@
 (defsystem "whistler"
   :description "A Lisp that compiles to eBPF"
-  :version "1.8.0"
+  :version "1.9.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ()
@@ -44,7 +44,7 @@
 
 (defsystem "whistler/cli"
   :description "CLI binary — bundles whistler + loader + bpftrace into one self-contained executable"
-  :version "1.8.0"
+  :version "1.9.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ("whistler" "whistler/loader"
