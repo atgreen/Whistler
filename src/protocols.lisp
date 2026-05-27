@@ -28,12 +28,19 @@
     ;; x86-64 System V ABI: rdi, rsi, rdx, rcx, r8, r9, rax
     '((:parm1 . 112) (:parm2 . 104) (:parm3 . 96)
       (:parm4 .  88) (:parm5 .  72) (:parm6 . 64)
-      (:ret   .  80))
+      (:ret   .  80)
+      ;; Common pt_regs slots for bpftrace's reg() builtin.
+      (:ip    . 128) (:sp   . 152) (:bp  . 32)
+      (:ax    .  80) (:bx   .  40) (:cx  . 88) (:dx . 96)
+      (:si    . 104) (:di   . 112)
+      (:r8    .  72) (:r9   .  64) (:r10 . 56) (:r11 . 48)
+      (:r12   .  24) (:r13  .  16) (:r14 . 8)  (:r15 . 0))
     #+arm64
-    ;; aarch64: x0-x5 at offsets 0-40, x0 also used for return value
+    ;; aarch64: x0-x30 at offsets 0..240, sp @ 248, pc @ 256
     '((:parm1 .  0) (:parm2 .  8) (:parm3 . 16)
       (:parm4 . 24) (:parm5 . 32) (:parm6 . 40)
-      (:ret   .  0))
+      (:ret   .  0)
+      (:ip    . 256) (:sp . 248) (:pc . 256))
     #-(or x86-64 arm64)
     (error "pt-regs-parm1..6 and pt-regs-ret require x86-64 or aarch64. ~
             Current architecture is not supported. ~

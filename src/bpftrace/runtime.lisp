@@ -305,6 +305,39 @@
                      count
                      (render-bar count maxc 52)))))
 
+(defun lhist-bucket-label (i lo hi step)
+  "Bucket labels for a linear histogram. i=0 is underflow, i=N+1 is
+   overflow; in-range buckets are [LO+(i-1)*STEP, LO+i*STEP)."
+  (let ((n (max 1 (floor (- hi lo) step))))
+    (cond
+      ((zerop i)         (format nil "(..., ~D)" lo))
+      ((= i (+ n 1))     (format nil "[~D, ...)" hi))
+      (t                 (format nil "[~D, ~D)" (+ lo (* (- i 1) step))
+                                                (+ lo (* i step)))))))
+
+(defun print-lhist (label info params)
+  "Render a linear histogram. PARAMS is (lo hi step) captured at codegen."
+  (unless params
+    (format t "~%@~A: <missing lhist params>~%" label)
+    (return-from print-lhist))
+  (destructuring-bind (lo hi step) params
+    (let* ((n       (max 1 (floor (- hi lo) step)))
+           (total   (+ n 2))
+           (buckets (loop for i below total
+                          collect (lookup-percpu-sum info i)))
+           (last    (or (position-if-not #'zerop buckets :from-end t) -1))
+           (maxc    (or (reduce #'max buckets) 0)))
+      (format t "~%@~A:~%" label)
+      (when (minusp last)
+        (format t "    (no samples)~%")
+        (return-from print-lhist))
+      (loop for i from 0 to last
+            for count = (nth i buckets)
+            do (format t "~20A ~10D |~A|~%"
+                       (lhist-bucket-label i lo hi step)
+                       count
+                       (render-bar count maxc 52))))))
+
 (defun lookup-percpu-u64s (info key &optional (n-fields 1))
   "For a percpu map, look up KEY and return a list of u64s, one per
    field (in declaration order across all CPUs reduced however the
@@ -438,7 +471,9 @@
            (mapinfo     (when entry (cdr entry))))
       (when mapinfo
         (case kind
-          (:hist (print-hist raw-name mapinfo))
+          (:hist  (print-hist raw-name mapinfo))
+          (:lhist (print-lhist raw-name mapinfo
+                               (getf (cdr info-rec) :hist-params)))
           (t     (print-scalar-map raw-name mapinfo
                                    :key-parts key-parts
                                    :keyed-p (getf (cdr info-rec) :keyed-p)
@@ -678,6 +713,16 @@
                                               (pid      (ash pid-tgid -32)))
                                          (incf off 16)
                                          (resolve-usym pid addr)))
+                                      ((eq ty :ipv4)
+                                       (let ((b0 (sb-sys:sap-ref-8 sap off))
+                                             (b1 (sb-sys:sap-ref-8 sap (+ off 1)))
+                                             (b2 (sb-sys:sap-ref-8 sap (+ off 2)))
+                                             (b3 (sb-sys:sap-ref-8 sap (+ off 3))))
+                                         (incf off 4)
+                                         (format nil "~D.~D.~D.~D" b0 b1 b2 b3)))
+                                      ((eq ty :ipv6)
+                                       (prog1 (format-ipv6 sap off)
+                                         (incf off 16)))
                                       ((and (consp ty) (eq (car ty) :string))
                                        (let ((size (cdr ty)))
                                          (prog1 (sap-read-string-fixed
@@ -685,6 +730,34 @@
                                            (incf off size))))
                                       (t (error "unknown printf arg type ~A" ty)))))))
         (write-string (format-printf fmt args))))))
+
+(defun format-ipv6 (sap off)
+  "Render 16 bytes at SAP+OFF as an IPv6 address. Compresses the
+   longest run of zero groups with `::', matches inet_ntop()."
+  (let ((groups (loop for i below 8
+                      collect (logior (ash (sb-sys:sap-ref-8 sap (+ off (* i 2))) 8)
+                                      (sb-sys:sap-ref-8 sap (+ off (* i 2) 1))))))
+    ;; Find longest zero-run (must be ≥ 2 groups to compress).
+    (let ((best-start -1) (best-len 0) (cur-start -1) (cur-len 0))
+      (loop for g in groups for i from 0 do
+        (cond ((zerop g)
+               (when (minusp cur-start) (setf cur-start i))
+               (incf cur-len)
+               (when (> cur-len best-len)
+                 (setf best-len cur-len best-start cur-start)))
+              (t (setf cur-start -1 cur-len 0))))
+      (with-output-to-string (s)
+        (cond
+          ((>= best-len 2)
+           (loop for g in groups for i from 0 do
+             (cond ((= i best-start) (write-string ":" s))
+                   ((and (> i best-start) (< i (+ best-start best-len))))
+                   ((zerop i) (format s "~(~X~)" g))
+                   (t (format s ":~(~X~)" g))))
+           (when (= (+ best-start best-len) 8) (write-string ":" s)))
+          (t
+           (loop for g in groups for i from 0 do
+             (if (zerop i) (format s "~(~X~)" g) (format s ":~(~X~)" g)))))))))
 
 (defun resolve-usym (pid addr)
   "Resolve a (pid, user-address) into a `name+0xOFF [lib]' string using
@@ -727,7 +800,9 @@
         (find-map-by-id map-id-table id map-alist info-list)
       (when map-info
         (case (getf (cdr info-rec) :kind)
-          (:hist (print-hist raw map-info))
+          (:hist  (print-hist raw map-info))
+          (:lhist (print-lhist raw map-info
+                               (getf (cdr info-rec) :hist-params)))
           (t     (print-scalar-map
                   raw map-info
                   :key-parts (or (getf (cdr info-rec) :key-parts) 1)

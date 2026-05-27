@@ -28,7 +28,7 @@
 (defstruct minfo
   name             ; whistler symbol (defmap name)
   raw-name         ; original bpftrace name or NIL for anonymous
-  kind             ; :counter | :scalar | :hist
+  kind             ; :counter | :scalar | :hist | :lhist
   key-size         ; bytes (set by inference; 0 if scalar-only)
   value-size       ; bytes
   max-entries
@@ -36,8 +36,9 @@
   key-types        ; for composite keys: list of one keyword per slot
                    ;   (e.g. (:pid :ustack) for @[pid, ustack]).
                    ;   NIL for scalar single-slot keys.
-  keyed-p)         ; T iff any access used [keys]. Scalar-only `@m =`
+  keyed-p          ; T iff any access used [keys]. Scalar-only `@m =`
                    ;   maps stay NIL so the printer skips the `[…]`.
+  hist-params)     ; for :lhist, the list (MIN MAX STEP); NIL otherwise.
 
 (defun builtin-size (kw)
   (case kw
@@ -205,9 +206,21 @@
                                (minfo-key-size info) 4
                                (minfo-max-entries info) 64))
                         ((string= fn "lhist")
-                         (setf (minfo-kind info) :hist
-                               (minfo-key-size info) 4
-                               (minfo-max-entries info) 256))
+                         (let* ((args (getf (cdr rhs) :args))
+                                (literal (lambda (n)
+                                           (let ((a (nth n args)))
+                                             (cond
+                                               ((and a (eq (first a) :int)) (second a))
+                                               (t (unsupported
+                                                   "lhist() requires literal min/max/step (got ~S)" a))))))
+                                (lo  (funcall literal 1))
+                                (hi  (funcall literal 2))
+                                (st  (funcall literal 3))
+                                (n   (max 1 (floor (- hi lo) st))))
+                           (setf (minfo-kind info) :lhist
+                                 (minfo-key-size info) 4
+                                 (minfo-max-entries info) (+ n 2)
+                                 (minfo-hist-params info) (list lo hi st))))
                         ((string= fn "sum")
                          (setf (minfo-kind info) :sum))
                         ((string= fn "min")
@@ -249,7 +262,8 @@
                    (note-keys (first (getf (cdr e) :args))))))))))
       ;; Histogram maps with no explicit user key always have 4-byte key.
       (loop for info being the hash-values of table
-            when (eq (minfo-kind info) :hist)
+            when (or (eq (minfo-kind info) :hist)
+                     (eq (minfo-kind info) :lhist))
               do (setf (minfo-key-size info) 4))
       table)))
 
@@ -257,7 +271,7 @@
 
 (defun gen-defmap (info)
   (let ((mtype (case (minfo-kind info)
-                 (:hist                    :percpu-array)
+                 ((:hist :lhist)           :percpu-array)
                  ;; sum/min/max/avg use percpu-hash so concurrent
                  ;; updates from different CPUs don't race (no atomics
                  ;; needed; userspace reduces across CPUs at print time).
@@ -425,7 +439,37 @@
       ((string= name "time")   (lower-async-time
                                 (getf (cdr expr) :args)))
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
+      ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
       (t (unsupported "function ~A" name)))))
+
+(defparameter *reg-aliases*
+  ;; Map bpftrace reg() names to the pt-regs keyword the protocols.lisp
+  ;; table indexes by. bpftrace accepts the conventional register names
+  ;; (rax → ax etc); whistler's pt_regs table uses the short form.
+  '(("ip" . :ip) ("rip" . :ip) ("pc" . :ip)
+    ("sp" . :sp) ("rsp" . :sp)
+    ("bp" . :bp) ("rbp" . :bp)
+    ("ax" . :ax) ("rax" . :ax) ("eax" . :ax)
+    ("bx" . :bx) ("rbx" . :bx) ("ebx" . :bx)
+    ("cx" . :cx) ("rcx" . :cx) ("ecx" . :cx)
+    ("dx" . :dx) ("rdx" . :dx) ("edx" . :dx)
+    ("si" . :si) ("rsi" . :si) ("esi" . :si)
+    ("di" . :di) ("rdi" . :di) ("edi" . :di)
+    ("r8"  . :r8)  ("r9"  . :r9)  ("r10" . :r10) ("r11" . :r11)
+    ("r12" . :r12) ("r13" . :r13) ("r14" . :r14) ("r15" . :r15)))
+
+(defun lower-reg-call (args)
+  "Lower reg(\"name\") to a (ctx u64 OFFSET) load against pt_regs."
+  (unless (and args (= (length args) 1) (eq (first (first args)) :str))
+    (unsupported "reg() needs exactly one string argument"))
+  (let* ((name (second (first args)))
+         (key  (cdr (assoc name *reg-aliases* :test #'string=))))
+    (unless key
+      (unsupported "reg(~S) — unknown register name" name))
+    (let ((off (cdr (assoc key (whistler::pt-regs-offsets)))))
+      (unless off
+        (unsupported "reg(~S) — register not available on this arch" name))
+      `(whistler::ctx ,(intern "U64" :whistler) ,off))))
 
 (defun intern-map-id (mref)
   "Assign / look up a stable integer id for the given @map reference."
@@ -494,13 +538,29 @@
        (cons :string (or n +bt-str-default-len+))))
     ((named-call-p expr "ksym") :ksym)
     ((named-call-p expr "usym") :usym)
+    ((named-call-p expr "ntop") (ntop-arg-type expr))
     (t :int)))
+
+(defun ntop-arg-type (expr)
+  "Decide whether an ntop(...) call produces an IPv4 (4-byte) or
+   IPv6 (16-byte) slot. Single-arg form is always v4. Two-arg form
+   inspects the family literal (AF_INET=2, AF_INET6=10)."
+  (let* ((args (getf (cdr expr) :args))
+         (af   (when (and (cdr args) (eq (first (first args)) :int))
+                 (second (first args)))))
+    (cond
+      ((null af)         :ipv4)
+      ((eql af 2)        :ipv4)
+      ((eql af 10)       :ipv6)
+      (t                 :ipv4))))
 
 (defun printf-arg-size (arg-type)
   (cond
     ((eq arg-type :int)  8)
     ((eq arg-type :ksym) 8)
     ((eq arg-type :usym) 16)
+    ((eq arg-type :ipv4) 4)
+    ((eq arg-type :ipv6) 16)
     ((and (consp arg-type) (eq (car arg-type) :string)) (cdr arg-type))
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
 
@@ -560,6 +620,18 @@
           (whistler::store ,(intern "U64" :whistler) ,rec ,off
                            (whistler::get-current-pid-tgid))
           (whistler::store ,(intern "U64" :whistler) ,rec (+ ,off 8) ,addr))))
+    ((eq ty :ipv4)
+     ;; Single u32 store. The userspace decoder reads the 4 bytes in
+     ;; network-byte-order, matching bpftrace's contract that the
+     ;; input is already __be32.
+     (let* ((args (getf (cdr arg) :args))
+            (addr-expr (lower-expr (if (cdr args) (second args) (first args)))))
+       `(whistler::store ,(intern "U32" :whistler) ,rec ,off ,addr-expr)))
+    ((eq ty :ipv6)
+     ;; 16 bytes copied from a pointer in user/kernel memory.
+     (let* ((args (getf (cdr arg) :args))
+            (ptr  (lower-expr (second args))))
+       `(whistler::probe-read-kernel (+ ,rec ,off) 16 ,ptr)))
     ((and (consp ty) (eq (car ty) :string))
      (let ((size (cdr ty)))
        (cond
@@ -735,7 +807,15 @@
               (unsupported "@m[k1,…] = hist(x) — per-key histograms not yet supported"))
             (gen-hist-update mname (lower-expr (first (getf (cdr rhs) :args)))))
            ((string= fn "lhist")
-            (unsupported "lhist() — Phase 1 ships hist() only"))
+            (when (rest keys)
+              (unsupported "@m[k1,…] = lhist(x,…) — per-key lhist not yet supported"))
+            (let* ((args (getf (cdr rhs) :args))
+                   (value-form (lower-expr (first args)))
+                   (params (minfo-hist-params info)))
+              (unless params
+                (unsupported "internal: lhist info missing params"))
+              (destructuring-bind (lo hi step) params
+                (gen-lhist-update mname value-form lo hi step))))
            (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
       (t (gen-scalar-set mname keys (lower-expr rhs) op)))))
 
@@ -848,6 +928,25 @@
     `(let* ((,val ,value-form)
                     (,slot (whistler::log2 ,val)))
        (when (whistler::>= ,slot 64) (setf ,slot 63))
+       (whistler:when-let ((,p (whistler::map-lookup ,mname ,slot)))
+         (whistler::atomic-add ,p 0 1)))))
+
+(defun gen-lhist-update (mname value-form lo hi step)
+  "Linear histogram update. Buckets:
+     0          → underflow (value < LO)
+     1..N       → [LO + (i-1)*STEP, LO + i*STEP)
+     N+1        → overflow  (value >= HI)
+   where N = (HI - LO) / STEP."
+  (let* ((n    (max 1 (floor (- hi lo) step)))
+         (over (+ n 1))
+         (val  (gensym "V"))
+         (slot (gensym "S"))
+         (p    (gensym "P")))
+    `(let* ((,val ,value-form)
+            (,slot (cond
+                     ((whistler::< ,val ,lo) 0)
+                     ((whistler::>= ,val ,hi) ,over)
+                     (t (whistler::+ 1 (whistler::/ (whistler::- ,val ,lo) ,step))))))
        (whistler:when-let ((,p (whistler::map-lookup ,mname ,slot)))
          (whistler::atomic-add ,p 0 1)))))
 
@@ -1160,4 +1259,5 @@
                                                    1)
                                     :keyed-p (minfo-keyed-p info)
                                     :value-size (minfo-value-size info)
-                                    :max-entries (minfo-max-entries info))))))
+                                    :max-entries (minfo-max-entries info)
+                                    :hist-params (minfo-hist-params info))))))

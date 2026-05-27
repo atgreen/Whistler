@@ -82,11 +82,29 @@
            (kind (getf (cdr info) :kind)))
       (is (eq :counter kind)))))
 
-(test codegen-unsupported-feature-signaled
-  "lhist() raises BPFTRACE-UNSUPPORTED (Phase 1 ships hist only)."
-  (signals whistler/bpftrace:bpftrace-unsupported
-    (whistler/bpftrace:compile-script
-     "kprobe:foo { @h = lhist(arg0, 0, 1000, 10); }")))
+(test codegen-lhist-records-params
+  "lhist(value, lo, hi, step) compiles and records its params on the
+   map info so the runtime printer can re-bucket at print time."
+  (let* ((src "kprobe:foo { @h = lhist(arg0, 0, 1000, 100); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (info (first (getf gen :info))))
+    (is (eq :lhist (getf (cdr info) :kind)))
+    (is (equal '(0 1000 100) (getf (cdr info) :hist-params)))
+    (is (= 12 (getf (cdr info) :max-entries))
+        "buckets = N+2 (10 in-range + 1 underflow + 1 overflow)")))
+
+(test codegen-printf-ntop-v4
+  "ntop(addr) emits a 4-byte slot tagged :ipv4."
+  (let* ((src "kprobe:foo { printf(\"%s\\n\", ntop(arg0)); }")
+         (gen (whistler/bpftrace:compile-script src))
+         (entry (first (getf gen :printf-table))))
+    (is (equal '(:ipv4) (third entry)))))
+
+(test codegen-reg-ip
+  "reg(\"ip\") lowers and compiles cleanly inside a kprobe."
+  (let* ((src "kprobe:foo { printf(\"%s\\n\", ksym(reg(\"ip\"))); }")
+         (gen (whistler/bpftrace:compile-script src)))
+    (is (= 1 (length (getf gen :progs))))))
 
 ;;; ========== printf format flags ==========
 
@@ -139,3 +157,27 @@
          (gen (whistler/bpftrace:compile-script src))
          (entry (first (getf gen :printf-table))))
     (is (equal '(:usym) (third entry)))))
+
+(test format-ipv4-network-byte-order
+  "ntop()'s wire format: 4 bytes printed in their stored order. A u32
+   store of 0x0100A8C0 lays the bytes down as C0 A8 00 01 → 192.168.0.1."
+  (let ((bytes (make-array 4 :element-type '(unsigned-byte 8)
+                            :initial-contents '(#xC0 #xA8 #x00 #x01))))
+    (sb-sys:with-pinned-objects (bytes)
+      (let* ((sap (sb-sys:vector-sap bytes))
+             (b0 (sb-sys:sap-ref-8 sap 0))
+             (b1 (sb-sys:sap-ref-8 sap 1))
+             (b2 (sb-sys:sap-ref-8 sap 2))
+             (b3 (sb-sys:sap-ref-8 sap 3)))
+        (is (string= "192.168.0.1"
+                     (format nil "~D.~D.~D.~D" b0 b1 b2 b3)))))))
+
+(test format-ipv6-zero-compression
+  "format-ipv6 compresses the longest zero-run with `::`."
+  (let ((bytes (make-array 16 :element-type '(unsigned-byte 8)
+                              :initial-element 0)))
+    ;; ::1 → all zeros except last byte = 1
+    (setf (aref bytes 15) 1)
+    (sb-sys:with-pinned-objects (bytes)
+      (is (string= "::1" (whistler/bpftrace::format-ipv6
+                          (sb-sys:vector-sap bytes) 0))))))
