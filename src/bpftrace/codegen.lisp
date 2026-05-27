@@ -337,6 +337,11 @@
 ;;; ========== Expression lowering ==========
 
 (defvar *probe-spec* nil)
+
+(defvar *var-types* nil
+  "Per-probe alist VAR-NAME → STRUCT-NAME. Populated from `$v =
+   (struct X *)EXPR' assignments so later `$v.field' accesses can
+   walk BTF for the right offsets without seeing the cast again.")
 (defvar *map-table* nil)
 
 (defun lower-expr (expr)
@@ -1116,13 +1121,118 @@
       ((and (consp base) (eq (first base) :args))
        (lower-args-field name))
       ((and (consp base) (eq (first base) :curtask))
-       (lower-struct-pointer-field "task_struct" name
-                                   '(whistler::get-current-task)))
+       ;; A single field off curtask uses the simple scalar path; the
+       ;; chained-field path also covers it but the offsets-only walk
+       ;; covers more cases (`curtask.mm.start_code') downstream.
+       (let ((tname (cdr (assoc "task_struct" '(("task_struct" . "task_struct"))
+                                :test #'string=))))
+         (declare (ignore tname))
+         (lower-struct-pointer-field "task_struct" name
+                                     '(whistler::get-current-task))))
       ;; ((struct NAME *)EXPR)->FIELD — type comes from the cast.
       ((and (consp base) (eq (first base) :cast))
        (lower-struct-pointer-field (getf (cdr base) :type) name
                                    (lower-expr (getf (cdr base) :expr))))
+      ;; $var with a recorded cast type — `$sk = (struct sock *)retval;'
+      ;; then `$sk.field' (single hop).
+      ((and (consp base) (eq (first base) :var)
+            (assoc (second base) *var-types* :test #'string=))
+       (lower-struct-pointer-field
+        (cdr (assoc (second base) *var-types* :test #'string=))
+        name (lower-expr base)))
+      ;; Chained field access — e.g. `$sk.__sk_common.skc_family'.
+      ;; Walk inward collecting names; require the root to carry a
+      ;; known struct type via *var-types* or :cast / :curtask.
+      ((and (consp base) (eq (first base) :field))
+       (multiple-value-bind (root struct-name names)
+           (collect-field-chain expr)
+         (cond
+           ((and root struct-name)
+            (lower-chained-field (root-ptr-form root) struct-name names))
+           (t (unsupported "field access .~A on non-args expressions"
+                           name)))))
       (t (unsupported "field access .~A on non-args expressions" name)))))
+
+(defun root-ptr-form (root-ast)
+  "Lower the root of a field-chain — either a $var, a :cast, or
+   :curtask — to a pointer expression."
+  (cond
+    ((eq (first root-ast) :curtask) '(whistler::get-current-task))
+    ((eq (first root-ast) :cast)    (lower-expr (getf (cdr root-ast) :expr)))
+    (t                              (lower-expr root-ast))))
+
+(defun collect-field-chain (expr)
+  "Walk a (possibly nested) :field expression to its root. Returns
+   (values ROOT-AST ROOT-STRUCT-NAME FIELD-NAMES) where FIELD-NAMES
+   is the list of dotted names from outermost-base to leaf. Returns
+   (nil nil nil) if no struct type can be inferred for the root."
+  (labels ((walk (e)
+             (cond
+               ((and (consp e) (eq (first e) :field))
+                (multiple-value-bind (r rs names) (walk (getf (cdr e) :base))
+                  (values r rs (append names (list (getf (cdr e) :name))))))
+               (t (values e nil nil)))))
+    (multiple-value-bind (root _rs names) (walk expr)
+      (declare (ignore _rs))
+      (let ((struct-name
+              (cond
+                ((and (consp root) (eq (first root) :cast))
+                 (getf (cdr root) :type))
+                ((and (consp root) (eq (first root) :curtask))
+                 "task_struct")
+                ((and (consp root) (eq (first root) :var))
+                 (cdr (assoc (second root) *var-types* :test #'string=))))))
+        (if struct-name
+            (values root struct-name names)
+            (values nil nil nil))))))
+
+(defun lower-chained-field (root-ptr-form root-struct-name chain)
+  "Walk BTF for each name in CHAIN, summing offsets through embedded
+   structs/unions until a scalar leaf. Emits a single probe_read_kernel
+   from (ROOT-PTR-FORM + total-offset). Pointer-traversal (a chain
+   element whose type is itself a pointer-to-struct that you then
+   dot through) is not yet handled."
+  (let ((vmbtf (whistler:ensure-vmlinux-btf))
+        (current root-struct-name)
+        (total-offset 0)
+        (final-size nil)
+        (final-type nil))
+    (dolist (fname chain)
+      (let ((tid (whistler:btf-find-struct vmbtf current)))
+        (unless tid
+          (unsupported "field walk: struct ~A not in vmlinux BTF" current))
+        (let* ((fields (whistler:btf-struct-fields vmbtf tid))
+               (cell   (find fname fields :test #'string= :key #'first)))
+          (unless cell
+            (unsupported "->~A: struct ~A has no such field"
+                         fname current))
+          (let ((bpf-type (second cell))
+                (offset   (third cell))
+                (size     (fourth cell))
+                (sub-name (fifth cell)))
+            (incf total-offset offset)
+            (cond
+              ;; Embedded struct/union — keep walking.
+              ((and (null bpf-type) sub-name (not (eq fname (car (last chain)))))
+               (setf current sub-name))
+              ;; Scalar leaf.
+              ((and (eq fname (car (last chain)))
+                    (member size '(1 2 4 8)))
+               (setf final-size size)
+               (setf final-type (case size
+                                  (1 (intern "U8"  :whistler))
+                                  (2 (intern "U16" :whistler))
+                                  (4 (intern "U32" :whistler))
+                                  (8 (intern "U64" :whistler)))))
+              (t (unsupported
+                  "field chain ~{.~A~} — leaf must be a 1/2/4/8 byte scalar"
+                  chain)))))))
+    (let ((scratch (gensym "F")))
+      `(let ((,scratch (whistler::struct-alloc ,final-size)))
+         (whistler::probe-read-kernel
+          ,scratch ,final-size
+          (whistler::+ ,root-ptr-form ,total-offset))
+         (whistler::load ,final-type ,scratch 0)))))
 
 (defun lower-struct-pointer-field (struct-name field-name ptr-form)
   "Generate the kernel-side read for STRUCT-NAME pointer pointed to by
@@ -1703,9 +1813,29 @@
                (t (cons (walk (first f)) (walk (rest f)))))))
     (walk form)))
 
+(defun infer-var-types (stmts)
+  "Walk STMTS for `$v = (struct X *)EXPR' assignments and return an
+   alist (\"v\" . \"X\"). Loose: only the immediate :cast on the RHS
+   is recognised; intermediate arithmetic on the cast is skipped."
+  (let ((acc nil))
+    (labels ((maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var)
+                          (consp rhs) (eq (first rhs) :cast))
+                 (push (cons (second lhs) (getf (cdr rhs) :type)) acc)))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-record (getf (cdr s) :lhs)
+                                        (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk stmts))
+    acc))
+
 (defun gen-kernel-prog (spec pred body index sub)
   (multiple-value-bind (ptype section) (spec->section spec)
     (let* ((*probe-spec* spec)
+           (*var-types*  (infer-var-types body))
            (probe-str (format nil "~A" section))
            (func-str  (probe-func-name spec))
            (body      (rewrite-self-refs body probe-str func-str))

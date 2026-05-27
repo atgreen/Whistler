@@ -375,6 +375,25 @@
          (text (format nil "~S" (cdddr (first (getf gen :progs))))))
     (is (search "MAP-LOOKUP" text))))
 
+(test codegen-chained-field-access
+  "`$sk = (struct sock *)retval; $sk.__sk_common.skc_family' walks
+   through the embedded sock_common struct and probe-reads at the
+   summed offset (sock.__sk_common base + sock_common.skc_family
+   member offset)."
+  (let* ((src "kretprobe:inet_csk_accept
+                 { $sk = (struct sock *)retval;
+                   @ = $sk.__sk_common.skc_family; }")
+         (gen (whistler/bpftrace:compile-script src))
+         (text (format nil "~S" (cdddr (first (getf gen :progs))))))
+    ;; A single probe-read-kernel for the leaf u16 — not two.
+    (is (search "PROBE-READ-KERNEL" text))
+    (is (= 1 (count-occurrences "PROBE-READ-KERNEL" text)))))
+
+(defun count-occurrences (needle haystack)
+  (loop for start = 0 then (1+ pos)
+        for pos = (search needle haystack :start2 start)
+        while pos count pos))
+
 (test codegen-ppid
   "ppid builtin reads task->real_parent->tgid via two probe-reads."
   (let* ((src "kprobe:vfs_read { @[ppid] = count(); }")
