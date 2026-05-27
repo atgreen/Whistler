@@ -274,41 +274,48 @@
                                (minfo-value-size info) 16)))))
                    (t (when (eq (minfo-kind info) :counter)
                         (setf (minfo-kind info) :scalar)))))))
-      (dolist (probe (script-probes script))
-        (let ((body (getf (cdr probe) :body))
-              (pred (getf (cdr probe) :predicate)))
-          (when pred (when (eq (first pred) :map) (note-keys pred)))
-          (dolist (stmt body)
-            (case (first stmt)
-              (:assign
-               (let ((lhs (getf (cdr stmt) :lhs))
-                     (rhs (getf (cdr stmt) :rhs)))
-                 (when (eq (first lhs) :map)
-                   (note-keys lhs)
-                   (note-rhs lhs rhs))))
-              (:incdec
-               (let ((lhs (getf (cdr stmt) :lhs)))
-                 (when (eq (first lhs) :map)
-                   (note-keys lhs)
-                   (setf (minfo-kind (ensure lhs)) :counter))))
-              (:expr
-               (let ((e (second stmt)))
-                 (when (and (consp e) (eq (first e) :call)
-                            (member (getf (cdr e) :name)
-                                    '("delete" "clear" "zero")
-                                    :test #'string=))
-                   (let* ((args (getf (cdr e) :args))
-                          (mref (first args)))
-                     (when (and (consp mref) (eq (first mref) :map))
-                       (cond
-                         ;; Two-arg delete(@m, k1[, k2 …]) — note the
-                         ;; remaining args as keys.
-                         ((and (string= (getf (cdr e) :name) "delete")
-                               (>= (length args) 2))
-                          (note-keys
-                           (list :map :name (getf (cdr mref) :name)
-                                 :keys (rest args))))
-                         (t (note-keys mref))))))))))))
+      (labels
+          ((scan-stmt (stmt)
+             (case (first stmt)
+               (:assign
+                (let ((lhs (getf (cdr stmt) :lhs))
+                      (rhs (getf (cdr stmt) :rhs)))
+                  (when (eq (first lhs) :map)
+                    (note-keys lhs)
+                    (note-rhs lhs rhs))))
+               (:incdec
+                (let ((lhs (getf (cdr stmt) :lhs)))
+                  (when (eq (first lhs) :map)
+                    (note-keys lhs)
+                    (setf (minfo-kind (ensure lhs)) :counter))))
+               (:expr
+                (let ((e (second stmt)))
+                  (when (and (consp e) (eq (first e) :call)
+                             (member (getf (cdr e) :name)
+                                     '("delete" "clear" "zero")
+                                     :test #'string=))
+                    (let* ((args (getf (cdr e) :args))
+                           (mref (first args)))
+                      (when (and (consp mref) (eq (first mref) :map))
+                        (cond
+                          ((and (string= (getf (cdr e) :name) "delete")
+                                (>= (length args) 2))
+                           (note-keys
+                            (list :map :name (getf (cdr mref) :name)
+                                  :keys (rest args))))
+                          (t (note-keys mref))))))))
+               ;; Recurse into compound statements so map references
+               ;; nested under if/while still get inferred.
+               (:if
+                (mapc #'scan-stmt (getf (cdr stmt) :then))
+                (mapc #'scan-stmt (getf (cdr stmt) :else)))
+               (:while
+                (mapc #'scan-stmt (getf (cdr stmt) :body))))))
+        (dolist (probe (script-probes script))
+          (let ((body (getf (cdr probe) :body))
+                (pred (getf (cdr probe) :predicate)))
+            (when pred (when (eq (first pred) :map) (note-keys pred)))
+            (mapc #'scan-stmt body))))
       ;; Histogram maps with no explicit user key always have 4-byte key.
       (loop for info being the hash-values of table
             when (or (eq (minfo-kind info) :hist)
@@ -1412,7 +1419,12 @@
     (:incdec    (lower-incdec stmt))
     (:expr      (lower-expr-stmt stmt))
     (:let-noop  0)  ; bare `let $x;' — declaration, no work to do
-    (:return    (unsupported "return outside fn body"))))
+    (:return
+     ;; bpftrace lets `return;' at probe-body scope mean `skip the
+     ;; rest of this probe invocation'. The kernel ignores the
+     ;; tracepoint/kprobe return value, so emitting (whistler::return 0)
+     ;; is harmless and matches user intent.
+     `(whistler::return 0))))
 
 (defun lower-while (stmt)
   "Lower a bpftrace `while (cond) { body }' to a bounded dotimes:
