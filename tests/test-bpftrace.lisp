@@ -221,3 +221,20 @@
          (info (first (getf gen :info))))
     (is (eq :stats (getf (cdr info) :kind)))
     (is (= 16 (getf (cdr info) :value-size)))))
+
+(test codegen-kfunc-args-arrow
+  "args->fieldname in kfunc lowers to a ctx u64 load at BTF's offset."
+  (let* ((src "kfunc:vfs_read { @ = args->file; }")
+         (gen (whistler/bpftrace:compile-script src))
+         (prog (first (getf gen :progs)))
+         (text (format nil "~S" (cdddr prog))))
+    ;; vfs_read's first param is `file' at ctx offset 0.
+    (is (search "CTX" text))
+    (is (search "WHISTLER::U64" text))))
+
+(test codegen-kfunc-args-arrow-bad-field
+  "Unknown args->fieldname raises BPFTRACE-UNSUPPORTED with the actual
+   parameter list."
+  (signals whistler/bpftrace:bpftrace-unsupported
+    (whistler/bpftrace:compile-script
+     "kfunc:vfs_read { @ = args->nope; }")))

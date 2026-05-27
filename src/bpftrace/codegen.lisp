@@ -701,8 +701,25 @@
         (name (getf (cdr expr) :name)))
     (cond
       ((and (consp base) (eq (first base) :args))
-       (list (w-sym (concatenate 'string "tp-" name))))
+       (lower-args-field name))
       (t (unsupported "field access .~A on non-args expressions" name)))))
+
+(defun lower-args-field (name)
+  "Lower args->NAME based on the current probe type. Tracepoints use
+   the deftracepoint-generated tp-NAME accessor; fentry/fexit
+   programs read the named arg directly out of the ctx array using
+   the offset BTF gives us."
+  (case (first *probe-spec*)
+    ((:kfunc :kretfunc)
+     (let* ((fname  (second *probe-spec*))
+            (vmbtf  (whistler:ensure-vmlinux-btf))
+            (params (whistler:btf-func-params vmbtf fname))
+            (cell   (assoc name params :test #'string=)))
+       (unless cell
+         (unsupported "args->~A: ~A has no such parameter (have: ~{~A~^, ~})"
+                      name fname (mapcar #'car params)))
+       `(whistler::ctx ,(intern "U64" :whistler) ,(cdr cell))))
+    (t (list (w-sym (concatenate 'string "tp-" name))))))
 
 (defun store-key-component (buf offset type expr)
   "Emit the kernel form that fills (buf+offset, size-of-type) with EXPR's

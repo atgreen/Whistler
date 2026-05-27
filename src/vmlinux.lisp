@@ -130,6 +130,41 @@
                                          (getf proto :vlen))))
                      (values id (or nargs 0))))))
 
+(defun btf-func-params (vmbtf name)
+  "Find the kernel FUNC named NAME and return its parameter list as
+   ((PARAM-NAME . CTX-OFFSET-IN-BYTES) ...). Empty list if the
+   function isn't found or has no params. The offsets correspond to
+   ctx[i] in a fentry/fexit program, where ctx is laid out as
+   __u64 ctx[N] with one slot per arg."
+  (let* ((strtab (vmlinux-btf-strtab vmbtf))
+         (types  (vmlinux-btf-types vmbtf))
+         (data   (vmlinux-btf-type-data vmbtf)))
+    (loop for id from 1 below (length types)
+          for rec = (aref types id)
+          when (and rec
+                    (= (getf rec :kind) +btf-kind-func+)
+                    (string= (btf-string strtab (getf rec :name-off)) name))
+            return (let* ((proto-id (getf rec :size))
+                          (proto    (when (and proto-id
+                                               (< proto-id (length types)))
+                                      (aref types proto-id))))
+                     (cond
+                       ((and proto
+                             (= (getf proto :kind) +btf-kind-func-proto+))
+                        ;; FUNC_PROTO's vlen-many BTF_PARAM records
+                        ;; live at :data-off, each one 8 bytes:
+                        ;; struct btf_param { __u32 name_off; __u32 type; }.
+                        ;; (data-off is relative to type-data, not bytes.)
+                        (let ((base (- (getf proto :data-off) 12))) ; back to start of rec
+                          (declare (ignore base))
+                          (loop with off = (getf proto :data-off)
+                                with vlen = (getf proto :vlen)
+                                for i below vlen
+                                for name-off = (btf-u32 data (+ off (* i 8)))
+                                for pname = (btf-string strtab name-off)
+                                collect (cons pname (* i 8)))))
+                       (t '()))))))
+
 (defun btf-resolve-type (vmbtf type-id)
   "Resolve a BTF type through typedefs, const, volatile, etc.
    Returns the underlying kind, size, and name."
