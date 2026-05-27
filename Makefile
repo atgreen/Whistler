@@ -5,12 +5,15 @@ SBCL_FLAGS = --noinform --non-interactive
 
 all: whistler
 
-# Build standalone binary
-whistler: whistler.asd $(wildcard src/*.lisp)
+# Build standalone binary. The program-op is on whistler/cli (which
+# pulls in whistler + whistler/loader + symbolize + bpftrace); the
+# bare "whistler" system has no :build-operation and would just load
+# without producing an executable.
+whistler: whistler.asd $(wildcard src/*.lisp) $(wildcard src/loader/*.lisp) $(wildcard src/symbolize/*.lisp) $(wildcard src/bpftrace/*.lisp)
 	$(SBCL) $(SBCL_FLAGS) \
 		--eval '(require :asdf)' \
 		--eval '(push #p"./" asdf:*central-registry*)' \
-		--eval '(asdf:make "whistler")'
+		--eval '(asdf:make "whistler/cli")'
 
 # Compile examples
 examples: all
