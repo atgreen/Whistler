@@ -1160,7 +1160,7 @@
    strftime it; id 0 falls back to bpftrace's default `%H:%M:%S\\n'."
   (let* ((id  (sap-read-u32-le sap 4))
          (fmt (or (cdr (assoc id time-format-table :test #'=))
-                  "%H:%M:%S~%")))
+                  (format nil "%H:%M:%S~%"))))
     (write-string (strftime-light fmt))))
 
 (defun decode-join-record (sap)

@@ -1193,7 +1193,7 @@
    `%H:%M:%S\\n'. With one string-literal arg, that strftime format
    is interned and looked up at print time."
   (let ((fmt (cond
-               ((null args) "%H:%M:%S~%")
+               ((null args) (format nil "%H:%M:%S~%"))
                ((and (= (length args) 1)
                      (eq (first (first args)) :str))
                 (second (first args)))
