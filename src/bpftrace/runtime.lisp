@@ -994,10 +994,9 @@
                                               (fstr (cdr (assoc fmt-id
                                                                 time-format-table
                                                                 :test #'=))))
-                                         (declare (ignore ts))
                                          (incf off 8)
                                          (if fstr
-                                             (strftime-light fstr)
+                                             (strftime-light fstr ts)
                                              "?")))
                                       ((eq ty :int)
                                        (prog1 (sap-read-u64-le sap off)
@@ -1168,40 +1167,83 @@
                          k (whistler/loader::map-info-key-size info)))
                 (error () nil)))))))))
 
-(defun strftime-light (fmt)
-  "A minimal strftime over the CURRENT wall-clock time. Honours the
-   directives bpftrace tools actually use: %Y %y %m %d %H %M %S %j
-   %a %A %b %B %p %T %F %f (microseconds — we have second resolution
-   so this renders as 000000) and %%. Anything else passes through
-   literally."
-  (multiple-value-bind (sec min hr mday mon yr) (get-decoded-time)
-    (declare (ignore))
-    (let ((out (make-string-output-stream)))
-      (loop with i = 0
-            with n = (length fmt)
-            while (< i n) do
-        (let ((c (char fmt i)))
-          (cond
-            ((and (char= c #\%) (< (1+ i) n))
-             (let ((d (char fmt (1+ i))))
-               (case d
-                 (#\Y (format out "~4,'0D" yr))
-                 (#\y (format out "~2,'0D" (mod yr 100)))
-                 (#\m (format out "~2,'0D" mon))
-                 (#\d (format out "~2,'0D" mday))
-                 (#\H (format out "~2,'0D" hr))
-                 (#\M (format out "~2,'0D" min))
-                 (#\S (format out "~2,'0D" sec))
-                 (#\T (format out "~2,'0D:~2,'0D:~2,'0D" hr min sec))
-                 (#\F (format out "~4,'0D-~2,'0D-~2,'0D" yr mon mday))
-                 (#\f (write-string "000000" out))
-                 (#\n (terpri out))
-                 (#\t (write-char #\Tab out))
-                 (#\% (write-char #\% out))
-                 (t   (write-char #\% out) (write-char d out)))
-               (cl:incf i 2)))
-            (t (write-char c out) (cl:incf i)))))
-      (get-output-stream-string out))))
+(defvar *boot-to-realtime-offset-ns* nil
+  "Captured at session start: CLOCK_REALTIME_ns minus CLOCK_BOOTTIME_ns.
+   Lets us turn a kernel-side bpf_ktime_get_boot_ns timestamp into a
+   wall-clock time for %H:%M:%S.%f rendering.")
+
+(defun init-realtime-offset ()
+  (let* ((boot-ns
+           (sb-alien:with-alien ((ts (sb-alien:struct sb-unix::timespec)))
+             (sb-alien:alien-funcall
+              (sb-alien:extern-alien
+               "clock_gettime"
+               (function sb-alien:int sb-alien:int
+                         (* (sb-alien:struct sb-unix::timespec))))
+              7  ; CLOCK_BOOTTIME
+              (sb-alien:addr ts))
+             (+ (* 1000000000 (sb-alien:slot ts 'sb-unix::tv-sec))
+                (sb-alien:slot ts 'sb-unix::tv-nsec))))
+         (real-ns
+           (sb-alien:with-alien ((ts (sb-alien:struct sb-unix::timespec)))
+             (sb-alien:alien-funcall
+              (sb-alien:extern-alien
+               "clock_gettime"
+               (function sb-alien:int sb-alien:int
+                         (* (sb-alien:struct sb-unix::timespec))))
+              0  ; CLOCK_REALTIME
+              (sb-alien:addr ts))
+             (+ (* 1000000000 (sb-alien:slot ts 'sb-unix::tv-sec))
+                (sb-alien:slot ts 'sb-unix::tv-nsec)))))
+    (setf *boot-to-realtime-offset-ns* (- real-ns boot-ns))))
+
+(defun strftime-light (fmt &optional boot-ns)
+  "A minimal strftime. With BOOT-NS (kernel bpf_ktime_get_boot_ns
+   value), renders wall-clock time matching the moment that
+   timestamp was captured — %f gives real microseconds. Without
+   BOOT-NS (no timestamp source: bare time() use), falls back to
+   the CURRENT wall-clock time and %f is `000000'.
+   Directives: %Y %y %m %d %H %M %S %T %F %j %a %A %b %B %p %f %n %t %%."
+  (let* ((wall-ns (when (and boot-ns *boot-to-realtime-offset-ns*)
+                    (+ boot-ns *boot-to-realtime-offset-ns*)))
+         (wall-sec (and wall-ns (floor wall-ns 1000000000)))
+         (us       (if wall-ns
+                       (mod (floor wall-ns 1000) 1000000)
+                       0)))
+    (multiple-value-bind (sec min hr mday mon yr)
+        (if wall-sec
+            (decode-universal-time
+             ;; decode-universal-time expects "universal time" = secs
+             ;; since 1900-01-01. wall-sec is unix epoch (since 1970);
+             ;; add 70 years × 365.2425 ≈ 2208988800.
+             (+ wall-sec 2208988800))
+            (get-decoded-time))
+      (let ((out (make-string-output-stream)))
+        (loop with i = 0
+              with n = (length fmt)
+              while (< i n) do
+          (let ((c (char fmt i)))
+            (cond
+              ((and (char= c #\%) (< (1+ i) n))
+               (let ((d (char fmt (1+ i))))
+                 (case d
+                   (#\Y (format out "~4,'0D" yr))
+                   (#\y (format out "~2,'0D" (mod yr 100)))
+                   (#\m (format out "~2,'0D" mon))
+                   (#\d (format out "~2,'0D" mday))
+                   (#\H (format out "~2,'0D" hr))
+                   (#\M (format out "~2,'0D" min))
+                   (#\S (format out "~2,'0D" sec))
+                   (#\T (format out "~2,'0D:~2,'0D:~2,'0D" hr min sec))
+                   (#\F (format out "~4,'0D-~2,'0D-~2,'0D" yr mon mday))
+                   (#\f (format out "~6,'0D" us))
+                   (#\n (terpri out))
+                   (#\t (write-char #\Tab out))
+                   (#\% (write-char #\% out))
+                   (t   (write-char #\% out) (write-char d out)))
+                 (cl:incf i 2)))
+              (t (write-char c out) (cl:incf i)))))
+        (get-output-stream-string out)))))
 
 (defun decode-time-record (sap time-format-table)
   "Format-string id sits at offset 4 (u32). Look up the format and
@@ -1284,6 +1326,7 @@
            ;; Populate the elapsed-start map *before* attaching probes
            ;; so the very first probe firing sees a non-zero baseline.
            (_elapsed (populate-elapsed-map (find-elapsed-map gen map-alist)))
+           (_rt      (init-realtime-offset))
            (stack-depth (or (getf gen :stack-depth) 32))
            ;; Userspace symboliser for ustack frames. Allocated once
            ;; per session; per-pid /proc/<pid>/maps snapshots happen
