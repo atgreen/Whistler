@@ -326,7 +326,9 @@
     (is (= 2 (length forms)))
     (let ((fn (find :function forms :key #'first)))
       (is (string= "dub" (getf (cdr fn) :name)))
-      (is (equal '("x") (getf (cdr fn) :params))))))
+      ;; Params include the `$' sigil so substitution can distinguish
+      ;; `$x' (var reference) from a bare `x' (constant identifier).
+      (is (equal '("$x") (getf (cdr fn) :params))))))
 
 (test codegen-user-fn-inlined
   "fn calls inline at codegen time — body is substituted for params."
@@ -355,7 +357,8 @@
     (let ((m (find :macro (rest ast) :key #'first)))
       (is (not (null m)))
       (is (string= "ms" (getf (cdr m) :name)))
-      (is (equal '("t") (getf (cdr m) :params))))))
+      ;; Sigilled — see parse-user-fn for the rationale.
+      (is (equal '("$t") (getf (cdr m) :params))))))
 
 (test parse-macro-bare-and-at-params
   "Macro params accept `$name', bare `name', and `@name' forms."
