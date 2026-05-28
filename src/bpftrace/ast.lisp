@@ -105,12 +105,47 @@
 
 ;;; ========== Main entry ==========
 
+(defun parse-config-body (body)
+  "Split a config-block body string into an alist of (NAME . VALUE)
+   pairs. Entries are KEY=VALUE separated by `;' or newlines; surrounding
+   whitespace is trimmed. bpftrace docs say `BPFTRACE_FOO', `FOO',
+   and `foo' are equivalent — we downcase NAME and drop any leading
+   `bpftrace_' prefix so the runtime only has to look one form up."
+  (let ((out nil))
+    (dolist (raw (loop with acc = nil and start = 0
+                       for i from 0 below (length body)
+                       when (or (char= (char body i) #\;)
+                                (char= (char body i) #\newline))
+                         do (push (subseq body start i) acc)
+                            (setf start (1+ i))
+                       finally (push (subseq body start) acc)
+                               (return (nreverse acc))))
+      (let* ((s (string-trim '(#\Space #\Tab #\Newline #\Return) raw))
+             (eq (position #\= s)))
+        (when (and (plusp (length s)) eq)
+          (let* ((k (string-downcase
+                     (string-trim '(#\Space #\Tab) (subseq s 0 eq))))
+                 (v (string-trim '(#\Space #\Tab) (subseq s (1+ eq))))
+                 (k* (if (and (> (length k) 9)
+                              (string= k "bpftrace_" :end1 9))
+                         (subseq k 9)
+                         k)))
+            (push (cons k* v) out)))))
+    (nreverse out)))
+
+(defvar *script-config* nil
+  "Alist of (KEY . VALUE-STRING) pairs collected from any `config = {…}'
+   block(s) in the current script. Bound by NORMALIZE so codegen and
+   compile-script can pick the values up.")
+
 (defun normalize (raw)
   "Convert the iparse parse tree RAW into the typed AST, then apply
    post-parse rewrites (auto-prepend pid to ustack-keyed maps).
    Top-level forms may be probes or function definitions; both are
-   collected into the (:script ...) list."
+   collected into the (:script ...) list. Config blocks contribute to
+   *script-config* rather than the script body."
   (assert (eq (tag-of raw) :script) (raw) "expected :SCRIPT root, got ~S" (tag-of raw))
+  (setf *script-config* nil)
   (rewrite-ustack-pids
    (cons :script
          (loop for top in (all-tagged raw :top-form)
@@ -119,7 +154,14 @@
                               (:probe        (norm-probe inner))
                               (:function     (norm-function inner))
                               (:macro-decl   (norm-macro inner))
-                              (:config-block nil)  ; accept-and-ignore
+                              (:config-block
+                               (let* ((body-node (first-tagged inner :config-body))
+                                      (body (and body-node (text-of body-node))))
+                                 (when body
+                                   (setf *script-config*
+                                         (append *script-config*
+                                                 (parse-config-body body)))))
+                               nil)
                               (:map-decl     nil)  ; accept-and-ignore
                               (t (error "unexpected top-form: ~S"
                                         (tag-of inner))))

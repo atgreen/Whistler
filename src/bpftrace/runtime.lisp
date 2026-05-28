@@ -609,12 +609,16 @@
 (defun print-scalar-map (label info &key (key-parts 1) keyed-p
                                           (kind :counter) key-builtin
                                           key-types
+                                          top div
                                           stacks-info stack-depth
                                           symbolizer)
   "Print a hash or percpu-hash map's contents in bpftrace's END-dump
    style. KIND controls value decoding; KEY-BUILTIN is the single-slot
    key shape hint; KEY-TYPES is the per-slot hint list for composite
-   keys (e.g. (:pid :ustack)). SYMBOLIZER resolves ustack IPs."
+   keys (e.g. (:pid :ustack)). When TOP is set, only the largest TOP
+   entries by value are shown. When DIV is set (a positive integer),
+   each value is divided by DIV before printing — matches bpftrace's
+   `print(@m, top, div)' contract. SYMBOLIZER resolves ustack IPs."
   (let* ((keys (map-keys info))
          (pairs (sort (mapcar
                        (lambda (k)
@@ -639,6 +643,20 @@
                                (if (and (consp v) (eq (car v) :stats))
                                    (third v)  ; sort by total
                                    v)))))
+         ;; print(@m, top, div): keep only the largest TOP entries
+         ;; (we sorted ascending, so trim from the front) and scale
+         ;; each value by DIV before rendering. :stats values keep
+         ;; their tagged shape; div only applies to plain integers.
+         (pairs (if (and top (> (length pairs) top))
+                    (nthcdr (- (length pairs) top) pairs)
+                    pairs))
+         (pairs (if div
+                    (mapcar (lambda (kv)
+                              (let ((v (cdr kv)))
+                                (cons (car kv)
+                                      (if (integerp v) (floor v div) v))))
+                            pairs)
+                    pairs))
          (prefix (if (or (null label) (string= label "@")) "@" (format nil "@~A" label))))
     (multiple-value-bind (stack-idx pid-idx user-p)
         (when key-types (composite-stack-info key-types))
@@ -777,6 +795,20 @@
     (when sym
       (let ((key (string-downcase (substitute #\_ #\- (symbol-name sym)))))
         (cdr (assoc key map-alist :test #'string=))))))
+
+(defun config-bool (gen key default)
+  "Resolve a boolean knob from the script's `config = {…}' block. KEY
+   matches bpftrace's lowercase form (e.g. \"print_maps_on_exit\").
+   Recognised falsy values: 0, false, no, off. Truthy: 1, true, yes,
+   on. Anything else returns DEFAULT."
+  (let* ((pair (assoc key (getf gen :config) :test #'string=))
+         (v (and pair (string-downcase
+                       (string-trim '(#\Space #\Tab) (cdr pair))))))
+    (cond
+      ((null pair) default)
+      ((member v '("0" "false" "no" "off") :test #'string=) nil)
+      ((member v '("1" "true" "yes" "on")  :test #'string=) t)
+      (t default))))
 
 (defun find-print-map (gen map-alist)
   (let ((sym (getf gen :print-map)))
@@ -1210,6 +1242,8 @@
                   :key-builtin (getf (cdr info-rec) :key-builtin)
                   :key-types (getf (cdr info-rec) :key-types)
                   :kind      (getf (cdr info-rec) :kind)
+                  :top       (when (plusp top) top)
+                  :div       (when (plusp div) div)
                   :stacks-info stacks-info
                   :stack-depth stack-depth
                   :symbolizer *session-symbolizer*)))))))
@@ -1482,10 +1516,11 @@
               (error () nil)))
           (when ring-consumer
             (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
-          (print-all-maps info-list map-alist
-                          :stacks-info stacks-info
-                          :stack-depth stack-depth
-                          :symbolizer symbolizer)
+          (when (config-bool gen "print_maps_on_exit" t)
+            (print-all-maps info-list map-alist
+                            :stacks-info stacks-info
+                            :stack-depth stack-depth
+                            :symbolizer symbolizer))
           (whistler/symbolize:close-symbolizer symbolizer)
           (dolist (a atts) (handler-case (whistler/loader::detach a) (error () nil)))
           (dolist (e prog-alist)

@@ -1287,15 +1287,37 @@
 
 (defun lower-async-map (tag args op-name)
   "Emit a tagged ringbuf record asking userspace to print/clear/zero
-   the named map. ARGS must be one @map reference."
-  (unless (and args (= (length args) 1) (eq (first (first args)) :map))
-    (unsupported "~A() needs a single @map argument" op-name))
+   the named map. ARGS is one @map reference, plus (for print only)
+   optional TOP and DIV — `print(@m, 10)' shows the top 10 entries,
+   `print(@m, 10, 1000)' additionally divides each value by 1000.
+   Clear and zero accept only the single @map form."
+  (unless (and args (consp (first args)) (eq (first (first args)) :map))
+    (unsupported "~A() needs an @map as its first argument" op-name))
   (let* ((mref (first args))
+         (extras (rest args))
          (map-id (intern-map-id mref))
-         (rec (gensym "REC")))
-    `(whistler:with-ringbuf (,rec ,*print-map-name* 8)
-       (whistler::store ,(intern "U32" :whistler) ,rec 0 ,tag)
-       (whistler::store ,(intern "U32" :whistler) ,rec 4 ,map-id))))
+         (rec (gensym "REC"))
+         (u32 (intern "U32" :whistler)))
+    (cond
+      ;; print(@m), print(@m, N), print(@m, N, D) — 16-byte record so
+      ;; the kernel side can attach top/div without a second tag.
+      ((string= op-name "print")
+       (when (> (length extras) 2)
+         (unsupported "print() takes at most 3 args: @map, top, div"))
+       (let ((top (or (first extras) '(:int 0)))
+             (div (or (second extras) '(:int 0))))
+         `(whistler:with-ringbuf (,rec ,*print-map-name* 16)
+            (whistler::store ,u32 ,rec 0 ,tag)
+            (whistler::store ,u32 ,rec 4 ,map-id)
+            (whistler::store ,u32 ,rec 8 ,(lower-expr top))
+            (whistler::store ,u32 ,rec 12 ,(lower-expr div)))))
+      ;; clear / zero — still single-arg.
+      (t
+       (when extras
+         (unsupported "~A() takes a single @map argument" op-name))
+       `(whistler:with-ringbuf (,rec ,*print-map-name* 8)
+          (whistler::store ,u32 ,rec 0 ,tag)
+          (whistler::store ,u32 ,rec 4 ,map-id))))))
 
 (defvar *time-format-table* nil
   "Per-generate() alist (ID . FMT-STRING). Each time(FMT) call gets
@@ -3686,6 +3708,7 @@
                         maps)
           :progs (append tp-preamble probes)
           :user-probes user
+          :config *script-config*
           :exit-map (when uses-exit *exit-map-name*)
           :print-map (when uses-printf *print-map-name*)
           :stacks-map (when uses-kstack *stacks-map-name*)
