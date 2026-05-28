@@ -1011,6 +1011,29 @@
         (format t "kprobe:~A~%" name))
       (format t "~%;; ~D probe~:p~%" (length matches)))))
 
+(defun parse-named-params (args)
+  "Walk ARGS for `--NAME' / `--NAME=VALUE' positionals that come after
+   the `--' separator (bpftrace's convention) or after the script path.
+   Returns an alist ((NAME . VALUE) …). VALUE is the empty string for
+   bare flags. `--dump' / `-V' / `--help' are recognised as whistler's
+   own flags and excluded so users can't accidentally feed them to
+   getopt. Anything before `--' that already looks like a whistler flag
+   stays unaffected."
+  (let* ((sep (position "--" args :test #'string=))
+         (start (if sep (1+ sep) 0))
+         (own-flags '("--dump" "--help" "--version" "-h" "-V"))
+         (out nil))
+    (loop for i from start below (length args)
+          for a = (nth i args)
+          when (and (>= (length a) 3)
+                    (string= (subseq a 0 2) "--")
+                    (not (member a own-flags :test #'string=)))
+            do (let ((eq (position #\= a)))
+                 (if eq
+                     (push (cons (subseq a 2 eq) (subseq a (1+ eq))) out)
+                     (push (cons (subseq a 2) "") out))))
+    (nreverse out)))
+
 (defun run-bpftrace-script (args)
   "The compile-and-run path. Parses -e / -p / -c / --dump and the
    trailing script file."
@@ -1019,6 +1042,7 @@
          (e-pos  (position "-e" args :test #'string=))
          (p-pos  (position "-p" args :test #'string=))
          (c-pos  (position "-c" args :test #'string=))
+         (named-params (parse-named-params args))
          (pid-arg (when p-pos
                     (let ((s (nth (1+ p-pos) args)))
                       (unless s
@@ -1048,14 +1072,17 @@
          (filter-var  (find-symbol "*PID-FILTER*"    '#:whistler/bpftrace))
          (child-var   (find-symbol "*CHILD-PROCESS*" '#:whistler/bpftrace))
          (hook-var    (find-symbol "*POST-ATTACH-HOOK*" '#:whistler/bpftrace))
+         (params-var  (find-symbol "*NAMED-PARAMS*"  '#:whistler/bpftrace))
          (release-thunk (when child-process
                           (lambda () (release-traced-process child-process)))))
     (progv (remove nil (list (when effective-pid filter-var)
                               (when child-process    child-var)
-                              (when release-thunk    hook-var)))
+                              (when release-thunk    hook-var)
+                              (when named-params     params-var)))
            (remove nil (list (when effective-pid effective-pid)
                               (when child-process    child-process)
-                              (when release-thunk    release-thunk)))
+                              (when release-thunk    release-thunk)
+                              (when named-params     named-params)))
       (cond
         (dump-p
          (let ((gen (funcall (find-symbol "COMPILE-SCRIPT" '#:whistler/bpftrace) source))

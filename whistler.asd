@@ -81,6 +81,7 @@
                (:file "grammar")
                (:file "ast")
                (:file "codegen")
+               (:file "syscall-table")
                (:file "runtime")
                (:file "bpftrace")))
 

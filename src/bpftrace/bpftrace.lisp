@@ -23,6 +23,13 @@
    with `pid == PID-FILTER' before codegen. Wired through the CLI's
    -p / -c options.")
 
+(defvar *named-params* nil
+  "Alist of (NAME-STRING . VALUE-STRING) parsed from CLI args after the
+   script path or after `--' separator: `--sysname' → (\"sysname\" . \"\"),
+   `--n=10' → (\"n\" . \"10\"). Read by lower-call for getopt(NAME, DEFAULT)
+   — when NAME is present here, getopt returns the parsed value; otherwise
+   DEFAULT.")
+
 (defun add-pid-filter (ast pid)
   "Return AST with each probe's :predicate ANDed against (pid == PID).
    Functions and other top-level forms pass through unchanged."

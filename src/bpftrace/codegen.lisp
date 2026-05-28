@@ -214,6 +214,7 @@
     (:kstack  :kstack)
     (:ustack  :ustack)
     (:call    (cond ((or (str-call-p expr) (kstr-call-p expr)) :str)
+                    ((named-call-p expr "syscall_name") :syscall-name)
                     (t nil)))
     (t        nil)))
 
@@ -1007,11 +1008,54 @@
              (whistler::ash (whistler::logand ,x #xff) 8)
              (whistler::ash (whistler::logand ,x #xff00) -8)))))
       ;; `getopt(NAME, DEFAULT, HELP)' — bpftrace's CLI-flag accessor.
-      ;; whistler bpftrace doesn't expose user options, so this always
-      ;; returns the default value (the second argument).
+      ;; If NAME was passed via `whistler bpftrace script.bt -- --NAME[=V]'
+      ;; the parsed value lands in whistler/bpftrace:*named-params*, and
+      ;; we emit an integer literal for it. Otherwise we lower DEFAULT
+      ;; (which the bpftrace stdlib seeds as `false' / int / string).
+      ;; Only bool and int variants are supported today; string defaults
+      ;; without a CLI override still flow through unchanged.
       ((string= name "getopt")
-       (lower-expr (or (second (getf (cdr expr) :args))
-                       '(:int 0))))
+       (let* ((args     (getf (cdr expr) :args))
+              (opt-name (and (consp (first args))
+                             (eq (first (first args)) :str)
+                             (second (first args))))
+              (default  (or (second args) '(:int 0)))
+              (provided (and opt-name *named-params*
+                             (assoc opt-name *named-params* :test #'string=))))
+         (cond
+           ((null provided)
+            (lower-expr default))
+           ;; Bool-shaped default: false/true via :constant, or :bool
+           ;; literal if the parser ever emits one. Bare `--name' → 1,
+           ;; `--name=true`/`--name=1` → 1, `--name=false`/`--name=0` → 0.
+           ((or (and (consp default) (eq (first default) :constant)
+                     (or (string= (second default) "false")
+                         (string= (second default) "true")))
+                (and (consp default) (eq (first default) :bool)))
+            (let* ((raw (cdr provided))
+                   (v (cond
+                        ((or (null raw) (string= raw "")) 1)
+                        ((member raw '("1" "true") :test #'string=) 1)
+                        ((member raw '("0" "false") :test #'string=) 0)
+                        (t (unsupported "getopt(~S, bool): unrecognised value ~S"
+                                        opt-name raw)))))
+              v))
+           ;; Int-shaped default.
+           ((and (consp default) (eq (first default) :int))
+            (or (parse-integer (or (cdr provided) "") :junk-allowed t)
+                (unsupported "getopt(~S, int): could not parse value ~S as integer"
+                             opt-name (cdr provided))))
+           (t
+            (unsupported "getopt(~S): CLI override only supported for bool / int defaults"
+                         opt-name)))))
+      ;; `syscall_name(N)' — bpftrace returns a string; we instead pass
+      ;; the syscall number through unchanged and let the userspace
+      ;; print path map it to a name via the :syscall-name key-hint
+      ;; (see key-hint / format-key). Works for the common usage
+      ;; `@m[syscall_name(args.id)] = count()' but not as a printf %s
+      ;; arg — that needs kernel-side string-table lookup.
+      ((string= name "syscall_name")
+       (lower-expr (first (getf (cdr expr) :args))))
       ;; User-defined `fn' — inline the body, substituting the
       ;; formal parameters with the actual argument expressions.
       ((find-user-function name)

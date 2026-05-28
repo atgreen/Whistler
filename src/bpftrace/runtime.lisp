@@ -433,15 +433,44 @@
        (coerce (subseq bytes 0 end) '(simple-array (unsigned-byte 8) (*)))
        :external-format :utf-8))))
 
+(defvar *syscall-name-table* nil
+  "Lazy hash-table SYSCALL-ID (integer) → NAME (string). Populated on
+   first lookup from the baked *syscalls-<arch>* alists in
+   syscall-table.lisp; picked by SBCL feature flags. Runtime tracefs
+   scanning was tried first but is fragile — SBCL's readdir bails
+   partway through sysfs and produces SIGSEGV warnings.")
+
+(defun build-syscall-name-table ()
+  "Pick the baked syscall alist for the build-host architecture and
+   load it into a hash-table. x86-64 and arm64 are covered; everything
+   else gets an empty table and IDs render as 'unknown_syscall'."
+  (let ((alist #+x86-64 *syscalls-x86-64*
+               #+arm64  *syscalls-arm64*
+               #-(or x86-64 arm64) nil)
+        (tbl (make-hash-table)))
+    (dolist (pair alist)
+      (setf (gethash (car pair) tbl) (cdr pair)))
+    tbl))
+
+(defun syscall-id->name (id)
+  "Map a syscall ID to its name. Returns 'unknown_syscall' for IDs
+   not in the baked table for the current architecture."
+  (unless *syscall-name-table*
+    (setf *syscall-name-table* (build-syscall-name-table)))
+  (or (gethash id *syscall-name-table*) "unknown_syscall"))
+
 (defun format-key (key &key (parts 1) key-builtin)
   "Render KEY (an integer) as bpftrace does.
    * KEY-BUILTIN :comm or :str — KEY's PARTS*8 little-endian bytes
      are a NUL-padded string.
+   * KEY-BUILTIN :syscall-name — KEY is a syscall ID; render its name.
    * scalar (PARTS=1): bare decimal.
    * composite (PARTS>1): split into 8-byte chunks and render."
   (cond
     ((or (eq key-builtin :comm) (eq key-builtin :str))
      (format nil "~A" (bignum->string key (* parts 8))))
+    ((eq key-builtin :syscall-name)
+     (syscall-id->name key))
     ((<= parts 1) (format nil "~D" key))
     (t
      (with-output-to-string (s)
@@ -1164,7 +1193,9 @@
 
 (defun decode-print-map-record (sap map-id-table map-alist info-list
                                 stacks-info stack-depth)
-  (let ((id (sap-read-u32-le sap 4)))
+  (let ((id  (sap-read-u32-le sap 4))
+        (top (sap-read-u32-le sap 8))
+        (div (sap-read-u32-le sap 12)))
     (multiple-value-bind (raw map-info info-rec)
         (find-map-by-id map-id-table id map-alist info-list)
       (when map-info
