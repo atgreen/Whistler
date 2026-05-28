@@ -1450,15 +1450,12 @@
        `(whistler::store ,(intern "U64" :whistler) ,rec ,off ,cgid)))
     ((eq ty :ipv-any)
      ;; ARG is a `\$v' that points at its 17-byte ntop slot. Copy the
-     ;; whole slot (1 byte family + 16 bytes address) into the record.
-     (let ((src (lower-expr arg))
-           (i   (gensym "I")))
-       `(whistler::dotimes (,i ,+bt-ntop-slot-size+)
-          ;; load/store take immediate offsets; runtime index goes
-          ;; into the base pointer.
-          (whistler::store
-           whistler::u8 (+ ,rec ,off ,i) 0
-           (whistler::load whistler::u8 (+ ,src ,i) 0)))))
+     ;; whole slot (16 bytes address + 1 byte family) into the record.
+     ;; Uses whistler::memcpy (unrolled wide load/store) — a runtime
+     ;; byte-by-byte loop hit a regalloc-induced verifier reject when
+     ;; the loop counter and a derived pointer ended up sharing a
+     ;; register across iterations.
+     `(whistler::memcpy ,rec ,off ,(lower-expr arg) 0 ,+bt-ntop-slot-size+))
     ((and (consp ty) (eq (car ty) :string))
      (let ((size (cdr ty)))
        (cond
@@ -1484,11 +1481,10 @@
          ;; into the record.
          ((and (eq (first arg) :var)
                (member (second arg) *comm-vars* :test #'string-equal))
-          (let ((src (lower-expr arg))
-                (i   (gensym "I")))
-            `(whistler::dotimes (,i ,size)
-               (whistler::store whistler::u8 (+ ,rec ,off ,i) 0
-                                (whistler::load whistler::u8 (+ ,src ,i) 0)))))
+          ;; Unrolled byte copy (whistler::memcpy widens to u64/u32
+          ;; chunks at compile time). Avoids the regalloc snag the
+          ;; runtime-loop form hit.
+          `(whistler::memcpy ,rec ,off ,(lower-expr arg) 0 ,size))
          ;; A field-chain whose leaf is a char[] / u8[] array — emit
          ;; one probe_read_kernel of SIZE bytes from the chain's
          ;; computed pointer.
@@ -2051,10 +2047,7 @@
     (flet ((copy-body (kform)
              `(whistler:if-let
                   (,p (whistler::map-lookup-ptr ,mname ,kform))
-                (whistler::dotimes (,i ,vsize)
-                  (whistler::store
-                   whistler::u8 (+ ,slot-sym ,i) 0
-                   (whistler::load whistler::u8 (+ ,p ,i) 0)))
+                (whistler::memcpy ,slot-sym 0 ,p 0 ,vsize)
                 0)))
       (if ptr-p
           (with-key keys #'copy-body)
@@ -2077,10 +2070,7 @@
     (flet ((copy-body (kform)
              `(whistler:if-let
                   (,p (whistler::map-lookup-ptr ,mname ,kform))
-                (whistler::dotimes (,i ,+bt-ntop-slot-size+)
-                  (whistler::store
-                   whistler::u8 (+ ,slot-sym ,i) 0
-                   (whistler::load whistler::u8 (+ ,p ,i) 0)))
+                (whistler::memcpy ,slot-sym 0 ,p 0 ,+bt-ntop-slot-size+)
                 0)))
       (if ptr-p
           (with-key keys #'copy-body)
