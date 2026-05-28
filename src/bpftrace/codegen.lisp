@@ -491,6 +491,27 @@
    largest string-typed value-size of any map referenced from the
    current probe. Sized at gen-kernel-prog setup time.")
 
+(defvar *shared-key-buf* nil
+  "Per-probe shared 8-byte stack buffer reused as the scalar map-key
+   temporary across all gen-string-set calls in the same probe. A
+   BEGIN block initialising N entries (capable.bt has 41) would
+   otherwise allocate N × 8 bytes of single-use key buffers and blow
+   the 512-byte stack frame.
+
+   Important: this is a `struct-alloc' buffer, not a `let*'-bound
+   u64. The emitter's key cache (emit-key-to-stack) records `this
+   stack slot holds const N' when a u64 var with a known init value
+   appears as a stack-addr target — and subsequent map-lookups for
+   the same constant key reuse that slot WITHOUT re-storing the
+   value. A `let*'-bound u64 reused here would silently corrupt
+   readers: the slot holds whatever we last wrote (e.g. 40) but the
+   cache still claims it holds 0, so @m[0] reads return the @m[40]
+   entry. struct-alloc sidesteps the cache entirely.")
+
+(defvar *shared-key-buf-used* nil
+  "Set to T whenever a gen-*-set call lowers to use *shared-key-buf*
+   so the prologue knows to allocate it.")
+
 ;;; ========== Per-CPU scratch map ==========
 ;;;
 ;;; The BPF stack frame is capped at 512 bytes. Non-trivial bpftrace
@@ -1689,27 +1710,40 @@
          ;; Missing key (NULL pointer) → leave the slot untouched
          ;; (init was zero, so the userspace decoder sees an empty
          ;; string).
+         ;;
+         ;; Scalar-key path uses the per-probe shared *shared-key-buf*
+         ;; via map-lookup-ptr rather than a fresh `(let* ((tmpk u64 …)))'
+         ;; + map-lookup. Reason: the OLD pattern made the emit-time
+         ;; key cache (emit-key-to-stack) record "this slot holds
+         ;; const N" — but gen-string-set's writes through the shared
+         ;; buffer leave a stack slot that the cache later mis-routes
+         ;; constant-key lookups to. Using map-lookup-ptr sidesteps
+         ;; emit-key-to-stack entirely.
          ((eq (first arg) :map)
           (let* ((info (gethash (getf (cdr arg) :name) *map-table*))
                  (mname (minfo-name info))
                  (keys  (getf (cdr arg) :keys))
                  (p     (gensym "P"))
                  (ptr-p (keys-need-ptr-ops-p keys)))
-            (if ptr-p
-                (with-key keys
-                  (lambda (k)
-                    `(whistler:if-let
-                         (,p (whistler::map-lookup-ptr ,mname ,k))
-                       (whistler::probe-read-kernel
-                        (+ ,rec ,off) ,size ,p)
-                       0)))
-                (let ((tmpk (gensym "K")))
-                  `(let* ((,tmpk whistler::u64 ,(lower-expr (first keys))))
-                     (whistler:if-let
-                         (,p (whistler::map-lookup ,mname ,tmpk))
-                       (whistler::probe-read-kernel
-                        (+ ,rec ,off) ,size ,p)
-                       0)))))))))))
+            (cond
+              (ptr-p
+               (with-key keys
+                 (lambda (k)
+                   `(whistler:if-let
+                        (,p (whistler::map-lookup-ptr ,mname ,k))
+                      (whistler::probe-read-kernel
+                       (+ ,rec ,off) ,size ,p)
+                      0))))
+              (t
+               (setf *shared-key-buf-used* t)
+               `(progn
+                  (whistler::store whistler::u64 ,*shared-key-buf* 0
+                                   ,(lower-expr (first keys)))
+                  (whistler:if-let
+                      (,p (whistler::map-lookup-ptr ,mname ,*shared-key-buf*))
+                    (whistler::probe-read-kernel
+                     (+ ,rec ,off) ,size ,p)
+                    0)))))))))))
 
 (defun lower-printf-string-literal (rec off text size)
   "Emit the kernel-side stores that lay TEXT (UTF-8) into the SIZE-byte
@@ -2685,24 +2719,29 @@
   "Store LITERAL as the NUL-padded contents of @MNAME[KEYS]. Reuses
    the per-probe shared *string-set-buf* (allocated once in the
    prologue) so a BEGIN block initialising N entries doesn't bloat
-   the stack by N × value-size."
+   the stack by N × value-size. Scalar keys also reuse the shared
+   *shared-key-slot*: N × 8-byte one-shot key buffers (capable.bt's
+   41-entry @cap init) collapse to a single 8-byte slot."
   (let* ((mname (minfo-name info))
          (vsize (minfo-value-size info))
          (buf   *string-set-buf*)
-         (tmpk  (gensym "K"))
          (ptr-p (keys-need-ptr-ops-p keys)))
     (unless buf
       (unsupported "internal: gen-string-set called outside a probe scope"))
     (with-key keys
       (lambda (k)
-        (if ptr-p
-            `(progn
-               ,(lower-printf-string-literal buf 0 literal vsize)
-               (whistler::map-update-ptr ,mname ,k ,buf 0))
-            `(let* ((,tmpk whistler::u64 ,k))
-               ,(lower-printf-string-literal buf 0 literal vsize)
-               (whistler::map-update-ptr
-                ,mname (whistler::stack-addr ,tmpk) ,buf 0)))))))
+        (cond
+          (ptr-p
+           `(progn
+              ,(lower-printf-string-literal buf 0 literal vsize)
+              (whistler::map-update-ptr ,mname ,k ,buf 0)))
+          (t
+           (setf *shared-key-buf-used* t)
+           `(progn
+              (whistler::store whistler::u64 ,*shared-key-buf* 0 ,k)
+              ,(lower-printf-string-literal buf 0 literal vsize)
+              (whistler::map-update-ptr
+               ,mname ,*shared-key-buf* ,buf 0))))))))
 
 (defun gen-sum-update (mname keys value-form)
   "sum(x): incf the percpu-hash entry by x. The per-CPU storage means
@@ -3432,6 +3471,13 @@
            (*string-set-buf-size* (probe-string-buf-size body))
            (*string-set-buf*
              (when (plusp *string-set-buf-size*) (gensym "STRBUF")))
+           ;; One shared 8-byte struct-alloc buffer for the scalar key
+           ;; passed to map_update_elem from gen-string-set. Lower-stmts
+           ;; sets *shared-key-buf-used* when any gen-string-set call
+           ;; lowers. Buffer (not u64 var) — see *shared-key-buf*'s
+           ;; docstring.
+           (*shared-key-buf* (gensym "SHARED-KEY-BUF"))
+           (*shared-key-buf-used* nil)
            (*scratch-allocations* nil)
            (*scratch-base-sym* (gensym "BT-SCRATCH-BASE"))
            (prog-name (intern (format nil "BT-PROBE-~D-~D" index sub) :whistler))
@@ -3467,6 +3513,23 @@
                              (str-size `(,v (whistler::struct-alloc
                                              ,str-size)))
                              (t `(,v 0)))))
+           ;; Prepend the shared key buffer (struct-alloc 8) if any
+           ;; gen-string-set call elected to reuse it. *string-set-buf*
+           ;; goes in AFTER this, so it binds FIRST in let* order — the
+           ;; large *string-set-buf* alloc gets rewritten to live in
+           ;; per-CPU scratch (BT-SCRATCH-BASE + offset), and we need
+           ;; that scratch-base value to settle into a stable vreg
+           ;; before the smaller SHARED-KEY-BUF stack alloc starts
+           ;; clobbering R1. If we bound SHARED-KEY-BUF first, the
+           ;; struct-alloc 8 register sequence drops the scratch base
+           ;; before *string-set-buf* could capture it, and downstream
+           ;; STRBUF references collapse onto SHARED-KEY-BUF's stack
+           ;; slot (BPF verifier rejects: "invalid write to stack").
+           (var-inits (if *shared-key-buf-used*
+                          (cons `(,*shared-key-buf*
+                                  (whistler::struct-alloc 8))
+                                var-inits)
+                          var-inits))
            ;; Prepend the shared string buffer to the bindings if used.
            (var-inits (if *string-set-buf*
                           (cons `(,*string-set-buf*
