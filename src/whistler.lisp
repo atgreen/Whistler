@@ -1084,16 +1084,21 @@
          (child-var   (find-symbol "*CHILD-PROCESS*" '#:whistler/bpftrace))
          (hook-var    (find-symbol "*POST-ATTACH-HOOK*" '#:whistler/bpftrace))
          (params-var  (find-symbol "*NAMED-PARAMS*"  '#:whistler/bpftrace))
+         (cpid-var    (find-symbol "*CHILD-CPID*"    '#:whistler/bpftrace))
+         (child-pid   (and child-process
+                           (traced-child-pid child-process)))
          (release-thunk (when child-process
                           (lambda () (release-traced-process child-process)))))
     (progv (remove nil (list (when effective-pid filter-var)
                               (when child-process    child-var)
                               (when release-thunk    hook-var)
-                              (when named-params     params-var)))
+                              (when named-params     params-var)
+                              (when child-pid        cpid-var)))
            (remove nil (list (when effective-pid effective-pid)
                               (when child-process    child-process)
                               (when release-thunk    release-thunk)
-                              (when named-params     named-params)))
+                              (when named-params     named-params)
+                              (when child-pid        child-pid)))
       (cond
         (dump-p
          (let ((gen (funcall (find-symbol "COMPILE-SCRIPT" '#:whistler/bpftrace) source))

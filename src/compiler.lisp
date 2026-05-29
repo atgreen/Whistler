@@ -53,7 +53,8 @@
     ;; per-probe limitation.
     ("D-PATH"               . 147)
     ("SEND-SIGNAL"          . 109)
-    ("OVERRIDE-RETURN"      . 58))
+    ("OVERRIDE-RETURN"      . 58)
+    ("JIFFIES64"            . 118))
   "BPF helper functions: string name → helper ID.
    Single source of truth — referenced by the SSA pipeline via lower.lisp.")
 
@@ -63,6 +64,7 @@
     ("PROBE-READ-KERNEL-STR" . 3)
     ("D-PATH" . 3)
     ("SEND-SIGNAL" . 1) ("OVERRIDE-RETURN" . 2)
+    ("JIFFIES64" . 0)
     ("KTIME-GET-NS" . 0) ("GET-PRANDOM-U32" . 0) ("GET-CURRENT-TASK" . 0)
     ("GET-SMP-PROCESSOR-ID" . 0) ("GET-CURRENT-CGROUP-ID" . 0)
     ("GET-CURRENT-PID-TGID" . 0) ("GET-CURRENT-UID-GID" . 0)

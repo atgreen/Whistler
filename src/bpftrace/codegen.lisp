@@ -971,6 +971,37 @@
                collect `(whistler::store whistler::u8 ,buf ,i ,b))
        ,buf)))
 
+(defun lower-static-assert (args)
+  "static_assert(cond, msg) — compile-time predicate. We only know
+   `cond' at compile time when it's a literal integer / bool; in
+   that case false → whistler-error, true → no-op. Non-literal
+   cond falls through to runtime assert()."
+  (unless (= (length args) 2)
+    (unsupported "static_assert() takes (cond, msg)"))
+  (let ((c (first args))
+        (m (second args)))
+    (cond
+      ((and (consp c) (eq (first c) :int))
+       (cond
+         ((zerop (second c))
+          (whistler/compiler:whistler-error
+           :what (format nil "static_assert: ~A"
+                          (if (and (consp m) (eq (first m) :str))
+                              (second m)
+                              "assertion failed"))))
+         (t 0)))
+      ((and (consp c) (eq (first c) :constant)
+            (member (second c) '("false" "0") :test #'string=))
+       (whistler/compiler:whistler-error
+        :what (format nil "static_assert: ~A"
+                       (if (and (consp m) (eq (first m) :str))
+                           (second m)
+                           "assertion failed"))))
+      ;; Truthy literal-shaped cond → no-op.
+      ((and (consp c) (member (first c) '(:int :constant))) 0)
+      ;; Non-literal — punt to runtime assert.
+      (t (lower-assert args)))))
+
 (defun lower-assert (args)
   "assert(cond, msg) — bpftrace's stdlib macro. Reduces to
    `if (!cond) { errorf(\"assert failed: %s\", msg); exit(1); }'."
@@ -1529,6 +1560,28 @@
       ((string= name "len")     (lower-len     (getf (cdr expr) :args)))
       ((string= name "strcontains")
        (lower-strcontains (getf (cdr expr) :args)))
+      ;; jiffies() — kernel helper #118. Monotonic u64.
+      ((and (string= name "jiffies") (null (getf (cdr expr) :args)))
+       '(whistler::jiffies64))
+      ;; is_err(ptr) — IS_ERR-style check: pointers in the
+      ;; [-4095, 0) range encode an errno. Inline as
+      ;; `ptr < 0 && ptr >= -4095'.
+      ((and (string= name "is_err") (= 1 (length (getf (cdr expr) :args))))
+       (let ((p (gensym "P")))
+         `(let ((,p ,(lower-expr (first (getf (cdr expr) :args)))))
+            (whistler::logand (whistler::< ,p 0)
+                              (whistler::>= ,p -4095)))))
+      ;; static_assert(cond, msg) — bpftrace's compile-time check.
+      ;; Folds to fail() when cond is a literal-false expression.
+      ((string= name "static_assert")
+       (lower-static-assert (getf (cdr expr) :args)))
+      ;; cpid() / has_cpid() — child PID from `-c CMD'. Resolved
+      ;; at codegen time from whistler/bpftrace:*child-cpid*, which
+      ;; the CLI binds before compile-script runs.
+      ((and (string= name "cpid") (null (getf (cdr expr) :args)))
+       (or *child-cpid* 0))
+      ((and (string= name "has_cpid") (null (getf (cdr expr) :args)))
+       (if *child-cpid* 1 0))
       ((string= name "pton")    (lower-pton (getf (cdr expr) :args)))
       ;; cgroupid("/sys/fs/cgroup/PATH") — compile-time stat() of
       ;; the cgroup directory; emits its inode number as a literal.

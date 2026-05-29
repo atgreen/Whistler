@@ -30,6 +30,12 @@
    — when NAME is present here, getopt returns the parsed value; otherwise
    DEFAULT.")
 
+(defvar *child-cpid* nil
+  "When `whistler bpftrace -c CMD' spawned a child, the CLI sets
+   this to the child's pid before compile-script runs. The codegen
+   folds bpftrace's `cpid()' / `has_cpid()' builtins against this
+   value at compile time, matching bpftrace's `__builtin_cpid'.")
+
 (defun add-pid-filter (ast pid)
   "Return AST with each probe's :predicate ANDed against (pid == PID).
    Functions and other top-level forms pass through unchanged."
