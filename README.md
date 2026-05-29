@@ -436,6 +436,11 @@ sudo ./whistler bpftrace \
 | `-h` | Help |
 | `-- --NAME[=VALUE]` | Named params consumed by `getopt(NAME, default)` in the script (matches bpftrace's `script.bt -- --foo=5` convention) |
 
+If `whistler` is invoked under the name `bpftrace` (e.g. via a
+`ln -sf whistler /usr/local/bin/bpftrace`), it dispatches as if the
+user typed `whistler bpftrace …`. Drop-in for scripts that hard-code
+the `bpftrace` command name.
+
 `-c` uses `PTRACE_TRACEME`/`SIGSTOP` to stop the child at the exec entry,
 attaches probes, then `PTRACE_DETACH`s — matching bpftrace's behaviour so
 short-lived commands have probes live for their full lifetime.
@@ -453,20 +458,23 @@ Almost everything you'd write in a typical bpftrace script:
   `print(@m [, top [, div]])` (top-N + value scaling), `clear(@m)`,
   `zero(@m)`, `delete(@m[k])`, `time()`, `exit()`.
 - **String / address builtins**: `str(ptr [, n])`, `kstr(ptr [, n])`,
-  `ksym(addr)`, `usym(addr)`, `ntop([af,] addr)`, `reg("ip"|"sp"|…)`,
-  `syscall_name(id)` (renders the map-key column as the syscall name
-  for the current arch — x86-64 and arm64 baked in).
+  `ksym(addr)`, `usym(addr)`, `ntop([af,] addr)` (literal or runtime
+  family), `reg("ip"|"sp"|…)`, `syscall_name(id)` (x86-64 / arm64
+  baked-in tables), `signal_name(N)` (POSIX 1-31 + `SIG<N>` fallback).
 - **CLI integration**: `getopt(NAME, default)` reads
   `whistler bpftrace script.bt -- --NAME[=VALUE]` parameters and
-  returns the parsed value (bool / int variants); falls back to the
-  default when the flag isn't passed.
-- **Script configuration**: top-level `config = { … }` blocks parse
-  bpftrace-style `KEY=VALUE` pairs. `print_maps_on_exit = 0` is
-  currently honored — disables the at-teardown auto-dump. Other
-  keys parse and silently no-op pending implementation.
-- **Variables**: `pid`, `tid`, `uid`, `gid`, `comm`, `nsecs`, `cpu`,
-  `retval`, `curtask`, `args`, `probe`, `func`, `arg0..arg9`, `kstack`,
-  `ustack`, `$local` variables, `@global` and `@map[k1, k2, ...]`.
+  returns the parsed value. Bool, int, and string defaults all
+  flow correctly through printf %s, `$v = …`, and `@m[k] = …`.
+- **Script configuration**: top-level `config = { KEY=VALUE; …}` blocks.
+  Honored knobs: `print_maps_on_exit`, `max_strlen`, `max_map_keys`,
+  `on_stack_limit`, `missing_probes` (`warn` / `ignore` / `error`),
+  `str_trunc_trailer`, `stack_mode` (`bpftrace` / `perf` / `raw`).
+- **Variables**: `pid`, `tid`, `uid`, `gid`, `comm`, `pcomm`, `nsecs`,
+  `cpu`, `cgroup`, `elapsed`, `retval`, `curtask`, `args`, `probe`,
+  `func`, `arg0..arg9` (kprobe args 6+ via stack reads on x86-64,
+  registers on arm64), `kstack`, `ustack`, `$local`, `@global`, and
+  `@map[k1, k2, …]`. Each is also valid with empty parens (`pid()`,
+  `comm()`, etc.) per bpftrace's stdlib convention.
 - **Symbolic constants**: `AF_INET`, `O_RDONLY`, `IPPROTO_TCP`, etc. —
   resolved from kernel BTF enums + a curated `#define` table, no C
   headers required.

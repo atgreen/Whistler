@@ -117,6 +117,7 @@ size you ask for with `str(ptr [, n])` / `kstr(ptr [, n])` (default 64).
 | `ntop([af,] addr)` | IPv4 / IPv6 string | userspace format |
 | `reg("ip"\|"sp"\|"di"\|…)` | u64 register | direct `pt_regs` read |
 | `syscall_name(id)` | syscall name string | baked arch table (x86-64, arm64) |
+| `signal_name(N)` | signal name string (`SIGTERM`, `SIGKILL`, …) | POSIX 1-31 baked in; `SIG<N>` fallback |
 
 ### CLI parameters
 
@@ -136,7 +137,13 @@ equivalent. Currently honored:
 
 | Key | Effect |
 |---|---|
-| `print_maps_on_exit` | When `0` / `false`, suppresses the session-teardown auto-dump of every map. Other keys parse but no-op pending implementation. |
+| `print_maps_on_exit` | When `0` / `false`, suppresses the session-teardown auto-dump of every map. |
+| `max_strlen` | Default buffer size for `str(ptr)` without an explicit length. Default 64. |
+| `max_map_keys` | Default `max-entries` for hash maps. Default 1024. |
+| `on_stack_limit` | `struct-alloc` requests larger than this spill to the per-CPU scratch map instead of the BPF stack. Default 32. |
+| `missing_probes` | `warn` (default) logs failed attaches and continues; `ignore` is silent; `error` aborts the session. |
+| `str_trunc_trailer` | Appended to `str()` output when the buffer filled with no terminating NUL. Default empty. |
+| `stack_mode` | `bpftrace` (default — indented symbol-only), `perf` (`HEX_ADDR SYMBOL`), or `raw` (hex addresses only). |
 
 ### Aggregations
 
