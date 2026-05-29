@@ -930,6 +930,18 @@
       ((member v '("1" "true" "yes" "on")  :test #'string=) t)
       (t default))))
 
+(defun config-enum (gen key default &rest allowed)
+  "Resolve an enum-valued knob (`missing_probes', `stack_mode', …).
+   Returns one of ALLOWED as a keyword, or DEFAULT (also a keyword)
+   when the script doesn't set the key or sets it to an unknown value."
+  (let* ((pair (assoc key (getf gen :config) :test #'string=))
+         (raw  (and pair (string-trim '(#\Space #\Tab) (cdr pair))))
+         (kw   (and raw (intern (string-upcase raw) :keyword))))
+    (cond
+      ((null pair) default)
+      ((member kw allowed) kw)
+      (t default))))
+
 (defun find-print-map (gen map-alist)
   (let ((sym (getf gen :print-map)))
     (when sym
@@ -1602,12 +1614,24 @@
                    ;; and skipped; we keep going so the surviving
                    ;; targets in a comma-separated probe list still
                    ;; attach.
-                   (dolist (entry attach-progs)
-                     (handler-case
-                         (push (attach-probe (cdr entry)) atts)
-                       (error (e)
-                         (format *error-output* "~A~%" e)
-                         (force-output *error-output*))))
+                   (let ((missing-mode (config-enum gen "missing_probes" :warn
+                                                    :warn :ignore :error)))
+                     (dolist (entry attach-progs)
+                       (handler-case
+                           (push (attach-probe (cdr entry)) atts)
+                         (error (e)
+                           (ecase missing-mode
+                             (:warn
+                              (format *error-output* "~A~%" e)
+                              (force-output *error-output*))
+                             (:ignore
+                              ;; silent — matches bpftrace's
+                              ;; `config = { missing_probes = ignore }'
+                              nil)
+                             (:error
+                              ;; Re-raise; tearing down what we already
+                              ;; attached happens in the outer unwind.
+                              (error e)))))))
                    ;; Probes are live — let any waiting external code
                    ;; (e.g. the CLI's pipe-blocked -c child) proceed.
                    (when *post-attach-hook*

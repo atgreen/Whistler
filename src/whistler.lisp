@@ -828,9 +828,20 @@
 ;;; CLI entry point
 
 (defun main ()
-  "CLI entry point for whistler."
+  "CLI entry point for whistler. When argv[0]'s basename is `bpftrace'
+   (e.g. `/usr/local/bin/bpftrace' symlinked to whistler), prepend
+   `bpftrace' to the args so multi-call dispatch matches busybox-style
+   tooling. Other names dispatch normally."
   (handler-case
-      (%main-dispatch (uiop:command-line-arguments))
+      (let* ((argv0 (or (first sb-ext:*posix-argv*) ""))
+             ;; basename: strip directory components manually so we
+             ;; don't pull in another dep.
+             (slash (position #\/ argv0 :from-end t))
+             (base  (if slash (subseq argv0 (1+ slash)) argv0))
+             (args  (uiop:command-line-arguments)))
+        (%main-dispatch (if (string= base "bpftrace")
+                            (cons "bpftrace" args)
+                            args)))
     (error (c)
       (format *error-output* "~&~A~%" c)
       (uiop:quit 1))))
