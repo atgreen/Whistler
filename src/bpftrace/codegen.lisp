@@ -1183,6 +1183,33 @@
                       (whistler:incf ,hit 1))))
          ,hit))))
 
+(defun lower-find (args)
+  "find(@map, key, $var) — bpftrace's stdlib map-lookup-with-default
+   pattern. Reduces to `(has_key(@m, k) ? ($var = @m[k]) : 0; …)'
+   except we want to return 1 / 0 explicitly. Today's contract:
+   * exactly three arguments,
+   * first is an @map ref,
+   * third is a bare $var lvalue."
+  (unless (= 3 (length args))
+    (unsupported "find() takes (@map, key, $var)"))
+  (let ((mref (first args))
+        (key  (second args))
+        (var  (third args)))
+    (unless (and (consp mref) (eq (first mref) :map))
+      (unsupported "find(): first arg must be an @map reference"))
+    (unless (and (consp var) (eq (first var) :var))
+      (unsupported "find(): third arg must be a $var lvalue"))
+    (let* ((var-sym (var-sym (second var)))
+           (map-info (or (gethash (getf (cdr mref) :name) *map-table*)
+                         (unsupported "find(): unknown map @~A"
+                                      (getf (cdr mref) :name))))
+           (mname (minfo-name map-info))
+           (k     (lower-expr key)))
+      `(whistler:if-let ((,(gensym "FPTR")
+                          (whistler::map-lookup ,mname ,k)))
+         (progn (setf ,var-sym (whistler:getmap ,mname ,k)) 1)
+         0))))
+
 (defun lower-strstr (args)
   "strstr(haystack, needle) — like strcontains but returns the
    1-based byte offset of the first match, or 0 if not found.
@@ -1724,6 +1751,12 @@
        (lower-strcontains (getf (cdr expr) :args)))
       ((string= name "strstr")
        (lower-strstr (getf (cdr expr) :args)))
+      ;; find(@map, key, $var) — when KEY is in @MAP, copy the
+      ;; value into $VAR and return 1; otherwise return 0 (and
+      ;; leave $VAR unchanged). bpftrace's stdlib macro pulls the
+      ;; same behavior together via has_key + the map's lookup.
+      ((string= name "find")
+       (lower-find (getf (cdr expr) :args)))
       ;; jiffies() — kernel helper #118. Monotonic u64.
       ((and (string= name "jiffies") (null (getf (cdr expr) :args)))
        '(whistler::jiffies64))
