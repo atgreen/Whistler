@@ -853,6 +853,14 @@
                      ;; a constant may still be a registered macro.
                      (and (find-user-function (second expr))
                           (inline-user-call (second expr) nil))
+                     ;; `usermode' — bpftrace builtin returning 1 in
+                     ;; user-context probes (uprobe/uretprobe/USDT),
+                     ;; 0 otherwise. Resolved at compile time from the
+                     ;; active probe spec.
+                     (and (string= (second expr) "usermode")
+                          (if (member (first *probe-spec*)
+                                      '(:uprobe :uretprobe :usdt))
+                              1 0))
                      (unsupported "unknown identifier `~A' — not in BTF enums or curated #define table"
                                   (second expr))))
     (:arg        (lower-arg (second expr)))
@@ -1815,6 +1823,21 @@
                                 (getf (cdr expr) :args)))
       ((string= name "join")   (lower-async-join
                                 (getf (cdr expr) :args)))
+      ;; ustack() / kstack() called as functions with an optional
+      ;; depth arg — bpftrace's `printf("%s", ustack(1))' style. The
+      ;; depth hint is informational (we capture a fixed-depth trace
+      ;; via bpf_get_stackid regardless), so we dispatch to the same
+      ;; helpers as the bare-builtin form.
+      ((string= name "ustack")
+       `(whistler::get-stackid (whistler::ctx-ptr) ,*stacks-map-name*
+                                ,(ash 1 8)))
+      ((string= name "kstack")
+       `(whistler::get-stackid (whistler::ctx-ptr) ,*stacks-map-name* 0))
+      ;; `nsecs(CLOCK)' — bpftrace 0.22+ accepts an optional clock
+      ;; selector. We don't yet thread the clock through, so just
+      ;; emit the same ktime-ns the bare-builtin form would.
+      ((string= name "nsecs")
+       '(whistler::ktime-ns))
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
       ((string= name "kaddr")  (lower-kaddr-call (getf (cdr expr) :args)))
