@@ -1183,6 +1183,59 @@
                       (whistler:incf ,hit 1))))
          ,hit))))
 
+(defun lower-strstr (args)
+  "strstr(haystack, needle) — like strcontains but returns the
+   1-based byte offset of the first match, or 0 if not found.
+   bpftrace's stdlib returns 0 for `not found' (vs C strstr's NULL);
+   we mirror that for predicate use (`if (strstr(s, t)) …')."
+  (unless (= (length args) 2)
+    (unsupported "strstr() takes (haystack, needle)"))
+  (let ((haystack (first args))
+        (needle   (second args)))
+    (unless (and (consp needle) (eq (first needle) :str))
+      (unsupported "strstr(): needle must be a string literal"))
+    (let* ((bytes (sb-ext:string-to-octets (second needle)
+                                            :external-format :utf-8))
+           (nlen  (length bytes))
+           (hay-cap (cond
+                      ((eq (first haystack) :comm)  +bt-comm-len+)
+                      ((eq (first haystack) :pcomm) +bt-comm-len+)
+                      ((and (eq (first haystack) :var)
+                            (string-var-buf-size (second haystack))))
+                      (t (unsupported
+                          "strstr(): haystack must be `comm', `pcomm', or a string $var"))))
+           (buf-form
+             (cond
+               ((eq (first haystack) :comm)
+                (let ((b (gensym "COMMBUF")))
+                  `(let ((,b (whistler::struct-alloc ,+bt-comm-len+)))
+                     (whistler::get-current-comm ,b ,+bt-comm-len+)
+                     ,b)))
+               (t (var-sym (second haystack)))))
+           (buf (gensym "BUF"))
+           (pos (gensym "POS")))
+      `(let* ((,buf ,buf-form)
+              (,pos whistler::u64 0))
+         ;; First-match scan. We sweep candidate starts; the first
+         ;; one whose XOR-accumulator is zero stamps its (1-based)
+         ;; offset into POS. Subsequent matches are ignored because
+         ;; POS is already non-zero.
+         ,@(loop for start from 0 to (max 0 (- hay-cap nlen))
+                 for acc = (gensym "ACC")
+                 collect
+                 `(let ((,acc whistler::u64 0))
+                    ,@(loop for k below nlen
+                            collect
+                            `(whistler:incf
+                              ,acc
+                              (whistler::logxor
+                               (whistler::load whistler::u8 ,buf ,(+ start k))
+                               ,(aref bytes k))))
+                    (when (whistler::logand (whistler::= ,acc 0)
+                                            (whistler::= ,pos 0))
+                      (setf ,pos ,(1+ start)))))
+         ,pos))))
+
 (defun lower-strncmp (args)
   "Lower `strncmp(s1, s2, n)' to an inline byte-by-byte compare.
    Returns 0 when the first N bytes of S1 equal S2; non-zero
@@ -1669,6 +1722,8 @@
       ((string= name "len")     (lower-len     (getf (cdr expr) :args)))
       ((string= name "strcontains")
        (lower-strcontains (getf (cdr expr) :args)))
+      ((string= name "strstr")
+       (lower-strstr (getf (cdr expr) :args)))
       ;; jiffies() — kernel helper #118. Monotonic u64.
       ((and (string= name "jiffies") (null (getf (cdr expr) :args)))
        '(whistler::jiffies64))
