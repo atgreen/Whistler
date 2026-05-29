@@ -77,6 +77,20 @@ machinery refuses them, so the listing drops anything containing a
 | `-h`, `--help` | Print usage. |
 | `--dump` | Stop after codegen and print the generated `defmap` and `defprog` forms. |
 
+## Script parameters (`getopt`)
+
+Args after `--` (or after the script path) of the form `--NAME` or
+`--NAME=VALUE` are exposed to the script through bpftrace's
+`getopt(NAME, DEFAULT)` builtin. Bool defaults take `--NAME` as 1 and
+`--NAME=true/1`/`--NAME=false/0` as the parsed value; int defaults
+parse `--NAME=N` as an integer; missing flag yields the DEFAULT.
+
+```sh
+# tools/syscount.bt uses sysname = getopt("sysname", false) to gate
+# between numeric IDs and resolved names.
+sudo whistler bpftrace tools/syscount.bt -- --sysname
+```
+
 ## Examples
 
 ```sh

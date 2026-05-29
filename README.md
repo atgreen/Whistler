@@ -434,6 +434,7 @@ sudo ./whistler bpftrace \
 | `--dump` | Print generated Whistler forms and exit (no kernel load) |
 | `-V` | Version |
 | `-h` | Help |
+| `-- --NAME[=VALUE]` | Named params consumed by `getopt(NAME, default)` in the script (matches bpftrace's `script.bt -- --foo=5` convention) |
 
 `-c` uses `PTRACE_TRACEME`/`SIGSTOP` to stop the child at the exec entry,
 attaches probes, then `PTRACE_DETACH`s — matching bpftrace's behaviour so
@@ -448,10 +449,21 @@ Almost everything you'd write in a typical bpftrace script:
   (`kprobe:tcp_*`) and multi-target specs (`kprobe:foo,kprobe:bar`).
 - **Aggregations**: `count()`, `sum(x)`, `avg(x)`, `min(x)`, `max(x)`,
   `stats(x)`, `hist(x)`, `lhist(x, min, max, step)`.
-- **Async actions**: `printf` (with `%-16s`/`%05d` flags), `print(@m)`,
-  `clear(@m)`, `zero(@m)`, `delete(@m[k])`, `time()`, `exit()`.
+- **Async actions**: `printf` (with `%-16s`/`%05d` flags),
+  `print(@m [, top [, div]])` (top-N + value scaling), `clear(@m)`,
+  `zero(@m)`, `delete(@m[k])`, `time()`, `exit()`.
 - **String / address builtins**: `str(ptr [, n])`, `kstr(ptr [, n])`,
-  `ksym(addr)`, `usym(addr)`, `ntop([af,] addr)`, `reg("ip"|"sp"|…)`.
+  `ksym(addr)`, `usym(addr)`, `ntop([af,] addr)`, `reg("ip"|"sp"|…)`,
+  `syscall_name(id)` (renders the map-key column as the syscall name
+  for the current arch — x86-64 and arm64 baked in).
+- **CLI integration**: `getopt(NAME, default)` reads
+  `whistler bpftrace script.bt -- --NAME[=VALUE]` parameters and
+  returns the parsed value (bool / int variants); falls back to the
+  default when the flag isn't passed.
+- **Script configuration**: top-level `config = { … }` blocks parse
+  bpftrace-style `KEY=VALUE` pairs. `print_maps_on_exit = 0` is
+  currently honored — disables the at-teardown auto-dump. Other
+  keys parse and silently no-op pending implementation.
 - **Variables**: `pid`, `tid`, `uid`, `gid`, `comm`, `nsecs`, `cpu`,
   `retval`, `curtask`, `args`, `probe`, `func`, `arg0..arg9`, `kstack`,
   `ustack`, `$local` variables, `@global` and `@map[k1, k2, ...]`.

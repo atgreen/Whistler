@@ -99,7 +99,7 @@ size you ask for with `str(ptr [, n])` / `kstr(ptr [, n])` (default 64).
 | Form | Effect |
 |---|---|
 | `printf(FMT, args…)` | C-style format. Supports `%d / %u / %x / %X / %p / %c / %s / %lld / %%`, the `-` (left-align) and `0` (zero-pad) flags, and decimal width. |
-| `print(@m)` | Dump map `@m` from userspace. |
+| `print(@m [, top [, div]])` | Dump map `@m` from userspace. With `top`, only the largest N entries are shown. With `div`, integer values are divided by `div` before rendering — matches bpftrace's `print(@m, 10, 1000)` ns → µs idiom. |
 | `time()` | Print the current time. |
 | `exit()` | Raise the exit flag; the runtime stops at the next tick. |
 | `clear(@m)` | Empty map `@m`. |
@@ -116,6 +116,27 @@ size you ask for with `str(ptr [, n])` / `kstr(ptr [, n])` (default 64).
 | `usym(addr)` | resolved name | userspace symbolizer |
 | `ntop([af,] addr)` | IPv4 / IPv6 string | userspace format |
 | `reg("ip"\|"sp"\|"di"\|…)` | u64 register | direct `pt_regs` read |
+| `syscall_name(id)` | syscall name string | baked arch table (x86-64, arm64) |
+
+### CLI parameters
+
+| Form | Returns | Source |
+|---|---|---|
+| `getopt(NAME, DEFAULT)` | DEFAULT's type | `whistler bpftrace script.bt -- --NAME[=VALUE]` |
+
+Bool defaults: bare `--NAME` → 1, `--NAME=true`/`--NAME=1` → 1,
+`--NAME=false`/`--NAME=0` → 0. Int defaults: `--NAME=N` parses as an
+integer. Missing flag → DEFAULT.
+
+### Script configuration
+
+A top-level `config = { KEY=VALUE; KEY=VALUE }` block (before any
+probe) sets runtime knobs. `BPFTRACE_FOO`, `FOO`, and `foo` are
+equivalent. Currently honored:
+
+| Key | Effect |
+|---|---|
+| `print_maps_on_exit` | When `0` / `false`, suppresses the session-teardown auto-dump of every map. Other keys parse but no-op pending implementation. |
 
 ### Aggregations
 
