@@ -47,6 +47,22 @@
   value-ntop-p     ; T when the value slot is a 17-byte ntop record
                    ;   (1 family + 16 address bytes). Triggered by
                    ;   `@m[k] = ntop(…)' inference.
+  value-array-p    ; T when the value slot holds the bytes of an in-
+                   ;   script-struct array field. value-size is the
+                   ;   total array width; lower-map-assign emits a
+                   ;   probe-read into a stack buffer + map-update-ptr.
+  value-ptr-elt-size ; Set when the map's value is a typed pointer
+                   ;   stored from a `(T *)' cast — records sizeof(T).
+                   ;   Lower-index reads `@m[k][i]' as probe-read of
+                   ;   that many bytes at base+i*size.
+  value-array-elt-size ; When value-array-p is T, this is sizeof(elt)
+                   ;   so `@m[k][i]' subscripts the value buffer
+                   ;   with a sized load.
+  key-array-elt-size ; When the (single) map key is an in-script-struct
+                   ;   array field, sizeof(elt). The userspace printer
+                   ;   uses this with key-array-len to render keys as
+                   ;   `[v1,v2,…]' matching bpftrace's array-key style.
+  key-array-len    ; Number of elements in the array key when set.
   hist-params)     ; for :lhist, the list (MIN MAX STEP); NIL otherwise.
 
 (defun builtin-size (kw)
@@ -62,10 +78,19 @@
    pointed-to struct through @map[k] = args.FIELD assignments.
    NIL outside generate().")
 
+(defvar *tp-format-unreadable-paths* nil
+  "List of tracepoint format-file paths the codegen couldn't open
+   when populating *tp-field-sizes*. Used by lower-field's `non-
+   args expressions' error path to surface a permissions hint when
+   the field access depended on a type we couldn't resolve.")
+
 (defun load-tracepoint-field-sizes (script)
   "Walk SCRIPT, parse each referenced tracepoint format file, and
-   build *TP-FIELD-SIZES*. Skips silently if a format file can't be
-   read — the caller falls back to a default size."
+   build *TP-FIELD-SIZES*. Skips when a format file can't be read,
+   but pushes the path onto *tp-format-unreadable-paths* so we can
+   surface a clearer error downstream — `field access on non-args
+   expressions' is misleading when the real cause is `couldn't read
+   /sys/kernel/tracing/events/…/format'."
   (let ((table (make-hash-table :test 'equal)))
     (dolist (probe (script-probes script))
       (dolist (spec (getf (cdr probe) :specs))
@@ -74,16 +99,26 @@
                  (event (substitute #\_ #\- (third spec)))
                  (path (ignore-errors
                         (whistler::find-tracepoint-format-path cat event))))
-            (when path
-              (dolist (field (ignore-errors
+            (cond
+              (path
+               (let ((fields (ignore-errors
                               (whistler::parse-tracepoint-format
-                               (namestring path))))
-                (destructuring-bind (c-name _off size _signed array
-                                     &optional (c-type ""))
-                    field
-                  (declare (ignore _off _signed))
-                  (setf (gethash c-name table)
-                        (list size (or array 0) c-type)))))))))
+                               (namestring path)))))
+                 (cond
+                   (fields
+                    (dolist (field fields)
+                      (destructuring-bind (c-name _off size _signed array
+                                           &optional (c-type ""))
+                          field
+                        (declare (ignore _off _signed))
+                        (setf (gethash c-name table)
+                              (list size (or array 0) c-type)))))
+                   (t (pushnew (namestring path) *tp-format-unreadable-paths*
+                               :test #'string=)))))
+              (t (pushnew (format nil "/sys/kernel/tracing/events/~A/~A/format"
+                                  cat event)
+                          *tp-format-unreadable-paths*
+                          :test #'string=)))))))
     table))
 
 (defun tp-field-size (name)
@@ -169,6 +204,11 @@
          ((and (consp (getf (cdr expr) :base))
                (eq (first (getf (cdr expr) :base)) :args)
                (tp-field-size name)))
+         ;; In-script struct array field: `(struct A *)e.x' where x
+         ;; is `int x[4]' has total size 16. Used as key/value width.
+         ((multiple-value-bind (_b sz _o len) (array-field-meta expr)
+            (declare (ignore _b _o))
+            (and sz len (* sz len))))
          ;; Unknown: default to 4 (most sched/syscalls fields are u32).
          (t 4))))
     (t        8)))
@@ -207,6 +247,8 @@
         (offset 0))
     (values
      (loop for e in keys
+           for af-meta = (and (eq (first e) :field) (multiple-value-list
+                                                     (array-field-meta e)))
            for size = (cond
                         ((eq (first e) :comm) +bt-comm-len+)
                         ((or (eq (first e) :func)
@@ -217,6 +259,10 @@
                         ((eq (first e) :str) +bt-func-name-key-len+)
                         ((or (str-call-p e) (kstr-call-p e))
                          (str-key-size e))
+                        ;; In-script struct array field — width is
+                        ;; ELT-SIZE × ARR-LEN.
+                        ((and af-meta (first af-meta))
+                         (* (second af-meta) (fourth af-meta)))
                         (t 8))
            for type = (cond
                         ((eq (first e) :comm) u8)
@@ -224,6 +270,7 @@
                              (eq (first e) :probe-name)) u8)
                         ((eq (first e) :str) u8)
                         ((or (str-call-p e) (kstr-call-p e)) u8)
+                        ((and af-meta (first af-meta)) u8)
                         (t u64))
            collect (list offset size type e)
            do (incf offset size))
@@ -286,6 +333,16 @@
                    (when (and (null (minfo-key-builtin info))
                               (= (length keys) 1))
                      (setf (minfo-key-builtin info) (key-hint (first keys))))
+                   ;; Single-key that's an in-script-struct array
+                   ;; field: record the array shape so the printer
+                   ;; can render the key as `[v1,v2,…]'.
+                   (when (= (length keys) 1)
+                     (multiple-value-bind (_b sz _o len)
+                         (array-field-meta (first keys))
+                       (declare (ignore _b _o))
+                       (when (and sz len)
+                         (setf (minfo-key-array-elt-size info) sz
+                               (minfo-key-array-len info) len))))
                    ;; Composite: track per-slot hints so the printer
                    ;; can dispatch on individual slots.
                    (when (and (null (minfo-key-types info))
@@ -301,6 +358,13 @@
                    ((and (consp rhs) (eq (first rhs) :cast))
                     (setf (minfo-value-struct info)
                           (getf (cdr rhs) :type)))
+                   ;; `@m[k] = (T *)expr' — value is a typed pointer.
+                   ;; Stash sizeof(T) on the minfo so later
+                   ;; `@m[k][i]' reads emit a sized probe-read.
+                   ((and (consp rhs) (eq (first rhs) :prim-ptr-cast))
+                    (let ((sz (prim-ptr-elt-size (getf (cdr rhs) :elt-type))))
+                      (when sz
+                        (setf (minfo-value-ptr-elt-size info) sz))))
                    ;; `@m[k] = args.FIELD' where the tracepoint format
                    ;; declares FIELD as `struct X *' — propagate X
                    ;; into value-struct so `$v = @m[k]; $v.field' works
@@ -314,6 +378,22 @@
                                   (getf (cdr rhs) :name))))
                       (when (and sname (null (minfo-value-struct info)))
                         (setf (minfo-value-struct info) sname))))
+                   ;; `@m[k] = (struct X *)e.arrfield' — array-field
+                   ;; flow. Map's value-size becomes total array bytes,
+                   ;; mark value-array-p so lower-map-assign dispatches
+                   ;; to the probe-read-into-buffer path.
+                   ((and (consp rhs) (eq (first rhs) :field)
+                         (multiple-value-bind (_b sz _o len)
+                             (array-field-meta rhs)
+                           (declare (ignore _b _o))
+                           (and sz len)))
+                    (multiple-value-bind (_b sz _o len) (array-field-meta rhs)
+                      (declare (ignore _b _o))
+                      (setf (minfo-kind info) :scalar
+                            (minfo-value-array-p info) t
+                            (minfo-value-array-elt-size info) sz
+                            (minfo-value-size info)
+                            (max (minfo-value-size info) (* sz len)))))
                    ;; `@m[k] = :str LITERAL' — direct string literal
                    ;; RHS. Size to hold the literal plus a NUL byte.
                    ((and (consp rhs) (eq (first rhs) :str))
@@ -551,6 +631,14 @@
    \$v)' can emit the bytes. Indexing (`\$v[i]') reads u8 at offset
    i from the buffer.")
 
+(defvar *var-ptr-elt-types* nil
+  "Per-probe alist VAR-NAME → (TYPE-NAME-STRING ELT-SIZE-BYTES) for
+   vars assigned from a `:prim-ptr-cast' — e.g. `$a = (int32 *) arg0'
+   records `(\"$a\" . (\"int32\" 4))'. lower-index consults this so
+   `$a[i]' emits a probe-read of ELT-SIZE bytes at base + i*ELT-SIZE.
+   Distinct from *var-types* (struct names) so the existing
+   struct-pointer code paths aren't disturbed.")
+
 (defvar *string-set-buf* nil
   "Per-probe scratch buffer symbol shared across all
    `gen-string-set' calls in the same probe. The BPF stack frame
@@ -673,24 +761,39 @@
     (:offsetof
      (let* ((struct-name (getf (cdr expr) :struct))
             (field-name  (getf (cdr expr) :field))
-            (vmbtf (whistler:ensure-vmlinux-btf))
-            (tid (whistler:btf-find-struct vmbtf struct-name))
-            (fields (and tid (whistler:btf-struct-fields vmbtf tid)))
-            (cell (find field-name fields :test #'string= :key #'first)))
-       (unless cell
-         (unsupported "offsetof(struct ~A, ~A): no such field"
-                      struct-name field-name))
-       (third cell)))
+            (user-entry  (assoc struct-name *script-struct-decls*
+                                :test #'string=)))
+       (cond
+         (user-entry
+          (let ((cell (find field-name (cddr user-entry)
+                            :test #'string= :key #'first)))
+            (unless cell
+              (unsupported "offsetof(struct ~A, ~A): no such field in in-script decl"
+                           struct-name field-name))
+            (third cell)))
+         (t
+          (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+                 (tid (whistler:btf-find-struct vmbtf struct-name))
+                 (fields (and tid (whistler:btf-struct-fields vmbtf tid)))
+                 (cell (find field-name fields :test #'string= :key #'first)))
+            (unless cell
+              (unsupported "offsetof(struct ~A, ~A): no such field"
+                           struct-name field-name))
+            (third cell))))))
     (:sizeof
      (let* ((name      (getf (cdr expr) :name))
             (struct-p  (getf (cdr expr) :struct-p)))
        (cond
          (struct-p
-          (let* ((vmbtf (whistler:ensure-vmlinux-btf))
-                 (tid (whistler:btf-find-struct vmbtf name)))
-            (unless tid
-              (unsupported "sizeof(struct ~A): not in vmlinux BTF" name))
-            (whistler:btf-struct-size vmbtf tid)))
+          (let ((user-entry (assoc name *script-struct-decls*
+                                   :test #'string=)))
+            (cond
+              (user-entry (second user-entry))
+              (t (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+                        (tid (whistler:btf-find-struct vmbtf name)))
+                   (unless tid
+                     (unsupported "sizeof(struct ~A): not in vmlinux BTF" name))
+                   (whistler:btf-struct-size vmbtf tid))))))
          (t
           (or (cdr (assoc (string-downcase name)
                           '(("u8"  . 1) ("u16" . 2) ("u32" . 4) ("u64" . 8)
@@ -718,6 +821,31 @@
     ;; cast use is inside a (field :base (:cast …) :name ...) form,
     ;; which lower-field handles.
     (:cast       (lower-expr (getf (cdr expr) :expr)))
+    ;; Bare primitive-pointer cast — `((int32 *) arg0)' in expression
+    ;; position with no subscript. The element type matters at index
+    ;; sites (lower-index); here the result is just the underlying
+    ;; pointer value, which we hand back as a u64.
+    (:prim-ptr-cast (lower-expr (getf (cdr expr) :expr)))
+    ;; Positional CLI parameter — `$1', `$2', …. Resolved from
+    ;; *positional-args* at compile time. Numeric tokens lower to
+    ;; their integer value; non-numeric tokens become 0 (matching
+    ;; bpftrace's documented behaviour for non-int $N reads when
+    ;; the use site is an integer context). Missing index also 0.
+    (:positional
+     (let* ((n   (second expr))
+            (val (nth (1- n) *positional-args*)))
+       (or (and val (parse-integer val :junk-allowed t))
+           0)))
+    ;; `{ stmt; stmt; … expr }' — bpftrace 0.22+ block expression.
+    ;; Lower to a CL `progn' that runs the statements for their
+    ;; side effects and returns the trailing expr's value. Useful
+    ;; for `if ({ let $a = …; $a })' / `let $x = { … ; … }' shapes.
+    (:block-expr
+     (let ((stmts (getf (cdr expr) :stmts))
+           (final (getf (cdr expr) :final)))
+       `(progn
+          ,@(mapcar #'lower-stmt stmts)
+          ,(lower-expr final))))
     (:constant   (or (resolve-constant (second expr))
                      ;; bpftrace allows zero-arg `macro' to be called
                      ;; bare — `sysname' (no parens) means `sysname()'.
@@ -1648,9 +1776,17 @@
       ;; a literal; otherwise we punt to runtime errorf so the user
       ;; still sees a message in dev workflows.
       ((string= name "fail") (lower-fail (getf (cdr expr) :args)))
-      ((string= name "print")  (lower-async-map +bt-tag-print-map+
-                                                (getf (cdr expr) :args)
-                                                "print"))
+      ((string= name "print")
+       (let ((args (getf (cdr expr) :args)))
+         (cond
+           ;; print(@map[, top[, div]]) — original async-map path.
+           ((and args (consp (first args)) (eq (first (first args)) :map))
+            (lower-async-map +bt-tag-print-map+ args "print"))
+           ;; print(non-map) — bpftrace allows print(VAL) for any
+           ;; scalar/string. We route through printf with an inferred
+           ;; format, appending a newline (bpftrace's `print' always
+           ;; terminates the line).
+           (t (lower-print-value args)))))
       ((string= name "clear")  (lower-async-map +bt-tag-clear-map+
                                                 (getf (cdr expr) :args)
                                                 "clear"))
@@ -2394,6 +2530,44 @@
     ((and (consp arg-type) (eq (car arg-type) :strftime)) 8)  ; just the u64 timestamp
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
 
+(defun lower-print-value (args)
+  "Lower `print(VAL)' where VAL isn't an @map — bpftrace allows print()
+   on any scalar / string / tuple. We synthesize a printf(FMT, VAL…)
+   where FMT is inferred from VAL's syntactic shape and always ends
+   in `\\n' (bpftrace's `print' is line-terminated). Tuples format as
+   `(elem1, elem2, …)' with `%d' for ints / `%s' for strings."
+  (unless (and args (= (length args) 1))
+    (unsupported "print() takes one argument (a value or @map)"))
+  (let* ((val (first args))
+         (tag (and (consp val) (first val))))
+    (cond
+      ((eq tag :str)
+       (lower-printf (list (list :str "%s\n") val)))
+      ((eq tag :tuple)
+       (let* ((items   (getf (cdr val) :items))
+              (specs   (mapcar #'tuple-elem-printf-spec items))
+              (fmt     (format nil "(~{~A~^, ~})~~%" specs))
+              ;; Strip the literal `~%' suffix off the format string
+              ;; we're about to embed as a printf format — printf wants
+              ;; a literal `\n', not Lisp's `~%'.
+              (fmt-str (concatenate 'string
+                                    (subseq fmt 0 (- (length fmt) 2))
+                                    (string #\Newline))))
+         (lower-printf (cons (list :str fmt-str) items))))
+      ;; Default: numeric. Covers $vars, int literals, arithmetic,
+      ;; builtins like pid/tid/cpu, etc. The runtime decoder treats
+      ;; the payload as u64.
+      (t
+       (lower-printf (list (list :str "%d\n") val))))))
+
+(defun tuple-elem-printf-spec (elem)
+  "Pick a printf %-spec for a tuple element being lowered by
+   lower-print-value. String-typed elements use `%s'; everything
+   else falls back to `%d'."
+  (cond
+    ((and (consp elem) (eq (first elem) :str))  "%s")
+    (t  "%d")))
+
 (defun lower-printf (args &key (stream :stdout) (fn-name "printf"))
   "Lower a bpftrace `printf(\"FMT\", arg…)` to a ringbuf-submit using
    the unified async-action protocol. STREAM picks where the
@@ -2649,9 +2823,25 @@
          (cond
            ((and root struct-name)
             (lower-chained-field (root-ptr-form root) struct-name names))
-           (t (unsupported "field access .~A on non-args expressions"
-                           name)))))
-      (t (unsupported "field access .~A on non-args expressions" name)))))
+           (t (field-access-unsupported name)))))
+      (t (field-access-unsupported name)))))
+
+(defun field-access-unsupported (name)
+  "Signal the generic `field access .NAME on non-args expressions'
+   error, but prepend a tracefs-permissions hint when codegen tried
+   and failed to read tracepoint format files — that's almost always
+   the real root cause (the type of `args.FOO' couldn't be resolved,
+   so `$v = @m[k]' has no struct, so `$v.FIELD' can't be lowered)."
+  (cond
+    (*tp-format-unreadable-paths*
+     (unsupported
+      "field access .~A on non-args expressions — likely because a ~
+       tracepoint format file couldn't be read (need root or ~
+       `chmod a+r'):~{~%  ~A~}~%~
+       Re-run with sudo, or grant read permission to the format ~
+       file(s) above."
+      name (reverse *tp-format-unreadable-paths*)))
+    (t (unsupported "field access .~A on non-args expressions" name))))
 
 (defun root-ptr-form (root-ast)
   "Lower the root of a field-chain — either a $var, a :cast, or
@@ -2785,37 +2975,67 @@
 
 (defun lower-struct-pointer-field (struct-name field-name ptr-form)
   "Generate the kernel-side read for STRUCT-NAME pointer pointed to by
-   PTR-FORM, returning the value of FIELD-NAME. Uses kernel BTF for
-   the field's offset and size. Scalar fields (1/2/4/8 bytes) only —
-   nested struct fields require a chained-cast follow-on."
-  (let ((vmbtf (whistler:ensure-vmlinux-btf)))
-    (multiple-value-bind (type-id rec)
-        (whistler:btf-find-struct vmbtf struct-name)
-      (declare (ignore rec))
-      (unless type-id
-        (unsupported "->~A: struct ~A not found in vmlinux BTF"
-                     field-name struct-name))
-      (let* ((fields (whistler:btf-struct-fields vmbtf type-id))
-             (cell   (find field-name fields :test #'string= :key #'first)))
-        (unless cell
-          (unsupported "->~A: struct ~A has no such field"
-                       field-name struct-name))
-        (let ((offset (third cell))
-              (size   (fourth cell)))
-          (unless (member size '(1 2 4 8))
-            (unsupported "->~A: field is ~D bytes; only scalar (1/2/4/8) fields are wired up"
-                         field-name size))
-          (let ((scratch (gensym "FIELD"))
-                (type-sym (case size
-                            (1 (intern "U8"  :whistler))
-                            (2 (intern "U16" :whistler))
-                            (4 (intern "U32" :whistler))
-                            (8 (intern "U64" :whistler)))))
-            `(let ((,scratch (whistler::struct-alloc ,size)))
-               (whistler::probe-read-kernel
-                ,scratch ,size
-                (whistler::+ ,ptr-form ,offset))
-               (whistler::load ,type-sym ,scratch 0))))))))
+   PTR-FORM, returning the value of FIELD-NAME. Tries in-script
+   struct decls first (parsed at AST time into *script-struct-decls*),
+   then falls back to vmlinux BTF. Scalar fields (1/2/4/8 bytes) only
+   — array members and nested struct fields aren't wired up here."
+  (let ((user-entry (assoc struct-name *script-struct-decls*
+                           :test #'string=)))
+    (cond
+      ;; In-script struct: entry shape is (NAME TOTAL-SIZE FIELDS…).
+      (user-entry
+       (let* ((fields (cddr user-entry))
+              (cell   (find field-name fields :test #'string= :key #'first)))
+         (unless cell
+           (unsupported "->~A: in-script struct ~A has no such field"
+                        field-name struct-name))
+         (let* ((size    (second cell))
+                (offset  (third cell))
+                (arr-len (fourth cell)))
+           (when arr-len
+             (unsupported "->~A: in-script struct ~A field is an array (~D × ~D); ~
+                          whole-array access not wired up yet"
+                          field-name struct-name arr-len size))
+           (unless (member size '(1 2 4 8))
+             (unsupported "->~A: in-script struct ~A field is ~D bytes; ~
+                          only scalar (1/2/4/8) fields are wired up"
+                          field-name struct-name size))
+           (emit-struct-field-read size offset ptr-form (pick-probe-read-fn)))))
+      (t
+       (let ((vmbtf (whistler:ensure-vmlinux-btf)))
+         (multiple-value-bind (type-id rec)
+             (whistler:btf-find-struct vmbtf struct-name)
+           (declare (ignore rec))
+           (unless type-id
+             (unsupported "->~A: struct ~A not found in vmlinux BTF"
+                          field-name struct-name))
+           (let* ((fields (whistler:btf-struct-fields vmbtf type-id))
+                  (cell   (find field-name fields :test #'string= :key #'first)))
+             (unless cell
+               (unsupported "->~A: struct ~A has no such field"
+                            field-name struct-name))
+             (let ((offset (third cell))
+                   (size   (fourth cell)))
+               (unless (member size '(1 2 4 8))
+                 (unsupported "->~A: field is ~D bytes; only scalar (1/2/4/8) fields are wired up"
+                              field-name size))
+               (emit-struct-field-read
+                size offset ptr-form
+                (intern "PROBE-READ-KERNEL" :whistler))))))))))
+
+(defun emit-struct-field-read (size offset ptr-form helper)
+  "Build a `(let ((scratch struct-alloc)) helper … load)' triple that
+   reads a SIZE-byte scalar field at OFFSET from PTR-FORM via HELPER
+   (probe-read-user or probe-read-kernel)."
+  (let ((scratch (gensym "FIELD"))
+        (type-sym (case size
+                    (1 (intern "U8"  :whistler))
+                    (2 (intern "U16" :whistler))
+                    (4 (intern "U32" :whistler))
+                    (8 (intern "U64" :whistler)))))
+    `(let ((,scratch (whistler::struct-alloc ,size)))
+       (,helper ,scratch ,size (whistler::+ ,ptr-form ,offset))
+       (whistler::load ,type-sym ,scratch 0))))
 
 (defun lower-args-field (name)
   "Lower args->NAME based on the current probe type. Tracepoints
@@ -2897,6 +3117,18 @@
      ;; bytes plus NUL-pad to the full width.
      (lower-printf-string-literal buf offset (second expr)
                                   +bt-func-name-key-len+))
+    ;; In-script struct array-field key — probe-read the array bytes
+    ;; directly into the slot. The composite-key-layout sized the
+    ;; slot to ELT-SIZE × ARR-LEN bytes already.
+    ((multiple-value-bind (b s o l) (array-field-meta expr)
+       (declare (ignore b s o l))
+       (array-field-meta expr))
+     (multiple-value-bind (base-ast elt-size field-off arr-len)
+         (array-field-meta expr)
+       `(,(pick-probe-read-fn)
+         (whistler::+ ,buf ,offset)
+         ,(* elt-size arr-len)
+         (whistler::+ ,(lower-expr base-ast) ,field-off))))
     (t `(whistler::store ,type ,buf ,offset ,(lower-expr expr)))))
 
 (defun with-key (keys body-fn)
@@ -2965,7 +3197,131 @@
          `(whistler::load ,(intern "U8" :whistler)
                           ,(var-sym (second base))
                           ,(lower-expr idx)))
+        ;; `$a[i]' where `$a' was assigned from a primitive-pointer
+        ;; cast (`$a = (int32 *) arg0'). Read sizeof(elt) bytes at
+        ;; `$a + i * sizeof(elt)' via probe-read-user/kernel.
+        ((and (consp base) (eq (first base) :var)
+              (assoc (second base) *var-ptr-elt-types* :test #'string=))
+         (let* ((cell  (cdr (assoc (second base) *var-ptr-elt-types*
+                                   :test #'string=)))
+                (sz    (second cell)))
+           (lower-ptr-index (lower-expr base) (lower-expr idx) sz)))
+        ;; `((int32 *) EXPR)[i]' — direct subscript on a bare
+        ;; primitive-pointer cast, no intermediate var.
+        ((and (consp base) (eq (first base) :prim-ptr-cast))
+         (let ((sz (prim-ptr-elt-size (getf (cdr base) :elt-type))))
+           (unless sz
+             (unsupported "primitive-pointer cast: unknown element type ~A"
+                          (getf (cdr base) :elt-type)))
+           (lower-ptr-index (lower-expr (getf (cdr base) :expr))
+                            (lower-expr idx) sz)))
+        ;; `@m[k][i]' where @m's value was stored from a primitive-
+        ;; pointer cast (`@m[k] = (int32 *) X'). Read sizeof(elt)
+        ;; bytes at `@m[k] + i * sizeof(elt)' via probe-read. The
+        ;; map-read returns the stored u64 (the pointer); we then
+        ;; subscript through it.
+        ((and (consp base) (eq (first base) :map)
+              (let* ((nm   (or (getf (cdr base) :name) "@"))
+                     (info (and *map-table* (gethash nm *map-table*))))
+                (and info (minfo-value-ptr-elt-size info))))
+         (let* ((nm   (or (getf (cdr base) :name) "@"))
+                (info (gethash nm *map-table*))
+                (sz   (minfo-value-ptr-elt-size info)))
+           (lower-ptr-index (lower-expr base) (lower-expr idx) sz)))
+        ;; `@m[k][i]' where @m's value is a whole array (set via
+        ;; `@m[k] = (struct A *)e.x'). The map-lookup-ptr returns a
+        ;; pointer to the on-map buffer holding the array bytes; load
+        ;; the i'th element directly (no probe-read — it's already in
+        ;; kernel memory).
+        ((and (consp base) (eq (first base) :map)
+              (let* ((nm   (or (getf (cdr base) :name) "@"))
+                     (info (and *map-table* (gethash nm *map-table*))))
+                (and info (minfo-value-array-p info)
+                     (minfo-value-array-elt-size info))))
+         (let* ((nm   (or (getf (cdr base) :name) "@"))
+                (info (gethash nm *map-table*))
+                (sz   (minfo-value-array-elt-size info))
+                (type-sym (case sz
+                            (1 (intern "U8"  :whistler))
+                            (2 (intern "U16" :whistler))
+                            (4 (intern "U32" :whistler))
+                            (8 (intern "U64" :whistler)))))
+           `(whistler::load ,type-sym
+                            ,(lower-map-value-ptr base)
+                            (whistler::* ,(lower-expr idx) ,sz))))
+        ;; `$a.field[i]' or `(struct X *)e.field[i]' — element access
+        ;; on an array field of an in-script struct. The struct
+        ;; pointer + field offset + i * sizeof(elt) gives the address;
+        ;; probe-read sizeof(elt) bytes there.
+        ((and (consp base) (eq (first base) :field)
+              (array-field-lookup base))
+         (multiple-value-bind (ptr-form elt-size field-off arr-len)
+             (array-field-lookup base)
+           (when (and (consp idx) (eq (first idx) :int))
+             (let ((i (second idx)))
+               (when (or (minusp i) (>= i arr-len))
+                 (unsupported
+                  "ERROR: the index ~D is out of bounds for array of size ~D"
+                  i arr-len))))
+           (lower-ptr-index `(whistler::+ ,ptr-form ,field-off)
+                            (lower-expr idx) elt-size)))
         (t (unsupported "array indexing outside @maps"))))))
+
+(defun array-field-meta (field-expr)
+  "Pure-AST lookup of array-field metadata: returns (values BASE-AST
+   ELT-SIZE FIELD-OFFSET ARR-LEN) when FIELD-EXPR is `$var.field' /
+   `(struct X *)e.field' and the field is an in-script struct array,
+   else NIL. Unlike ARRAY-FIELD-LOOKUP, doesn't call LOWER-EXPR — so
+   safe to call from infer-maps / expr-size at AST time. Tag-guarded
+   so callers can pass any expr; non-`:field' inputs return NIL."
+  (unless (and (consp field-expr) (eq (first field-expr) :field))
+    (return-from array-field-meta nil))
+  (let ((base (getf (cdr field-expr) :base))
+        (name (getf (cdr field-expr) :name)))
+    (let ((struct-name
+            (cond
+              ((and (consp base) (eq (first base) :var))
+               (cdr (assoc (second base) *var-types* :test #'string=)))
+              ((and (consp base) (eq (first base) :cast))
+               (getf (cdr base) :type)))))
+      (unless struct-name (return-from array-field-meta nil))
+      (let* ((entry (assoc struct-name *script-struct-decls* :test #'string=))
+             (cell  (and entry (find name (cddr entry)
+                                     :test #'string= :key #'first)))
+             (elt-size (and cell (second cell)))
+             (offset   (and cell (third cell)))
+             (arr-len  (and cell (fourth cell))))
+        (when (and cell arr-len (member elt-size '(1 2 4 8)))
+          (values base elt-size offset arr-len))))))
+
+(defun array-field-lookup (field-expr)
+  "If FIELD-EXPR is a `:field' AST whose base is a $var typed to an
+   in-script struct and whose named field is declared as an array
+   (T x[N]), return (values BASE-PTR-FORM ELT-SIZE FIELD-OFFSET ARR-LEN).
+   Returns NIL when the lookup doesn't match — caller decides whether
+   to error or try another rule."
+  (multiple-value-bind (base elt-size offset arr-len)
+      (array-field-meta field-expr)
+    (when base (values (lower-expr base) elt-size offset arr-len))))
+
+(defun lower-ptr-index (ptr-form idx-form elt-size)
+  "Emit a typed-pointer subscript read: probe-read ELT-SIZE bytes at
+   PTR-FORM + IDX-FORM * ELT-SIZE into a scratch buffer, then load
+   the value back as a uN. Used for `$a[i]' where `$a' is a typed
+   primitive-pointer var (e.g. `(int32 *)') and the same shape on
+   bare casts like `((int32 *) arg0)[0]'."
+  (let ((scratch (gensym "PTRIDX"))
+        (helper  (pick-probe-read-fn))
+        (type-sym (case elt-size
+                    (1 (intern "U8"  :whistler))
+                    (2 (intern "U16" :whistler))
+                    (4 (intern "U32" :whistler))
+                    (8 (intern "U64" :whistler)))))
+    `(let ((,scratch (whistler::struct-alloc ,elt-size)))
+       (,helper
+        ,scratch ,elt-size
+        (whistler::+ ,ptr-form (whistler::* ,idx-form ,elt-size)))
+       (whistler::load ,type-sym ,scratch 0))))
 
 (defun lower-map-read (expr)
   (let* ((info (or (gethash (or (getf (cdr expr) :name) "@") *map-table*)
@@ -2974,6 +3330,20 @@
          (keys  (getf (cdr expr) :keys)))
     (with-key keys
       (lambda (k) `(whistler:getmap ,mname ,k)))))
+
+(defun lower-map-value-ptr (map-expr)
+  "Return a kernel-side form evaluating to a pointer to MAP-EXPR's
+   value slot (not the scalar value). Used by lower-index when the
+   map's value-array-p is set — `@m[k][i]' needs to subscript the
+   on-map buffer directly. NIL on missing lookup is left to BPF-side
+   handling; the caller can wrap in a null check if needed."
+  (let* ((info (or (gethash (or (getf (cdr map-expr) :name) "@") *map-table*)
+                   (unsupported "unknown map @~A in value-ptr lookup"
+                                (getf (cdr map-expr) :name))))
+         (mname (minfo-name info))
+         (keys  (getf (cdr map-expr) :keys)))
+    (with-key keys
+      (lambda (k) `(whistler::map-lookup-ptr ,mname ,k)))))
 
 ;;; ========== Statement lowering ==========
 
@@ -3020,7 +3390,14 @@
                            (dolist (k (getf (cdr form) :keys))
                              (walk k skip)))
                    (:map   (dolist (k (getf (cdr form) :keys))
-                             (walk k skip))))))
+                             (walk k skip)))
+                   ;; `{ stmt; stmt; … expr }' — descend into the
+                   ;; embedded statements (each contributes its own
+                   ;; var defs) plus the trailing expression.
+                   (:block-expr
+                    (mapc (lambda (s) (walk-stmt s seen skip))
+                          (getf (cdr form) :stmts))
+                    (walk (getf (cdr form) :final) skip)))))
              (walk-stmt (s _seen skip)
                (declare (ignore _seen))
                (case (first s)
@@ -3185,6 +3562,11 @@
          (op  (getf (cdr stmt) :op))
          (rhs (getf (cdr stmt) :rhs)))
     (ecase (first lhs)
+      (:discard
+       ;; `_ = EXPR' — evaluate EXPR for side effects, discard value.
+       ;; Useful as `_ = { …; … };' to invoke a block expression at
+       ;; statement level when its result isn't wanted.
+       (lower-expr rhs))
       (:var
        (let ((sym (var-sym (second lhs))))
          (cond
@@ -3513,6 +3895,20 @@
       ((and (consp rhs) (eq (first rhs) :comm)
             (minfo-value-string-p info))
        (gen-comm-set info keys))
+      ;; `@m[k] = (struct A *)e.arrfield' — whole-array assignment.
+      ;; Probe-read N×sizeof(elt) bytes from struct+field-off into a
+      ;; stack buffer, then map-update-ptr.
+      ((and (consp rhs) (eq (first rhs) :field)
+            (minfo-value-array-p info)
+            (array-field-meta rhs))
+       (multiple-value-bind (base-ast _sz _off _len)
+           (array-field-meta rhs)
+         (declare (ignore _sz _off _len))
+         (multiple-value-bind (_b sz off len) (array-field-meta rhs)
+           (declare (ignore _b))
+           (gen-array-field-set info keys
+                                (lower-expr base-ast)
+                                (* sz len) off))))
       ;; `@m[k] = ntop(…)' — write a 17-byte family+address record
       ;; into the value slot, using the same encoding as the $var-ntop
       ;; path so :ipv-any printf reads transparently.
@@ -3592,6 +3988,31 @@
                (whistler::map-update-ptr
                 ,mname (whistler::stack-addr ,tmpk) ,buf 0)))))))
 
+(defun gen-array-field-set (info keys struct-ptr-form total-bytes field-offset)
+  "Store the TOTAL-BYTES bytes at (STRUCT-PTR-FORM + FIELD-OFFSET) into
+   the value slot of @MNAME[KEYS]. Used for `@m = (struct A *)e.x'
+   where x is a fixed-size array field. Allocates a value-sized
+   scratch buffer, probe-reads the array bytes in via the right user/
+   kernel helper, then map-update-ptr."
+  (let* ((mname (minfo-name info))
+         (buf   (gensym "AVAL"))
+         (tmpk  (gensym "K"))
+         (ptr-p (keys-need-ptr-ops-p keys))
+         (helper (pick-probe-read-fn)))
+    (with-key keys
+      (lambda (k)
+        (if ptr-p
+            `(let ((,buf (whistler::struct-alloc ,total-bytes)))
+               (,helper ,buf ,total-bytes
+                        (whistler::+ ,struct-ptr-form ,field-offset))
+               (whistler::map-update-ptr ,mname ,k ,buf 0))
+            `(let* ((,tmpk whistler::u64 ,k)
+                    (,buf (whistler::struct-alloc ,total-bytes)))
+               (,helper ,buf ,total-bytes
+                        (whistler::+ ,struct-ptr-form ,field-offset))
+               (whistler::map-update-ptr
+                ,mname (whistler::stack-addr ,tmpk) ,buf 0)))))))
+
 (defun gen-string-set (info keys literal)
   "Store LITERAL as the NUL-padded contents of @MNAME[KEYS]. Reuses
    the per-probe shared *string-set-buf* (allocated once in the
@@ -3633,7 +4054,9 @@
    string-typed key (`comm', `str(…)', `kstr(…)', `func', `probe',
    or a bare :str literal — the latter is what rewrite-self-refs
    produces for `@[func]' / `@[probe]' inside map keys, so the
-   downstream path needs to recognise it the same way)."
+   downstream path needs to recognise it the same way), or by a
+   single in-script struct array-field key (its byte width exceeds
+   the 8-byte scalar key path)."
   (or (> (length keys) 1)
       (and (= (length keys) 1)
            (let ((k (first keys)))
@@ -3642,7 +4065,8 @@
                  (eq (first k) :probe-name)
                  (eq (first k) :str)
                  (str-call-p k)
-                 (kstr-call-p k))))))
+                 (kstr-call-p k)
+                 (and (eq (first k) :field) (array-field-meta k)))))))
 
 (defun gen-percpu-struct-update (mname keys value-form &key on-existing on-init)
   "Common scaffolding for sum/avg/min/max — all of which use a percpu
@@ -3827,17 +4251,30 @@
     `(whistler::store ,store-type ,buf ,offset ,(lower-expr key-expr))))
 
 (defun lower-incdec (stmt)
-  (let* ((lhs   (getf (cdr stmt) :lhs))
-         (op    (getf (cdr stmt) :op))
-         (info  (or (gethash (or (getf (cdr lhs) :name) "@") *map-table*)
-                    (error "internal: missing map ~A" (getf (cdr lhs) :name))))
-         (mname (minfo-name info))
-         (keys  (getf (cdr lhs) :keys)))
-    (with-key keys
-      (lambda (k)
-        (ecase op
-          (:inc `(whistler:incf (whistler:getmap ,mname ,k)))
-          (:dec `(whistler:decf (whistler:getmap ,mname ,k))))))))
+  "Lower `$x++' / `$x--' / `++$x' / `--$x' / `@m[k]++' etc. Statement-
+   level only — semantics are identical for prefix and postfix when
+   the result is discarded. Maps walk through getmap/incf/decf; scalar
+   vars expand to a plain `$x = $x ± 1' since they're bound as IR
+   locals, not via the map machinery."
+  (let* ((lhs  (getf (cdr stmt) :lhs))
+         (op   (getf (cdr stmt) :op))
+         (kind (first lhs)))
+    (ecase kind
+      (:map
+       (let* ((info  (or (gethash (or (getf (cdr lhs) :name) "@") *map-table*)
+                         (error "internal: missing map ~A" (getf (cdr lhs) :name))))
+              (mname (minfo-name info))
+              (keys  (getf (cdr lhs) :keys)))
+         (with-key keys
+           (lambda (k)
+             (ecase op
+               (:inc `(whistler:incf (whistler:getmap ,mname ,k)))
+               (:dec `(whistler:decf (whistler:getmap ,mname ,k))))))))
+      (:var
+       (let ((sym (var-sym (second lhs))))
+         (ecase op
+           (:inc `(setq ,sym (whistler::+ ,sym 1)))
+           (:dec `(setq ,sym (whistler::- ,sym 1)))))))))
 
 (defun lower-expr-stmt (stmt)
   (let ((e (second stmt)))
@@ -4033,6 +4470,68 @@
                       :rhs (rewrite-leaf (getf (cdr f) :rhs))))
                (t (cons (walk (first f)) (walk (rest f)))))))
     (walk form)))
+
+(defun prim-ptr-elt-size (type-name)
+  "Byte-width of a primitive-pointer cast's element type. Returns
+   NIL for an unrecognised name so the caller can fall through to
+   the generic `array indexing outside @maps' error."
+  (cond
+    ((or (string= type-name "uint8") (string= type-name "int8")
+         (string= type-name "bool"))
+     1)
+    ((or (string= type-name "uint16") (string= type-name "int16")) 2)
+    ((or (string= type-name "uint32") (string= type-name "int32")) 4)
+    ((or (string= type-name "uint64") (string= type-name "int64")
+         (string= type-name "uint")   (string= type-name "int"))
+     8)
+    (t nil)))
+
+(defun pick-probe-read-fn ()
+  "Pick probe-read-user vs probe-read-kernel based on the active
+   probe type. uprobe/uretprobe/USDT contexts point at userspace
+   memory; everything else (kprobe, kfunc, tracepoint, …) at kernel
+   memory."
+  (case (first *probe-spec*)
+    ((:uprobe :uretprobe :usdt)
+     (intern "PROBE-READ-USER" :whistler))
+    (t
+     (intern "PROBE-READ-KERNEL" :whistler))))
+
+(defun infer-var-ptr-elt-types (stmts)
+  "Walk STMTS for `$v = (T *) EXPR' assignments and return an alist
+   (VAR-NAME . (TYPE-NAME ELT-SIZE)). RHS may also be:
+     * a parens-wrapped cast (normalize already strips :parens);
+     * a `:map' read whose minfo carries value-ptr-elt-size — the map
+       was previously stored from a `(T *)' cast, so flow that into
+       the var too (`$x = @m[k]; $x[0]' should subscript-read).
+   Returns the alist of recordings."
+  (let ((acc nil))
+    (labels ((rhs-ptr-elt-size (rhs)
+               (cond
+                 ((and (consp rhs) (eq (first rhs) :prim-ptr-cast))
+                  (list (getf (cdr rhs) :elt-type)
+                        (prim-ptr-elt-size (getf (cdr rhs) :elt-type))))
+                 ((and (consp rhs) (eq (first rhs) :map)
+                       *map-table*)
+                  (let* ((nm (or (getf (cdr rhs) :name) "@"))
+                         (info (gethash nm *map-table*))
+                         (sz (and info (minfo-value-ptr-elt-size info))))
+                    (when sz (list "u" sz))))))
+             (maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var))
+                 (let ((cell (rhs-ptr-elt-size rhs)))
+                   (when (and cell (second cell))
+                     (push (cons (second lhs) cell) acc)))))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-record (getf (cdr s) :lhs)
+                                        (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk stmts))
+    acc))
 
 (defun infer-tuple-vars (stmts)
   "Walk STMTS for `\$v = (e1, e2, …)' assignments and return an
@@ -4531,6 +5030,7 @@
   (multiple-value-bind (ptype section) (spec->section spec)
     (let* ((*probe-spec* spec)
            (*var-types*  (infer-var-types body))
+           (*var-ptr-elt-types* (infer-var-ptr-elt-types body))
            (*ntop-vars*  (infer-ntop-vars body))
            (*comm-vars*  (infer-comm-vars body))
            (*str-vars*   (infer-str-vars body))
@@ -4743,19 +5243,29 @@
 
 (defun script-uses-printf-p (script)
   "T iff the script calls any function that emits a bt-print record
-   (printf, print, clear, time) — gates injection of the bt-print
-   ringbuf map."
+   — printf / print / clear / zero / time / cat / system / errorf /
+   warnf / join / strftime. All of these route through the same
+   ringbuf, so any of them gates injection of the bt-print map.
+   Walks user-defined macros / functions too — `macro x() { printf … }'
+   called from a probe still needs the bt-print map injected."
   (labels ((walk (form)
              (cond
                ((not (consp form)) nil)
                ((and (eq (first form) :call)
                      (member (getf (cdr form) :name)
-                             '("printf" "print" "clear" "time")
+                             '("printf" "print" "clear" "zero" "time"
+                               "cat" "system" "errorf" "warnf" "join"
+                               "strftime")
                              :test #'string=))
                 t)
                (t (some #'walk form)))))
-    (some (lambda (probe) (walk (getf (cdr probe) :body)))
-          (script-probes script))))
+    (or (some (lambda (probe) (walk (getf (cdr probe) :body)))
+              (script-probes script))
+        (some (lambda (form)
+                (and (consp form)
+                     (member (first form) '(:function :macro))
+                     (walk (getf (cdr form) :body))))
+              (rest script)))))
 
 (defun script-uses-kstack-p (script)
   "T iff `kstack' or `ustack' appears anywhere — gates injection of
@@ -4777,7 +5287,8 @@
      :exit-map      symbol of the hidden bt-exit map, if exit() is used
      :print-map     symbol of the hidden bt-print ringbuf, if printf() is used
      :printf-table  ((id fmt-string nargs) …) for ringbuf-record decoding"
-  (let* ((*tp-field-sizes* (load-tracepoint-field-sizes script))
+  (let* ((*tp-format-unreadable-paths* nil)
+         (*tp-field-sizes* (load-tracepoint-field-sizes script))
          ;; Honor `config = { max_strlen = N }' for the duration of
          ;; this generate(). Reverts when the let* unwinds.
          (+bt-str-default-len+
@@ -4889,6 +5400,8 @@
                                     :key-parts (if (> (minfo-key-size info) 8)
                                                    (/ (minfo-key-size info) 8)
                                                    1)
+                                    :key-array-elt-size (minfo-key-array-elt-size info)
+                                    :key-array-len (minfo-key-array-len info)
                                     :keyed-p (minfo-keyed-p info)
                                     :value-size (minfo-value-size info)
                                     :max-entries (minfo-max-entries info)

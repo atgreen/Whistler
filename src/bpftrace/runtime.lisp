@@ -488,11 +488,15 @@
   (or (cdr (assoc id *signal-names*))
       (format nil "SIG~D" id)))
 
-(defun format-key (key &key (parts 1) key-builtin)
+(defun format-key (key &key (parts 1) key-builtin
+                            array-elt-size array-len)
   "Render KEY (an integer) as bpftrace does.
    * KEY-BUILTIN :comm or :str — KEY's PARTS*8 little-endian bytes
      are a NUL-padded string.
    * KEY-BUILTIN :syscall-name — KEY is a syscall ID; render its name.
+   * ARRAY-ELT-SIZE + ARRAY-LEN — KEY is the bytes of an in-script
+     struct array field. Render as `[v1,v2,…]' matching bpftrace's
+     array-key format.
    * scalar (PARTS=1): bare decimal.
    * composite (PARTS>1): split into 8-byte chunks and render."
   (cond
@@ -502,6 +506,16 @@
      (syscall-id->name key))
     ((eq key-builtin :signal-name)
      (signal-id->name key))
+    ((and array-elt-size array-len)
+     (with-output-to-string (s)
+       (write-char #\[ s)
+       (let ((bits (* array-elt-size 8))
+             (mask (1- (ash 1 (* array-elt-size 8)))))
+         (loop for i below array-len
+               for v = (logand (ash key (- (* i bits))) mask)
+               do (when (plusp i) (write-string "," s))
+                  (format s "~D" v)))
+       (write-char #\] s)))
     ((<= parts 1) (format nil "~D" key))
     (t
      (with-output-to-string (s)
@@ -748,6 +762,7 @@
 (defun print-scalar-map (label info &key (key-parts 1) keyed-p
                                           (kind :counter) key-builtin
                                           key-types
+                                          key-array-elt-size key-array-len
                                           top div
                                           stacks-info stack-depth
                                           symbolizer)
@@ -829,7 +844,9 @@
                    prefix
                    (format-key (car kv)
                                :parts key-parts
-                               :key-builtin key-builtin)
+                               :key-builtin key-builtin
+                               :array-elt-size key-array-elt-size
+                               :array-len key-array-len)
                    (format-scalar-value (cdr kv)))))
         (t
          (dolist (kv pairs)
@@ -871,6 +888,10 @@
                                    :keyed-p (getf (cdr info-rec) :keyed-p)
                                    :key-builtin (getf (cdr info-rec) :key-builtin)
                                    :key-types (getf (cdr info-rec) :key-types)
+                                   :key-array-elt-size
+                                   (getf (cdr info-rec) :key-array-elt-size)
+                                   :key-array-len
+                                   (getf (cdr info-rec) :key-array-len)
                                    :kind kind
                                    :stacks-info stacks-info
                                    :stack-depth stack-depth
@@ -1746,6 +1767,14 @@
                    (when *post-attach-hook*
                      (handler-case (funcall *post-attach-hook*)
                        (error () nil)))
+                   ;; bpftrace's runtime test engine waits for this
+                   ;; exact line on stdout before launching the AFTER
+                   ;; testprog. Without it, AFTER never fires, so the
+                   ;; uprobe never gets a hit, so exit() never sets
+                   ;; the flag, so we time out after 5s with empty
+                   ;; output. The line is a no-op for normal users.
+                   (format t "__BPFTRACE_NOTIFY_PROBES_ATTACHED~%")
+                   (force-output)
                    ;; Poll-sleep until interrupted or exit() fires.
                    ;; Drain the printf ringbuf on every tick.
                    (setf *bpftrace-running* t)

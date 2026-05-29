@@ -185,22 +185,27 @@
 (defun vaddr-to-file-offset (bytes vaddr)
   "Convert a virtual address to a file offset using PT_LOAD segments.
    Finds the PT_LOAD segment containing VADDR and computes
-   p_offset + (vaddr - p_vaddr)."
+   p_offset + (vaddr - p_vaddr). For non-PIE binaries, p_vaddr is
+   the load base (e.g. 0x400000) and p_offset is 0; the result is
+   the file offset. For PIE binaries p_vaddr is 0 so VADDR is
+   already the file offset. Falls back to VADDR unchanged if no
+   PT_LOAD segment contains it — the kernel-side uprobe machinery
+   will then reject EINVAL, which is correct: we couldn't classify
+   the address."
   (let ((e-phoff (elf-u64 bytes 32))
         (e-phentsize (elf-u16 bytes 54))
         (e-phnum (elf-u16 bytes 56)))
-    (loop for i below e-phnum
-          for ph-off = (+ e-phoff (* i e-phentsize))
-          for p-type = (elf-u32 bytes ph-off)
-          when (= p-type 1)  ; PT_LOAD
-          do (let ((p-offset (elf-u64 bytes (+ ph-off 8)))
-                   (p-vaddr (elf-u64 bytes (+ ph-off 16)))
-                   (p-memsz (elf-u64 bytes (+ ph-off 40))))
-               (when (and (>= vaddr p-vaddr)
-                          (< vaddr (+ p-vaddr p-memsz)))
-                 (return (+ p-offset (- vaddr p-vaddr))))))
-    ;; Fallback: return vaddr unchanged (best effort)
-    vaddr))
+    (or (loop for i below e-phnum
+              for ph-off = (+ e-phoff (* i e-phentsize))
+              for p-type = (elf-u32 bytes ph-off)
+              when (= p-type 1)  ; PT_LOAD
+                do (let ((p-offset (elf-u64 bytes (+ ph-off 8)))
+                         (p-vaddr (elf-u64 bytes (+ ph-off 16)))
+                         (p-memsz (elf-u64 bytes (+ ph-off 40))))
+                     (when (and (>= vaddr p-vaddr)
+                                (< vaddr (+ p-vaddr p-memsz)))
+                       (return (+ p-offset (- vaddr p-vaddr))))))
+        vaddr)))
 
 (defun resolve-elf-symbol-offset (binary-path symbol-name)
   "Find the file offset of a symbol in an ELF binary.
@@ -231,12 +236,18 @@
 
 (defun attach-uprobe (prog-fd binary-path symbol-name &key retprobe)
   "Attach a BPF program to a uprobe on SYMBOL-NAME in BINARY-PATH.
+   BINARY-PATH may be relative; the kernel's uprobe perf_event_open
+   expects an absolute path string (it doesn't resolve relative to
+   the caller's cwd), so we canonicalize before passing it through.
    Returns an attachment that can be passed to detach."
-  (let* ((offset (resolve-elf-symbol-offset binary-path symbol-name))
+  (let* ((abs-path (or (and (probe-file binary-path)
+                            (namestring (truename binary-path)))
+                       (error "uprobe binary not found: ~A" binary-path)))
+         (offset (resolve-elf-symbol-offset abs-path symbol-name))
          (pmu-type (read-file-int "/sys/bus/event_source/devices/uprobe/type"))
          (config (if retprobe 1 0))  ; bit 0 = retprobe
          (attr (make-perf-attr (or pmu-type 8) config))
-         (path-bytes (sb-ext:string-to-octets binary-path :null-terminate t)))
+         (path-bytes (sb-ext:string-to-octets abs-path :null-terminate t)))
     (sb-sys:with-pinned-objects (path-bytes)
       ;; config1 = path pointer at offset 56, config2 = symbol offset at offset 64
       (put-ptr attr 56 (sb-sys:vector-sap path-bytes))

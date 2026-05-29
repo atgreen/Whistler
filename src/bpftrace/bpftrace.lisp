@@ -30,6 +30,13 @@
    — when NAME is present here, getopt returns the parsed value; otherwise
    DEFAULT.")
 
+(defvar *positional-args* nil
+  "List of bare positional argv tokens (strings) parsed from the CLI
+   after -e/-p/-c and the script path were consumed. bpftrace's `$1',
+   `$2' etc. inside the script resolve against this list; missing
+   indices yield 0 (matching bpftrace). Set by the CLI before
+   compile-script runs.")
+
 (defvar *child-cpid* nil
   "When `whistler bpftrace -c CMD' spawned a child, the CLI sets
    this to the child's pid before compile-script runs. The codegen

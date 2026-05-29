@@ -1022,6 +1022,26 @@
         (format t "kprobe:~A~%" name))
       (format t "~%;; ~D probe~:p~%" (length matches)))))
 
+(defun parse-positional-args (args e-pos p-pos c-pos script-pos)
+  "Collect bare positional argv tokens — `$1', `$2', … inside the
+   script come from this list (after argv consumed by -e/-p/-c/SCRIPT
+   are removed). Bpftrace's convention: `bpftrace -e \"…$1…\" 0 foo'
+   binds $1→\"0\", $2→\"foo\". Tokens that look like whistler/bpftrace
+   flags (`--foo', `-V', …) are excluded so they don't accidentally
+   land in $N."
+  (let ((sep (position "--" args :test #'string=))
+        (skip-indices (remove nil
+                              (list e-pos p-pos c-pos script-pos
+                                    (when e-pos (1+ e-pos))
+                                    (when p-pos (1+ p-pos))
+                                    (when c-pos (1+ c-pos))))))
+    (loop for a in args for i from 0
+          unless (or (member i skip-indices)
+                     (and (numberp sep) (= i sep))
+                     (and (>= (length a) 1)
+                          (char= (char a 0) #\-)))
+            collect a)))
+
 (defun parse-named-params (args)
   "Walk ARGS for `--NAME' / `--NAME=VALUE' positionals that come after
    the `--' separator (bpftrace's convention) or after the script path.
@@ -1054,6 +1074,17 @@
          (p-pos  (position "-p" args :test #'string=))
          (c-pos  (position "-c" args :test #'string=))
          (named-params (parse-named-params args))
+         ;; The script-path token, if we're in file-mode (not -e). It
+         ;; gets excluded from $N positional collection so users don't
+         ;; see their script name show up as $1.
+         (script-pos-for-pos
+           (unless (member "-e" args :test #'string=)
+             (position-if (lambda (a)
+                            (and (>= (length a) 1)
+                                 (char/= (char a 0) #\-)))
+                          args)))
+         (positional-args (parse-positional-args
+                           args e-pos p-pos c-pos script-pos-for-pos))
          (pid-arg (when p-pos
                     (let ((s (nth (1+ p-pos) args)))
                       (unless s
@@ -1084,6 +1115,7 @@
          (child-var   (find-symbol "*CHILD-PROCESS*" '#:whistler/bpftrace))
          (hook-var    (find-symbol "*POST-ATTACH-HOOK*" '#:whistler/bpftrace))
          (params-var  (find-symbol "*NAMED-PARAMS*"  '#:whistler/bpftrace))
+         (positional-var (find-symbol "*POSITIONAL-ARGS*" '#:whistler/bpftrace))
          (cpid-var    (find-symbol "*CHILD-CPID*"    '#:whistler/bpftrace))
          (child-pid   (and child-process
                            (traced-child-pid child-process)))
@@ -1093,11 +1125,13 @@
                               (when child-process    child-var)
                               (when release-thunk    hook-var)
                               (when named-params     params-var)
+                              (when positional-args  positional-var)
                               (when child-pid        cpid-var)))
            (remove nil (list (when effective-pid effective-pid)
                               (when child-process    child-process)
                               (when release-thunk    release-thunk)
                               (when named-params     named-params)
+                              (when positional-args  positional-args)
                               (when child-pid        child-pid)))
       (cond
         (dump-p

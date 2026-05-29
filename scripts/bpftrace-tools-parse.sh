@@ -38,7 +38,8 @@ while IFS= read -r -d '' script; do
     pass=$((pass + 1))
   else
     if [[ "$out" == *"tracepoint format not found"* || \
-          "$out" == *"Can't find the TRUENAME"* ]]; then
+          "$out" == *"Can't find the TRUENAME"* || \
+          "$out" == *"tracepoint format file couldn't be read"* ]]; then
       printf '  skip %s (tracefs not readable)\n' "$name"
       skip=$((skip + 1))
     else

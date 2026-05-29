@@ -103,6 +103,108 @@
         ((string= s "^=")  :^=)
         (t (unsupported "operator ~S" s))))
 
+;;; ========== struct-decl normalization ==========
+
+(defun ctype-size (name star-count)
+  "Byte-width of a C primitive `type-name' with STAR-COUNT pointer
+   stars. Pointers are 8 bytes (we target 64-bit kernels). Returns
+   NIL for an unrecognised name so the caller can decide what to do."
+  (cond
+    ((> star-count 0) 8)
+    ((or (string= name "char") (string= name "uint8") (string= name "int8")
+         (string= name "u8")   (string= name "s8")   (string= name "bool"))
+     1)
+    ((or (string= name "short") (string= name "uint16") (string= name "int16")
+         (string= name "u16")   (string= name "s16"))
+     2)
+    ((or (string= name "int")    (string= name "uint32") (string= name "int32")
+         (string= name "u32")    (string= name "s32")    (string= name "unsigned"))
+     4)
+    ((or (string= name "long")   (string= name "uint64") (string= name "int64")
+         (string= name "u64")    (string= name "s64")    (string= name "size_t")
+         (string= name "ssize_t") (string= name "ptrdiff_t"))
+     8)
+    (t nil)))
+
+(defun count-star-children (node)
+  "Number of literal `*' tokens in NODE's children — iparse keeps
+   un-tagged terminal strings, so a field-type with N stars has N
+   `*' atoms in its child list."
+  (loop for c in (children-of node)
+        count (and (stringp c) (string= c "*"))))
+
+(defun field-type-info (ftype-node)
+  "Extract (TYPE-NAME-STRING STAR-COUNT) from a :field-type subtree.
+   The subtree's child is :struct-ref, :struct-embed, or :plain-type.
+   For struct-ref / struct-embed we report `struct N' and pointer
+   star count from the trailing stars; for plain-type we use the
+   type-name atom plus stars. The size-and-name view is enough for
+   the codegen — we don't try to walk embedded struct layouts here."
+  (let* ((inner (find-if #'consp (children-of ftype-node))))
+    (case (tag-of inner)
+      (:plain-type
+       (let* ((name-node (first-tagged inner :type-name))
+              (name      (text-of (first-tagged name-node :ident)))
+              (stars     (count-star-children inner)))
+         (values name stars)))
+      (:struct-ref
+       (let* ((name (text-of (first-tagged inner :ident)))
+              (stars (count-star-children inner)))
+         (values (concatenate 'string "struct " name) stars)))
+      (:struct-embed
+       (let ((name (text-of (first-tagged inner :ident))))
+         (values (concatenate 'string "struct " name) 0))))))
+
+(defun norm-struct-decl (node)
+  "Parse a `struct NAME { fields… };' top-level decl into an entry on
+   *script-struct-decls*. Fields are walked in order, byte-aligned
+   to their element width (a simplified C natural-alignment model
+   that's correct for power-of-two scalar widths). The total struct
+   size pads up to the largest field width."
+  (let* ((name (text-of (first-tagged node :ident)))
+         (raw-fields (all-tagged node :struct-field))
+         (offset 0)
+         (max-align 1)
+         (fields nil))
+    (dolist (f raw-fields)
+      (let* ((ftype-node (first-tagged f :field-type))
+             (ident-node (first-tagged f :ident))
+             (arr-nodes  (all-tagged f :field-array-suffix))
+             (arr-dims   (when arr-nodes
+                           (mapcar (lambda (n)
+                                     (parse-integer
+                                      (text-of (first-tagged n :integer))))
+                                   arr-nodes)))
+             ;; Total element count for size purposes. For a scalar
+             ;; field (no `[N]'), arr-dims is NIL and arr-len is NIL.
+             (arr-len    (and arr-dims (reduce #'* arr-dims))))
+        (multiple-value-bind (type-str stars) (field-type-info ftype-node)
+          ;; Strip a leading `struct ' for the size lookup — plain
+          ;; `int', `char' etc. resolve directly; bare struct types
+          ;; we can't size precisely without nested-layout work, so
+          ;; we record a size of 0 (and the codegen will refuse
+          ;; field access on it).
+          (let* ((base-name (if (and (>= (length type-str) 7)
+                                     (string= type-str "struct " :end1 7))
+                                (subseq type-str 7)
+                                type-str))
+                 (base-size (or (ctype-size base-name stars) 0))
+                 ;; Natural alignment up to element width.
+                 (align     (max 1 base-size))
+                 (aligned   (if (zerop align) offset
+                                (* align (ceiling offset align))))
+                 (slot-size (* base-size (or arr-len 1))))
+            (push (list (text-of ident-node)
+                        base-size aligned arr-len type-str)
+                  fields)
+            (setf offset (+ aligned slot-size))
+            (setf max-align (max max-align align))))))
+    (let* ((total-size (if (zerop max-align)
+                           offset
+                           (* max-align (ceiling offset max-align))))
+           (entry (list* name total-size (nreverse fields))))
+      (push entry *script-struct-decls*))))
+
 ;;; ========== Main entry ==========
 
 (defun parse-config-body (body)
@@ -138,6 +240,17 @@
    block(s) in the current script. Bound by NORMALIZE so codegen and
    compile-script can pick the values up.")
 
+(defvar *script-struct-decls* nil
+  "Alist mapping struct names declared at script top-level (`struct
+   NAME { … };') to their parsed body. Each entry is
+     (NAME . ((FIELD-NAME ELT-SIZE OFFSET ARRAY-LEN-OR-NIL TYPE-STRING) …))
+   where ELT-SIZE is the per-element byte width, OFFSET is the byte
+   offset of the field within the struct, and ARRAY-LEN is the array
+   length when the field was declared `T x[N]' (NIL for scalar). TYPE-
+   STRING is the raw type token for diagnostics. Codegen consults
+   this before falling back to vmlinux BTF in lower-struct-pointer-
+   field, offsetof, and sizeof. Bound by NORMALIZE.")
+
 (defun normalize (raw)
   "Convert the iparse parse tree RAW into the typed AST, then apply
    post-parse rewrites (auto-prepend pid to ustack-keyed maps).
@@ -146,6 +259,7 @@
    *script-config* rather than the script body."
   (assert (eq (tag-of raw) :script) (raw) "expected :SCRIPT root, got ~S" (tag-of raw))
   (setf *script-config* nil)
+  (setf *script-struct-decls* nil)
   (rewrite-ustack-pids
    (cons :script
          (loop for top in (all-tagged raw :top-form)
@@ -162,6 +276,10 @@
                                          (append *script-config*
                                                  (parse-config-body body)))))
                                nil)
+                              (:struct-decl
+                               (norm-struct-decl inner)
+                               nil)
+                              (:enum-decl    nil)  ; accept-and-ignore
                               (:map-decl     nil)  ; accept-and-ignore
                               (t (error "unexpected top-form: ~S"
                                         (tag-of inner))))
@@ -396,7 +514,8 @@
   (let ((inner (first (remove-if-not #'consp (children-of node)))))
     (ecase (tag-of inner)
       (:map-access (norm-map-access inner))
-      (:scalar-var (list :var (text-of (first-tagged inner :ident)))))))
+      (:scalar-var (list :var (text-of (first-tagged inner :ident))))
+      (:wildcard-lhs (list :discard)))))
 
 ;;; ========== Expressions ==========
 ;;;
@@ -497,7 +616,23 @@
       (:func-call    (norm-call inner))
       (:map-access   (norm-map-access inner))
       (:map-anon     (list :map :name nil :keys nil))
-      (:scalar-var   (list :var (text-of (first-tagged inner :ident))))
+      (:scalar-var
+       (let ((pos-node (first-tagged inner :positional-var)))
+         (if pos-node
+             (list :positional (parse-integer (text-of pos-node)))
+             (list :var (text-of (first-tagged inner :ident))))))
+      (:block-expr
+       ;; { stmt; stmt; ... expr } — collect leading statements,
+       ;; take the trailing unterminated expr as the block's value.
+       ;; Codegen lowers this to a `(progn stmts… final)' form.
+       (let* ((pres  (all-tagged inner :block-expr-pre))
+              (stmts (mapcar (lambda (p)
+                               (norm-statement (first-tagged p :statement)))
+                             pres))
+              (final-expr-node (first-tagged inner :expr)))
+         (list :block-expr
+               :stmts (remove nil stmts)
+               :final (norm-expr-or-expr-wrapped final-expr-node))))
       (:builtin      (norm-builtin inner))
       (:builtin-name (norm-builtin inner)) ; if parens stripped
       (:cast
@@ -516,6 +651,18 @@
                                   (not (eq (tag-of c) :int-type-name))))
                            (children-of inner))))
          (norm-expr-dispatch sub)))
+      (:primitive-pointer-cast
+       ;; (int32 *)x — the element type IS load-bearing: codegen needs
+       ;; it to size `$v[i]' reads. We preserve it as :prim-ptr-cast
+       ;; so the `:assign' lowering can record the element type on $v
+       ;; in *var-types*, and `:index' lowering can consult it later.
+       (let* ((type-name (text-of (first-tagged inner :int-type-name)))
+              (sub (find-if (lambda (c)
+                              (and (consp c)
+                                   (not (eq (tag-of c) :int-type-name))))
+                            (children-of inner))))
+         (list :prim-ptr-cast :elt-type type-name
+               :expr (norm-expr-dispatch sub))))
       (:constant     (list :constant
                            (text-of (first-tagged inner :ident))))
       (:string-lit   (list :str (strip-quotes (text-of inner))))

@@ -2,7 +2,7 @@ SBCL ?= sbcl
 SBCL_FLAGS = --noinform --non-interactive
 
 .PHONY: all test test-torture check clean examples repl repl-loader \
-        bpftrace-parse-test bpftrace-runtime-test
+        bpftrace-parse-test bpftrace-runtime-test bpftrace-testprogs
 
 all: whistler
 
@@ -60,9 +60,32 @@ bpftrace-parse-test: whistler
 #   * sudo for probe attach (most non-`-l` tests load BPF programs).
 #
 # Pass an optional gtest-style filter via TEST_FILTER, e.g.
-#   make bpftrace-runtime-test TEST_FILTER='basic.*'
-BPFTRACE_SRC ?= $(HOME)/git/bpftrace
-bpftrace-runtime-test: whistler
+#   sudo make bpftrace-runtime-test TEST_FILTER='basic.*'
+#
+# Under `sudo' (without -E), $(HOME) is /root, which is almost never where
+# the bpftrace checkout actually lives. Fall back to SUDO_USER's home dir
+# when present so plain `sudo make bpftrace-runtime-test' Just Works.
+ifdef SUDO_USER
+_BPFTRACE_RUNTIME_HOME := $(shell getent passwd $(SUDO_USER) | cut -d: -f6)
+else
+_BPFTRACE_RUNTIME_HOME := $(HOME)
+endif
+BPFTRACE_SRC ?= $(_BPFTRACE_RUNTIME_HOME)/git/bpftrace
+# Reuse SUDO_USER's pip --user site-packages so the engine's Python deps
+# (looseversion etc.) are visible to root without `sudo pip install'.
+_BPFTRACE_USER_SITE := $(shell ls -d $(_BPFTRACE_RUNTIME_HOME)/.local/lib/python*/site-packages 2>/dev/null | tr '\n' ':')
+
+# Build bpftrace's tests/testprogs/ C "victim" binaries. Required for
+# the runtime suite — every -c test needs one of these on disk and the
+# Python engine crashes (FileNotFoundError, no try/except) on missing
+# ones. We avoid pulling in bpftrace's full CMake toolchain (LLVM,
+# libbpf, …) and just call gcc/g++ directly. Run as the unprivileged
+# user, not under sudo — the bpftrace checkout lives in your home dir
+# and root shouldn't own files written there.
+bpftrace-testprogs:
+	BPFTRACE_SRC=$(BPFTRACE_SRC) ./scripts/build-bpftrace-testprogs.sh
+
+bpftrace-runtime-test: whistler bpftrace-testprogs
 	@ln -sf $(CURDIR)/whistler $(CURDIR)/scripts/bpftrace
 	@# Engine ships its own un-rendered cmake_vars.py template that
 	@# Python refuses to parse. Stage the engine + our shim under
@@ -74,8 +97,11 @@ bpftrace-runtime-test: whistler
 	    $(BPFTRACE_SRC)/tests/runtime/engine/runner.py \
 	    build/bpftrace-runtime-engine/
 	@cp scripts/cmake_vars_shim.py build/bpftrace-runtime-engine/cmake_vars.py
+	@# Patch the staged main.py so missing testprogs → SKIP, not crash.
+	@python3 scripts/patch-bpftrace-engine.py build/bpftrace-runtime-engine
 	@cd $(BPFTRACE_SRC)/tests && \
 	  BPFTRACE_RUNTIME_TEST_EXECUTABLE=$(CURDIR)/scripts/bpftrace \
+	  PYTHONPATH="$(_BPFTRACE_USER_SITE)$${PYTHONPATH}" \
 	  python3 -u $(CURDIR)/build/bpftrace-runtime-engine/main.py \
 	    $(if $(TEST_FILTER),--filter "$(TEST_FILTER)",)
 

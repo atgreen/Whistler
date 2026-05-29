@@ -171,7 +171,41 @@
 (defparameter *grammar-source*
   "
   script         = <ws> top-form (<ws> top-form)* <ws>
-  top-form       = function / macro-decl / config-block / map-decl / probe
+  top-form       = function / macro-decl / config-block / map-decl / struct-decl / enum-decl / probe
+  (* `enum [NAME] { K1 = V1, K2, … };' at script top-level. Parsed
+     just to clear the way; we don't resolve K-as-constant yet, so
+     scripts that *use* the enum values will fail at codegen with
+     the regular `unknown identifier' error. *)
+  enum-decl      = <'enum'> (<ws> ident)? <ws> <'{'> #'[^}]*' <'}'> (<ws> <';'>)?
+  (* `struct NAME { … }' at script top-level — bpftrace's in-script
+     C struct declaration. We accept it so scripts parse, but the
+     body is captured as opaque text; codegen reports a clearer
+     `in-script struct types not yet supported' error if NAME is
+     then used in a struct-pointer cast. Kernel-BTF structs still
+     work because they're never declared in the script. *)
+  struct-decl    = <'struct'> <ws> ident <ws> <'{'> <ws> struct-field* <ws> <'}'> (<ws> <';'>)?
+  (* `int x;', `int x[4];', `const char* ignore;', `struct Bar { int x; } bar;'
+     etc. Field-type captures the type tokens loosely (qualifiers, ptr
+     stars, embedded structs); field-array-suffix captures `[N]' when
+     present. Trailing `;' is required. Nested struct bodies are
+     handled by recursion at parse time — the inner `struct N { … }'
+     reduces to another struct-field-type which produces a struct-decl
+     style branch in field-type. *)
+  (* Field-array-suffix repeats so `int y[2][3]', `char m[4][5][6]'
+     etc. parse. We capture each dim as its own integer; codegen
+     multiplies them into a total element count for sizing. *)
+  struct-field   = field-type <ws> ident (<ws> field-array-suffix)* <ws> <';'> <ws>
+  field-array-suffix = <'['> <ws> integer <ws> <']'>
+  (* A field type is either:
+       - a `struct N { … }' embedded def (rare but legal),
+       - a `struct N' / `struct N *' name reference,
+       - a plain type-name with optional qualifiers + pointer stars. *)
+  field-type     = struct-embed / struct-ref / plain-type
+  struct-embed   = <'struct'> <ws> ident <ws> <'{'> <ws> struct-field* <ws> <'}'>
+  struct-ref     = <'struct'> <ws> ident (<ws> '*')*
+  plain-type     = type-qual* type-name (<ws> '*')* type-qual*
+  type-qual      = ('const' / 'volatile' / 'unsigned' / 'signed') !ident-char <ws>
+  type-name      = ident
   (* `let @m = lruhash(N);' (or `hashmap(N)') at top level declares
      a map with an explicit type / capacity. whistler bpftrace
      infers all of this from usage at first reference; we accept
@@ -207,23 +241,37 @@
                    kretfunc-spec / kfunc-spec /
                    kretprobe-spec / kprobe-spec / uretprobe-spec /
                    uprobe-spec / tracepoint-spec
-  begin-spec     = 'BEGIN'
-  end-spec       = 'END'
-  kprobe-spec    = <'kprobe'> <':'> glob-ident
-  kretprobe-spec = <'kretprobe'> <':'> glob-ident
-  kfunc-spec     = <'kfunc'> <':'> ('vmlinux' <':'>)? ident
-  kretfunc-spec  = <'kretfunc'> <':'> ('vmlinux' <':'>)? ident
-  uprobe-spec    = <'uprobe'> <':'> upath <':'> ident
-  uretprobe-spec = <'uretprobe'> <':'> upath <':'> ident
+  (* `BEGIN' / `END' (classic) and `begin' / `end' (bpftrace 0.22+)
+     both legal — same semantics. The !ident-char anchor prevents
+     `beginning' / `endpoint' style identifiers from being eaten. *)
+  begin-spec     = ('BEGIN' / 'begin') !ident-char
+  end-spec       = ('END' / 'end') !ident-char
+  (* bpftrace short forms for every probe type — `k:'/`kr:'/`u:'/
+     `ur:'/`t:'/`f:'/`fr:'/`i:'/`p:' are accepted alongside the long
+     spellings. The !ident-char anchor prevents a script that uses
+     `interval' written `interval' from being eaten as `i'-prefix. *)
+  kprobe-spec    = <('kprobe' / 'k') !ident-char> <':'> glob-ident
+  kretprobe-spec = <('kretprobe' / 'kr') !ident-char> <':'> glob-ident
+  (* `fentry:'/`fexit:' are bpftrace 0.20+ aliases for `kfunc:'/
+     `kretfunc:'. Both forms attach BPF_PROG_TYPE_TRACING programs
+     to BTF-typed kernel functions; the codegen treats them the same. *)
+  (* kfunc/fentry/kretfunc/fexit accept an optional kernel-module
+     name prefix: `fentry:kvm:foo' resolves `foo' against the `kvm'
+     module's BTF instead of vmlinux's. We accept any ident for the
+     module, then a colon, then the function name. *)
+  kfunc-spec     = <('kfunc'   / 'fentry' / 'f' )  !ident-char> <':'> (ident <':'>)? ident
+  kretfunc-spec  = <('kretfunc' / 'fexit'  / 'fr') !ident-char> <':'> (ident <':'>)? ident
+  uprobe-spec    = <('uprobe' / 'u')   !ident-char> <':'> upath <':'> ident
+  uretprobe-spec = <('uretprobe' / 'ur') !ident-char> <':'> upath <':'> ident
   upath          = #'[A-Za-z0-9_./-]+'
-  tracepoint-spec= <'tracepoint'> <':'> glob-ident <':'> glob-ident
+  tracepoint-spec= <('tracepoint' / 't') !ident-char> <':'> glob-ident <':'> glob-ident
   (* Either form is accepted:
        interval:s:1          -- traditional unit:count
        interval:1s           -- count + unit suffix
      Same for profile:.
   *)
-  interval-spec  = <'interval'> <':'> (interval-unit <':'> integer / integer interval-unit)
-  profile-spec   = <'profile'> <':'> (interval-unit <':'> integer / integer interval-unit)
+  interval-spec  = <('interval' / 'i') !ident-char> <':'> (interval-unit <':'> integer / integer interval-unit)
+  profile-spec   = <('profile'  / 'p') !ident-char> <':'> (interval-unit <':'> integer / integer interval-unit)
   interval-unit  = 'ms' / 'us' / 's' / 'hz'
 
   predicate      = <'/'> <ws> expr <ws> <'/'>
@@ -241,8 +289,8 @@
      induction variable is scoped to the body. Both bounds are full
      expressions; we lower to a bounded dotimes plus a guard. The
      map iteration form (`for $kv : @m { … }') is not yet supported. *)
-  for-stmt       = <'for'> !ident-char <ws> <'$'> ident <ws> <':'> <ws>
-                   expr <ws> <'..'> <ws> expr <ws> block
+  for-stmt       = <'for'> !ident-char <ws> (<'('> <ws>)? <'$'> ident <ws> <':'> <ws>
+                   expr <ws> <'..'> <ws> expr (<ws> <')'>)? <ws> block
   break-stmt     = <'break'> !ident-char
   continue-stmt  = <'continue'> !ident-char
   (* `let $var;' or `let $var = expr;' — bpftrace's local-var decl.
@@ -251,10 +299,19 @@
   let-stmt       = <'let'> !ident-char <ws> <'$'> ident (<ws> <'='> <ws> expr)?
   if-stmt        = <'if'> <ws> if-cond <ws> block (<ws> <'else'> <ws> block)?
   if-cond        = <'('> <ws> expr <ws> <')'> / expr
+  (* Postfix and prefix `++'/`--' both legal at statement level:
+       $x++;   $x--;   ++$x;   --$x;
+     We canonicalize the prefix form to a postfix shape at AST time —
+     statement-level semantics are identical. *)
   assign-stmt    = lhs <ws> assign-op <ws> expr  /
-                   lhs <ws> incdec-op
+                   lhs <ws> incdec-op /
+                   incdec-op <ws> lhs
   expr-stmt      = expr
-  lhs            = map-access / scalar-var
+  lhs            = wildcard-lhs / map-access / scalar-var
+  (* bpftrace's discard wildcard: `_ = expr;' evaluates expr for its
+     side effects and throws the result away. Useful as `_ = { …; … };'
+     to run a block expression at statement level. *)
+  wildcard-lhs   = '_' !ident-char
   assign-op      = '=' / '+=' / '-=' / '*=' / '/=' / '%=' / '|=' / '&=' / '^='
   incdec-op      = '++' / '--'
 
@@ -282,8 +339,15 @@
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
-  primary        = cast / primitive-cast / offsetof-expr / sizeof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
+  primary        = cast / primitive-pointer-cast / primitive-cast / block-expr / offsetof-expr / sizeof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
                    constant / string-lit / hex-int / integer
+  (* `{ stmt; stmt; … expr }' — bpftrace 0.22+ block expression. Each
+     statement runs in order; the final unterminated expr is the
+     block's value. Distinct from `block' (which produces no value
+     and is used as a probe/if/while body). Placed in `primary' so
+     a block expression can appear anywhere an expression can. *)
+  block-expr     = <'{'> <ws> block-expr-pre* <ws> expr <ws> <'}'>
+  block-expr-pre = statement <ws> <';'> <ws>
   (* offsetof(struct NAME, FIELD) — resolved to an integer constant
      at compile time via BTF. *)
   offsetof-expr  = <'offsetof'> <ws> <'('> <ws> <'struct'> <ws> ident <ws> <','> <ws> ident <ws> <')'>
@@ -311,9 +375,16 @@
      since all values are u64 in our IR; preserves bpftrace
      compatibility for scripts that lean on integer narrowing. *)
   primitive-cast = <'('> <ws> int-type-name <ws> <')'> <ws> postfix
+  (* Primitive-pointer cast: int32-star, uint64-star, etc. Distinct
+     from primitive-cast because the element type is load-bearing —
+     it tells the codegen how many bytes to read per element when the
+     result is subscripted (`$a[i]'). *)
+  primitive-pointer-cast = <'('> <ws> int-type-name <ws> <'*'> <ws> <')'> <ws> postfix
+  (* `bool' is a no-op alongside `int' / `uint' for cast purposes —
+     all values are u64 in our IR. Accepting it matches bpftrace. *)
   int-type-name  = 'uint64' / 'uint32' / 'uint16' / 'uint8' /
                    'int64' / 'int32' / 'int16' / 'int8' /
-                   'uint' / 'int'
+                   'uint' / 'int' / 'bool'
   (* Bare identifier — used for symbolic constants like AF_INET. Comes
      after builtin and func-call so those keywords / call shapes win
      when applicable. !ident-char anchors the boundary so identifier
@@ -324,7 +395,14 @@
   arg-list       = expr (<ws> <','> <ws> expr)*
   map-access     = <'@'> (ident <ws>)? map-keys? / <'@'>
   map-keys       = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
-  scalar-var     = <'$'> ident
+  (* `$1', `$2', … are positional CLI parameters resolved at compile
+     time from argv: `bpftrace -e SCRIPT 0 foo' makes `$1' → 0,
+     `$2' → \"foo\" inside the script. We bind these to integer
+     literals from the argv list (or 0 when unset). Must precede
+     the regular `ident' branch since digits aren't a valid
+     `ident' start anyway, but the order makes intent explicit. *)
+  scalar-var     = <'$'> (positional-var / ident)
+  positional-var = #'[0-9]+'
 
   builtin        = builtin-name !ident-char
   builtin-name   = 'pcomm' / 'ppid' / 'pid' / 'tid' / 'uid' / 'gid' / 'nsecs' / 'elapsed' /
