@@ -971,6 +971,121 @@
                collect `(whistler::store whistler::u8 ,buf ,i ,b))
        ,buf)))
 
+(defun lower-assert (args)
+  "assert(cond, msg) — bpftrace's stdlib macro. Reduces to
+   `if (!cond) { errorf(\"assert failed: %s\", msg); exit(1); }'."
+  (unless (= (length args) 2)
+    (unsupported "assert() takes (cond, msg)"))
+  (let* ((cond-expr (first args))
+         (msg-arg   (second args))
+         (cond-form (lower-expr cond-expr)))
+    `(whistler::unless ,cond-form
+       ,(lower-printf (list '(:str "assert failed: %s\\n") msg-arg)
+                      :stream :stderr :fn-name "assert")
+       ,(lower-call '(:call :name "exit" :args ())))))
+
+(defun string-var-buf-size (var-name)
+  "Return the maximum byte width of a $var-backed string slot, or NIL
+   when VAR-NAME isn't string-typed."
+  (cond
+    ((assoc var-name *str-vars* :test #'string-equal)
+     (cdr (assoc var-name *str-vars* :test #'string-equal)))
+    ((member var-name *comm-vars* :test #'string-equal)
+     +bt-comm-len+)
+    (t nil)))
+
+(defun lower-len (args)
+  "len(s) for a string-typed $var or `comm' / `pcomm' — walk the
+   slot byte-by-byte until the first NUL, return the offset. Falls
+   back to the slot capacity when no NUL is found."
+  (unless (= (length args) 1)
+    (unsupported "len() takes one argument"))
+  (let* ((arg (first args))
+         (cap (cond
+                ((eq (first arg) :comm)  +bt-comm-len+)
+                ((eq (first arg) :pcomm) +bt-comm-len+)
+                ((and (eq (first arg) :var)
+                      (string-var-buf-size (second arg))))
+                (t (unsupported
+                    "len(): arg must be `comm', `pcomm', or a string-typed $var"))))
+         (buf-form
+           (cond
+             ((eq (first arg) :comm)
+              (let ((b (gensym "COMMBUF")))
+                `(let ((,b (whistler::struct-alloc ,+bt-comm-len+)))
+                   (whistler::get-current-comm ,b ,+bt-comm-len+)
+                   ,b)))
+             ((eq (first arg) :pcomm)
+              (let ((b (gensym "PCOMMBUF")))
+                `(let ((,b (whistler::struct-alloc ,+bt-comm-len+)))
+                   ,(lower-pcomm-into-record b 0 +bt-comm-len+)
+                   ,b)))
+             (t (var-sym (second arg)))))
+         (buf (gensym "BUF"))
+         (acc (gensym "LEN")))
+    `(let* ((,buf ,buf-form)
+            (,acc whistler::u64 0))
+       ;; Unrolled scan: for each byte, only advance the counter
+       ;; while no NUL has been seen yet. The branchless accumulator
+       ;; lets the verifier prove termination without a loop.
+       ,@(loop for i below cap
+               for done = (gensym "DONE")
+               collect
+               `(let ((,done (whistler::!=
+                              (whistler::load whistler::u8 ,buf ,i) 0)))
+                  (whistler:incf ,acc (whistler::logand ,done 1))))
+       ,acc)))
+
+(defun lower-strcontains (args)
+  "strcontains(haystack, needle): returns non-zero if NEEDLE (a string
+   literal) is found anywhere in HAYSTACK. Implemented as N − len +1
+   strncmp-style probes at increasing offsets, OR'd together."
+  (unless (= (length args) 2)
+    (unsupported "strcontains() takes (haystack, needle)"))
+  (let ((haystack (first args))
+        (needle   (second args)))
+    (unless (and (consp needle) (eq (first needle) :str))
+      (unsupported "strcontains(): needle must be a string literal"))
+    (let* ((bytes (sb-ext:string-to-octets (second needle)
+                                            :external-format :utf-8))
+           (nlen  (length bytes))
+           (hay-cap (cond
+                      ((eq (first haystack) :comm)  +bt-comm-len+)
+                      ((eq (first haystack) :pcomm) +bt-comm-len+)
+                      ((and (eq (first haystack) :var)
+                            (string-var-buf-size (second haystack))))
+                      (t (unsupported
+                          "strcontains(): haystack must be `comm', `pcomm', or a string $var"))))
+           (buf-form
+             (cond
+               ((eq (first haystack) :comm)
+                (let ((b (gensym "COMMBUF")))
+                  `(let ((,b (whistler::struct-alloc ,+bt-comm-len+)))
+                     (whistler::get-current-comm ,b ,+bt-comm-len+)
+                     ,b)))
+               (t (var-sym (second haystack)))))
+           (buf (gensym "BUF"))
+           (hit (gensym "HIT")))
+      `(let* ((,buf ,buf-form)
+              (,hit whistler::u64 0))
+         ;; For each candidate start position, OR together the per-byte
+         ;; XORs. The position matched iff the accumulator is 0. We
+         ;; flip that into a hit bit and OR it into the global flag.
+         ,@(loop for start from 0 to (max 0 (- hay-cap nlen))
+                 for acc = (gensym "ACC")
+                 collect
+                 `(let ((,acc whistler::u64 0))
+                    ,@(loop for k below nlen
+                            collect
+                            `(whistler:incf
+                              ,acc
+                              (whistler::logxor
+                               (whistler::load whistler::u8 ,buf ,(+ start k))
+                               ,(aref bytes k))))
+                    (when (whistler::= ,acc 0)
+                      (whistler:incf ,hit 1))))
+         ,hit))))
+
 (defun lower-strncmp (args)
   "Lower `strncmp(s1, s2, n)' to an inline byte-by-byte compare.
    Returns 0 when the first N bytes of S1 equal S2; non-zero
@@ -1407,6 +1522,13 @@
       ((or (string= name "kptr") (string= name "uptr"))
        (lower-expr (first (getf (cdr expr) :args))))
       ((string= name "strncmp") (lower-strncmp (getf (cdr expr) :args)))
+      ;; assert(cond, msg) — runtime check. When cond is falsy, route
+      ;; the message through errorf and flip the exit flag.
+      ((string= name "assert")
+       (lower-assert (getf (cdr expr) :args)))
+      ((string= name "len")     (lower-len     (getf (cdr expr) :args)))
+      ((string= name "strcontains")
+       (lower-strcontains (getf (cdr expr) :args)))
       ((string= name "pton")    (lower-pton (getf (cdr expr) :args)))
       ;; cgroupid("/sys/fs/cgroup/PATH") — compile-time stat() of
       ;; the cgroup directory; emits its inode number as a literal.
