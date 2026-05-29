@@ -152,6 +152,20 @@
     (let ((fds (attach-perf-bpf attr prog-fd :per-cpu t)))
       (make-attachment :type :perf-profile :perf-fds fds :prog-fd prog-fd))))
 
+(defun attach-perf-profile-period (prog-fd period-ns)
+  "Attach PROG-FD to a PERF_TYPE_SOFTWARE / CPU_CLOCK event in
+   PERIOD-NS-nanosecond period mode (one sample every PERIOD-NS ns).
+   Used for `profile:s:N', `profile:ms:N', `profile:us:N'."
+  (let ((attr (make-perf-attr +perf-type-software+
+                              +perf-count-sw-cpu-clock+)))
+    ;; sample_period at offset 16 (same union slot as sample_freq;
+    ;; the flag bit picks which interpretation applies).
+    (put-u64 attr 16 period-ns)
+    ;; No freq flag — kernel reads slot 16 as sample_period.
+    (put-u64 attr 40 0)
+    (let ((fds (attach-perf-bpf attr prog-fd :per-cpu t)))
+      (make-attachment :type :perf-profile :perf-fds fds :prog-fd prog-fd))))
+
 (defun attach-tracepoint (prog-fd tracepoint-name)
   "Attach a BPF program to a tracepoint.
    TRACEPOINT-NAME is e.g. \"tracepoint/sched/sched_process_fork\"

@@ -167,6 +167,7 @@
            ;; pt_regs access (x86-64)
            #:pt-regs-parm1 #:pt-regs-parm2 #:pt-regs-parm3
            #:pt-regs-parm4 #:pt-regs-parm5 #:pt-regs-parm6
+           #:pt-regs-parm7 #:pt-regs-parm8
            #:pt-regs-ret
            ;; Safe kernel memory access
            #:kernel-load

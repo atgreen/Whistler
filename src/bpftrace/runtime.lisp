@@ -111,6 +111,14 @@
                (string= (subseq tail 0 5) "freq_"))
       (parse-integer tail :start 5 :junk-allowed t))))
 
+(defun parse-profile-period-ns (section)
+  "Extract the period (ns) from `profile/period_N' section names."
+  (let* ((parts (split-section section))
+         (tail  (second parts)))
+    (when (and tail (>= (length tail) 7)
+               (string= (subseq tail 0 7) "period_"))
+      (parse-integer tail :start 7 :junk-allowed t))))
+
 (defun resolve-uprobe-library (name)
   "Map a bare library name like `libpthread' / `libc' to a real
    filesystem path. bpftrace accepts these unqualified — the dynamic
@@ -340,12 +348,14 @@
                       :reason "could not parse period from interval section"))
              (whistler/loader::attach-perf-timer fd period)))
           ((string= kind "profile")
-           (let ((freq (parse-profile-freq-hz section)))
-             (unless freq
-               (error 'bpftrace-attach-error
-                      :section section :target target
-                      :reason "could not parse frequency from profile section"))
-             (whistler/loader::attach-perf-profile fd freq)))
+           (let ((freq   (parse-profile-freq-hz section))
+                 (period (parse-profile-period-ns section)))
+             (cond
+               (freq   (whistler/loader::attach-perf-profile fd freq))
+               (period (whistler/loader::attach-perf-profile-period fd period))
+               (t (error 'bpftrace-attach-error
+                         :section section :target target
+                         :reason "could not parse freq or period from profile section")))))
           ((string= kind "fentry")
            (whistler/loader:attach-fentry fd nil))
           ((string= kind "fexit")

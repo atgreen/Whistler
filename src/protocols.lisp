@@ -36,9 +36,11 @@
       (:r8    .  72) (:r9   .  64) (:r10 . 56) (:r11 . 48)
       (:r12   .  24) (:r13  .  16) (:r14 . 8)  (:r15 . 0))
     #+arm64
-    ;; aarch64: x0-x30 at offsets 0..240, sp @ 248, pc @ 256
+    ;; aarch64: x0-x30 at offsets 0..240, sp @ 248, pc @ 256.
+    ;; First 8 args in x0..x7; arg9+ go on the stack.
     '((:parm1 .  0) (:parm2 .  8) (:parm3 . 16)
       (:parm4 . 24) (:parm5 . 32) (:parm6 . 40)
+      (:parm7 . 48) (:parm8 . 56)
       (:ret   .  0)
       (:ip    . 256) (:sp . 248) (:pc . 256))
     #-(or x86-64 arm64)
@@ -57,6 +59,14 @@
   (def-pt-regs-accessor pt-regs-parm4 :parm4 "Fourth function argument from pt_regs.")
   (def-pt-regs-accessor pt-regs-parm5 :parm5 "Fifth function argument from pt_regs.")
   (def-pt-regs-accessor pt-regs-parm6 :parm6 "Sixth function argument from pt_regs.")
+  ;; parm7 and parm8 are register-based on aarch64 (x6, x7). They're
+  ;; not exposed for x86-64 — the System V ABI passes the 7th+ args on
+  ;; the stack at *(rsp + (n-6)*8). Whistler's lower-arg builds that
+  ;; pattern inline for kprobes; this accessor stays arm64-only.
+  #+arm64
+  (def-pt-regs-accessor pt-regs-parm7 :parm7 "Seventh function argument from pt_regs (arm64 only).")
+  #+arm64
+  (def-pt-regs-accessor pt-regs-parm8 :parm8 "Eighth function argument from pt_regs (arm64 only).")
   (def-pt-regs-accessor pt-regs-ret   :ret   "Return value from pt_regs."))
 
 ;;; ---- Control flow ----

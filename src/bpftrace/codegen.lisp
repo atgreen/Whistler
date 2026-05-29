@@ -864,7 +864,7 @@
        (0 '(whistler:pt-regs-parm1)) (1 '(whistler:pt-regs-parm2))
        (2 '(whistler:pt-regs-parm3)) (3 '(whistler:pt-regs-parm4))
        (4 '(whistler:pt-regs-parm5)) (5 '(whistler:pt-regs-parm6))
-       (t (unsupported "arg~D — only arg0..arg5 are wired up" n))))
+       (t (lower-arg-overflow n))))
     ((:kretprobe :uretprobe)
      (unsupported "arg~D in ret-probe — retval is the only accessor" n))
     ;; In fentry / fexit programs the ctx is `__u64 ctx[N]` where
@@ -873,6 +873,34 @@
     ((:kfunc :kretfunc)
      `(whistler::ctx ,(intern "U64" :whistler) ,(* n 8)))
     (:tracepoint (unsupported "tracepoint arg~D — use args->field" n))))
+
+(defun lower-arg-overflow (n)
+  "Args 6+ (or 8+ on arm64) live on the kernel stack, not in pt_regs
+   registers. On x86-64 the System V ABI puts arg7+ at *(rsp + (n-5)*8)
+   — the kprobe fires before the function prologue, so pt_regs.rsp
+   still points at the return address with the stack-passed args
+   following. Read them via probe-read-kernel."
+  (cond
+    #+arm64
+    ((= n 6) '(whistler:pt-regs-parm7))
+    #+arm64
+    ((= n 7) '(whistler:pt-regs-parm8))
+    (t
+     (let* ((sp #+x86-64 152 #+arm64 248
+                #-(or x86-64 arm64)
+                (unsupported "arg~D on unsupported architecture" n))
+            ;; Off-by-one: arg6 (index 6) is at sp+8, arg7 at sp+16, …
+            ;; on x86-64 (first 6 args in regs, rsp[0]=ret addr).
+            ;; On arm64, x0..x7 are regs, arg8 (index 8) is at sp+0,
+            ;; arg9 at sp+8, … — but we route arg6/arg7 to parm7/parm8
+            ;; above, so arm64 only lands here for index >= 8.
+            (stack-off #+x86-64 (* (- n 5) 8)
+                       #+arm64  (* (- n 8) 8))
+            (buf (gensym "ARGSTK")))
+       `(let ((,buf (whistler::struct-alloc 8)))
+          (whistler::probe-read-kernel
+           ,buf 8 (whistler::+ (whistler::ctx whistler::u64 ,sp) ,stack-off))
+          (whistler::load whistler::u64 ,buf 0))))))
 
 (defun lower-retval ()
   (ecase (first *probe-spec*)
@@ -1042,7 +1070,7 @@
     (cond
       ((string= name "count") (unsupported "count() must be on the RHS of @map = …"))
       ((string= name "hist")  (unsupported "hist() must be on the RHS of @map = …"))
-      ((string= name "lhist") (unsupported "lhist() — Phase 1 ships hist() only"))
+      ((string= name "lhist") (unsupported "lhist() must be on the RHS of @map = …"))
       ((string= name "exit")
        ;; Set the exit flag the userspace print loop polls every tick.
        `(setf (whistler:getmap ,*exit-map-name* 0) 1))
@@ -1465,8 +1493,10 @@
    max_strlen. Records reserve a fixed (4 + +bt-buf-max-len+) bytes;
    the actual byte count is the leading u32.")
 
-(defconstant +bt-str-default-len+ 64
-  "Default buffer size used by str(ptr) — matches bpftrace's default.")
+(defvar +bt-str-default-len+ 64
+  "Default buffer size used by str(ptr) — matches bpftrace's default.
+   Rebound by `generate' from the script's `config = { max_strlen = N }'
+   when present.")
 
 (defun named-call-p (expr name)
   "T when EXPR is a (:call :name NAME :args …) form."
@@ -2434,6 +2464,17 @@
                                (intern "PROBE-READ-USER-STR" :whistler)
                                (intern "PROBE-READ-KERNEL-STR" :whistler))))
               `(,helper ,sym ,size ,src)))
+           ;; `$v = "literal"' on a str-typed $v — emit byte-stores
+           ;; that lay the literal (NUL-padded) into $v's buffer.
+           ;; rewrite-self-refs lands `$v = func' / `$v = probe' here
+           ;; after folding the per-probe name into a :str literal.
+           ((and (eq op :=)
+                 (consp rhs) (eq (first rhs) :str)
+                 (assoc (second lhs) *str-vars* :test #'string-equal))
+            (let* ((entry (assoc (second lhs) *str-vars*
+                                 :test #'string-equal))
+                   (size  (cdr entry)))
+              (lower-printf-string-literal sym 0 (second rhs) size)))
            (t
             (ecase op
               (:=  `(setf ,sym ,(lower-expr rhs)))
@@ -2602,17 +2643,37 @@
        `(progn
           (whistler::probe-read-kernel ,slot-sym 16 ,chain-ptr)
           (whistler::store whistler::u8 ,slot-sym 16 10)))
-      ((or (null family-literal) (eql family-literal 2))
+      ;; Single-arg form (no family) — implicit AF_INET, addr is a u32.
+      ((null (cdr ntop-args))
        `(progn
           (whistler::store whistler::u32 ,slot-sym 0
                            ,(lower-expr addr-expr))
-          ;; Zero the unused middle bytes (4..15) so the v6 decoder
-          ;; would see a clean buffer if it ever read this slot.
           ,@(loop for off from 4 below 16
                   collect `(whistler::store whistler::u8 ,slot-sym ,off 0))
           (whistler::store whistler::u8 ,slot-sym 16 2)))
+      ;; Literal AF_INET — store the u32 and zero-pad.
+      ((eql family-literal 2)
+       `(progn
+          (whistler::store whistler::u32 ,slot-sym 0
+                           ,(lower-expr addr-expr))
+          ,@(loop for off from 4 below 16
+                  collect `(whistler::store whistler::u8 ,slot-sym ,off 0))
+          (whistler::store whistler::u8 ,slot-sym 16 2)))
+      ;; Runtime family — emit a branch. Both arms assume ADDR-EXPR
+      ;; lowers to a pointer to up to 16 bytes (the v6 max); the
+      ;; v4 arm probes only the low 4 and zero-pads the rest.
       (t
-       (unsupported "ntop() with non-literal family — only AF_INET/AF_INET6")))))
+       (let ((fam (gensym "FAM")))
+         `(let ((,fam ,(lower-expr (first ntop-args))))
+            (if (whistler::= ,fam 2)
+                (progn
+                  (whistler::probe-read-kernel
+                   ,slot-sym 4 ,(lower-chain-as-ptr addr-expr))
+                  ,@(loop for off from 4 below 16
+                          collect `(whistler::store whistler::u8 ,slot-sym ,off 0)))
+                (whistler::probe-read-kernel
+                 ,slot-sym 16 ,(lower-chain-as-ptr addr-expr)))
+            (whistler::store whistler::u8 ,slot-sym 16 ,fam)))))))
 
 (defun lower-map-assign (mref op rhs)
   (let* ((info (or (gethash (or (getf (cdr mref) :name) "@") *map-table*)
@@ -3030,21 +3091,26 @@
     ;; runtime can parse it back when wiring up the perf timer.
     (:interval   (values :kprobe (format nil "interval/period_~D"
                                          (interval-period-ns spec))))
-    ;; profile:hz:N attaches to a freq-mode PERF_TYPE_SOFTWARE event
-    ;; per-CPU at N samples/sec. Section encodes the frequency in Hz.
-    (:profile    (values :kprobe (format nil "profile/freq_~D"
-                                         (profile-freq-hz spec))))))
+    ;; profile:hz:N → freq mode (N samples/sec/CPU); profile:s/ms/us:N
+    ;; → period mode (one sample every N units/CPU). The unit is
+    ;; encoded in the section name so the runtime can pick the right
+    ;; perf-event attach call.
+    (:profile    (values :kprobe (profile-section-name spec)))))
 
-(defun profile-freq-hz (spec)
-  "Convert a :profile probe spec to a frequency in hertz. Phase 4
-   only supports `profile:hz:N'; other units don't really make sense
-   for sampling (would need period mode)."
+(defun profile-section-name (spec)
+  "Encode a :profile probe spec into a section name. `profile:hz:N'
+   uses freq mode and lands as `profile/freq_N'; `profile:s:N',
+   `profile:ms:N', `profile:us:N' use period mode and land as
+   `profile/period_NS' where NS is the period in nanoseconds."
   (let ((unit  (getf (cdr spec) :unit))
         (count (getf (cdr spec) :count)))
-    (unless (eq unit :hz)
-      (unsupported "profile:~A:~D — Phase 4 supports profile:hz:N only"
-                   unit count))
-    count))
+    (case unit
+      (:hz (format nil "profile/freq_~D" count))
+      (:s  (format nil "profile/period_~D" (* count 1000000000)))
+      (:ms (format nil "profile/period_~D" (* count 1000000)))
+      (:us (format nil "profile/period_~D" (* count 1000)))
+      (t   (unsupported "profile:~A:~D — unit must be hz, s, ms, or us"
+                        unit count)))))
 
 (defvar *test-run-counter* 0
   "Per-generate() counter used to keep BEGIN/END section names unique.")
@@ -3119,6 +3185,18 @@
                       :lhs (walk (getf (cdr f) :lhs))
                       :op  (getf (cdr f) :op)
                       :rhs (rewrite-leaf (getf (cdr f) :rhs))))
+               ;; $v = func/probe — rewrite RHS to a :str literal so
+               ;; the var ends up holding the per-probe section name
+               ;; in its pre-allocated buffer. infer-str-vars already
+               ;; reserved the buffer; lower-assign's :str-into-var
+               ;; branch handles the actual byte-stores.
+               ((and (eq (first f) :assign)
+                     (let ((lhs (getf (cdr f) :lhs)))
+                       (and (consp lhs) (eq (first lhs) :var))))
+                (list :assign
+                      :lhs (walk (getf (cdr f) :lhs))
+                      :op  (getf (cdr f) :op)
+                      :rhs (rewrite-leaf (getf (cdr f) :rhs))))
                (t (cons (walk (first f)) (walk (rest f)))))))
     (walk form)))
 
@@ -3141,6 +3219,52 @@
                  (:for    (mapc #'walk (getf (cdr s) :body))))))
       (mapc #'walk stmts))
     acc))
+
+(defun fold-getopt-expr (expr)
+  "If EXPR is `(:call :name \"getopt\" :args ((:str NAME) DEFAULT …))'
+   resolve it against *named-params*. With a :str DEFAULT, returns a
+   :str literal (override or default). With :int / :constant defaults
+   we leave the call alone — those are handled by lower-call's
+   integer/bool path. Returns EXPR unchanged when no fold applies."
+  (cond
+    ((not (and (consp expr) (eq (first expr) :call)
+               (stringp (getf (cdr expr) :name))
+               (string= (getf (cdr expr) :name) "getopt")))
+     expr)
+    (t
+     (let* ((args     (getf (cdr expr) :args))
+            (opt-name (and (consp (first args))
+                           (eq (first (first args)) :str)
+                           (second (first args))))
+            (default  (second args))
+            (provided (and opt-name *named-params*
+                           (assoc opt-name *named-params* :test #'string=))))
+       (cond
+         ;; Only fold when the default is a :str literal.
+         ((not (and (consp default) (eq (first default) :str))) expr)
+         ;; CLI override present → emit the user's value as :str.
+         (provided `(:str ,(cdr provided)))
+         ;; No override → resolve to the literal default.
+         (t default))))))
+
+(defun fold-getopt (form)
+  "Walk FORM recursively, replacing eligible getopt(NAME, DEFAULT)
+   calls with their resolved :str literals."
+  (cond
+    ((not (consp form)) form)
+    (t
+     (let ((folded (fold-getopt-expr form)))
+       (if (eq folded form)
+           (cons (fold-getopt (first form)) (fold-getopt (rest form)))
+           folded)))))
+
+(defun fold-getopt-script (script)
+  "Apply fold-getopt to every probe / macro / function body so the
+   resolved :str literals reach infer-* and rewrite-self-refs."
+  (cons (first script)
+        (mapcar (lambda (form)
+                  (if (consp form) (fold-getopt form) form))
+                (rest script))))
 
 (defun expand-tuple-vars-script (script)
   "Apply expand-tuple-vars per top-form (probes AND user macros/fns).
@@ -3285,19 +3409,39 @@
       (mapc #'walk-and-recurse stmts))))
 
 (defun infer-str-vars (stmts)
-  "Return an alist (VAR-NAME . SIZE) of $vars assigned from a
-   `str(…)' / `kstr(…)' call. SIZE is the explicit second arg if
-   present, otherwise +bt-str-default-len+. Scans into user-fn /
-   macro bodies via walk-stmts-with-macros so $vars defined inside
-   a called macro get sized at probe scope before lowering."
+  "Return an alist (VAR-NAME . SIZE) of $vars assigned from a string-
+   typed RHS: `str(ptr [,n])', `kstr(ptr [,n])', `func', or
+   `probe'. SIZE picks the right buffer width: str()'s explicit
+   second arg (or +bt-str-default-len+), or +bt-func-name-key-len+
+   for func / probe. Scans into user-fn / macro bodies via
+   walk-stmts-with-macros so $vars defined inside a called macro
+   get sized at probe scope before lowering."
   (let ((acc nil))
     (flet ((maybe-record (s)
              (when (eq (first s) :assign)
                (let* ((lhs (getf (cdr s) :lhs))
                       (rhs (getf (cdr s) :rhs))
-                      (sz  (when (and (consp rhs) (eq (first rhs) :call)
-                                      (or (str-call-p rhs) (kstr-call-p rhs)))
-                             (str-key-size rhs))))
+                      (sz (cond
+                            ((and (consp rhs) (eq (first rhs) :call)
+                                  (or (str-call-p rhs) (kstr-call-p rhs)))
+                             (str-key-size rhs))
+                            ;; `$v = func' / `$v = probe' — fold the
+                            ;; per-probe name into a fixed-width slot.
+                            ;; rewrite-self-refs will later convert the
+                            ;; RHS to a :str literal that hits
+                            ;; lower-assign's :str-into-var branch.
+                            ((and (consp rhs)
+                                  (or (eq (first rhs) :func)
+                                      (eq (first rhs) :probe-name)))
+                             +bt-func-name-key-len+)
+                            ;; `$v = "literal"' — produced by
+                            ;; fold-getopt when the default is a :str.
+                            ;; Size to the bigger of the literal width
+                            ;; or the default str() length so longer
+                            ;; CLI overrides also fit.
+                            ((and (consp rhs) (eq (first rhs) :str))
+                             (max +bt-str-default-len+
+                                  (1+ (length (second rhs))))))))
                  (when (and sz (consp lhs) (eq (first lhs) :var))
                    (let ((entry (assoc (second lhs) acc :test #'string=)))
                      (if entry
@@ -3749,6 +3893,12 @@
      :print-map     symbol of the hidden bt-print ringbuf, if printf() is used
      :printf-table  ((id fmt-string nargs) …) for ringbuf-record decoding"
   (let* ((*tp-field-sizes* (load-tracepoint-field-sizes script))
+         ;; Honor `config = { max_strlen = N }' for the duration of
+         ;; this generate(). Reverts when the let* unwinds.
+         (+bt-str-default-len+
+           (let ((pair (assoc "max_strlen" *script-config* :test #'string=)))
+             (or (and pair (parse-integer (cdr pair) :junk-allowed t))
+                 +bt-str-default-len+)))
          (*test-run-counter* 0)
          (*printf-table* nil)
          (*printf-id-counter* 0)
@@ -3756,6 +3906,12 @@
          (*cat-paths-table* nil)
          (*map-id-table* nil)
          (*max-scratch-bytes* 0)
+         ;; Resolve getopt(name, string-default) calls against
+         ;; *named-params* BEFORE tuple expansion / map inference so
+         ;; the resulting :str literals flow through the regular
+         ;; rewrite-self-refs + lower-assign paths just like any
+         ;; other string literal.
+         (script    (fold-getopt-script script))
          ;; Expand tuple-var references BEFORE infer-maps so the map's
          ;; key-size lands at the composite total, not at 8 (the size
          ;; of the var alias). expand-tuple-vars-script rewrites
