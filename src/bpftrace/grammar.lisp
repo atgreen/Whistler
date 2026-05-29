@@ -377,9 +377,13 @@
      resolved via the curated table. The `sizeof-struct' /
      `sizeof-type' alternatives let the AST normalizer dispatch on
      which one matched. *)
-  sizeof-expr    = <'sizeof'> <ws> <'('> <ws> (sizeof-struct / sizeof-type) <ws> <')'>
+  sizeof-expr    = <'sizeof'> <ws> <'('> <ws> (sizeof-struct / sizeof-type / sizeof-value) <ws> <')'>
   sizeof-struct  = <'struct'> <ws> ident
-  sizeof-type    = ident
+  sizeof-type    = ident !ident-char
+  (* sizeof(EXPR) — bpftrace accepts arbitrary expressions inside
+     sizeof. Everything is u64 in our IR, so the result is just 8.
+     The sub-expression isn't evaluated; we fold to a constant. *)
+  sizeof-value   = expr
   (* `(e1, e2, …)' — bpftrace tuple literal. Always 2+ elements so
      it doesn't conflict with the parenthesised single expression
      form. Components must be simple (pure) — biosnoop uses them as

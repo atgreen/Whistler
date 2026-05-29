@@ -779,13 +779,17 @@
          (list :offsetof :struct (first idents) :field (second idents))))
       (:sizeof-expr
        ;; Grammar wraps the inner alternative as either :sizeof-struct
-       ;; (with the `struct' keyword consumed) or :sizeof-type. The
-       ;; ident lives one level deeper either way.
-       (let* ((sub  (or (first-tagged inner :sizeof-struct)
-                        (first-tagged inner :sizeof-type)))
-              (ident (and sub (text-of (first-tagged sub :ident)))))
-         (list :sizeof :name ident
-               :struct-p (and sub (eq (tag-of sub) :sizeof-struct)))))
+       ;; (with the `struct' keyword consumed), :sizeof-type, or
+       ;; :sizeof-value (any expression). For the value form we
+       ;; fold to 8 (all values are u64 in our IR) at AST time.
+       (let* ((value-node (first-tagged inner :sizeof-value)))
+         (if value-node
+             (list :int 8)
+             (let* ((sub  (or (first-tagged inner :sizeof-struct)
+                              (first-tagged inner :sizeof-type)))
+                    (ident (and sub (text-of (first-tagged sub :ident)))))
+               (list :sizeof :name ident
+                     :struct-p (and sub (eq (tag-of sub) :sizeof-struct)))))))
       (:hex-int      (list :int (parse-integer (text-of inner) :start 2 :radix 16)))
       (:integer      (list :int (parse-integer-with-exp (text-of inner))))
       (:duration-literal
