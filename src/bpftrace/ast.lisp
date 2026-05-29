@@ -199,7 +199,7 @@
                                 (* align (ceiling offset align))))
                  (slot-size (* base-size (or arr-len 1))))
             (push (list (text-of ident-node)
-                        base-size aligned arr-len type-str)
+                        base-size aligned arr-len type-str arr-dims)
                   fields)
             (setf offset (+ aligned slot-size))
             (setf max-align (max max-align align))))))

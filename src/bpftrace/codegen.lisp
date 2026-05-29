@@ -3423,6 +3423,12 @@
            `(whistler::load ,type-sym
                             ,(lower-map-value-ptr base)
                             (whistler::* ,(lower-expr idx) ,sz))))
+        ;; `$a.field[i][j]…' — multi-dim index chain on an in-script
+        ;; struct array field. Walk the chain, multiply each index
+        ;; by the inner-dim stride, then probe-read ELT-SIZE bytes at
+        ;; struct+field-off+sum.
+        ((multi-dim-array-subscript-p expr)
+         (lower-multi-dim-array-subscript expr))
         ;; `$a.field[i]' or `(struct X *)e.field[i]' — element access
         ;; on an array field of an in-script struct. The struct
         ;; pointer + field offset + i * sizeof(elt) gives the address;
@@ -3440,6 +3446,25 @@
            (lower-ptr-index `(whistler::+ ,ptr-form ,field-off)
                             (lower-expr idx) elt-size)))
         (t (unsupported "array indexing outside @maps"))))))
+
+(defun array-field-dims (field-expr)
+  "Return the parsed dim-list (e.g. (2 2) for `int y[2][2]') of an
+   in-script-struct array field, or NIL if FIELD-EXPR isn't one."
+  (unless (and (consp field-expr) (eq (first field-expr) :field))
+    (return-from array-field-dims nil))
+  (let* ((base (getf (cdr field-expr) :base))
+         (name (getf (cdr field-expr) :name))
+         (struct-name
+           (cond
+             ((and (consp base) (eq (first base) :var))
+              (cdr (assoc (second base) *var-types* :test #'string=)))
+             ((and (consp base) (eq (first base) :cast))
+              (getf (cdr base) :type)))))
+    (when struct-name
+      (let* ((entry (assoc struct-name *script-struct-decls* :test #'string=))
+             (cell  (and entry (find name (cddr entry)
+                                     :test #'string= :key #'first))))
+        (and cell (sixth cell))))))
 
 (defun array-field-meta (field-expr)
   "Pure-AST lookup of array-field metadata: returns (values BASE-AST
@@ -3477,6 +3502,65 @@
   (multiple-value-bind (base elt-size offset arr-len)
       (array-field-meta field-expr)
     (when base (values (lower-expr base) elt-size offset arr-len))))
+
+(defun walk-index-chain (expr)
+  "Walk a chain of nested `:index' ASTs to find the underlying root.
+   Returns (values ROOT-EXPR KEY-LIST-IN-SOURCE-ORDER) — for
+   `field[a][b]', KEY-LIST is `(a b)'. The traversal descends
+   outer-to-inner (`[b]'-first), pushing each key onto a list head;
+   the resulting list is already in source order."
+  (let (keys)
+    (labels ((walk (e)
+               (cond
+                 ((and (consp e) (eq (first e) :index))
+                  (let ((sub-keys (getf (cdr e) :keys)))
+                    (when sub-keys
+                      (push (first sub-keys) keys)))
+                  (walk (getf (cdr e) :base)))
+                 (t e))))
+      (let ((root (walk expr)))
+        (values root keys)))))
+
+(defun multi-dim-array-subscript-p (expr)
+  "T when EXPR is `field[i][j]…' with EXACTLY as many subscripts as
+   the field's declared dims (so the result is a single element).
+   Returns NIL if the chain is partial — leave those to the simpler
+   single-subscript rule."
+  (multiple-value-bind (root keys) (walk-index-chain expr)
+    (and (consp root) (eq (first root) :field)
+         (let ((dims (array-field-dims root)))
+           (and dims (= (length dims) (length keys)) (> (length dims) 1))))))
+
+(defun lower-multi-dim-array-subscript (expr)
+  "Lower `field[i1][i2]…' to a sized probe-read at
+   struct+field-off + sum(ik * stride_k). Strides come from the
+   field's recorded dim list."
+  (multiple-value-bind (root keys) (walk-index-chain expr)
+    (multiple-value-bind (base-ast elt-size field-off _len)
+        (array-field-meta root)
+      (declare (ignore _len))
+      (let* ((dims (array-field-dims root))
+             ;; Stride for dim k = elt-size × product(dims[k+1..]).
+             (strides (loop for i below (length dims)
+                            collect (* elt-size
+                                       (apply #'* (subseq dims (1+ i))))))
+             (offset-form
+               (reduce (lambda (acc pair)
+                         `(whistler::+ ,acc
+                            (whistler::* ,(first pair) ,(second pair))))
+                       (mapcar #'list (mapcar #'lower-expr keys) strides)
+                       :initial-value field-off))
+             (scratch (gensym "MDIDX"))
+             (helper (pick-probe-read-fn))
+             (type-sym (case elt-size
+                         (1 (intern "U8"  :whistler))
+                         (2 (intern "U16" :whistler))
+                         (4 (intern "U32" :whistler))
+                         (8 (intern "U64" :whistler)))))
+        `(let ((,scratch (whistler::struct-alloc ,elt-size)))
+           (,helper ,scratch ,elt-size
+                    (whistler::+ ,(lower-expr base-ast) ,offset-form))
+           (whistler::load ,type-sym ,scratch 0))))))
 
 (defun lower-ptr-index (ptr-form idx-form elt-size)
   "Emit a typed-pointer subscript read: probe-read ELT-SIZE bytes at
