@@ -371,9 +371,10 @@
                         ((string= fn "count")
                          (setf (minfo-kind info) :counter))
                         ((string= fn "hist")
-                         (setf (minfo-kind info) :hist
-                               (minfo-key-size info) 4
-                               (minfo-max-entries info) 64))
+                         ;; Don't touch key-size / max-entries — the
+                         ;; later hist-sizing loop overwrites them
+                         ;; once it knows whether the map is keyed.
+                         (setf (minfo-kind info) :hist))
                         ((string= fn "lhist")
                          (let* ((args (getf (cdr rhs) :args))
                                 (literal (lambda (n)
@@ -381,15 +382,12 @@
                                              (cond
                                                ((and a (eq (first a) :int)) (second a))
                                                (t (unsupported
-                                                   "lhist() requires literal min/max/step (got ~S)" a))))))
-                                (lo  (funcall literal 1))
-                                (hi  (funcall literal 2))
-                                (st  (funcall literal 3))
-                                (n   (max 1 (floor (- hi lo) st))))
+                                                   "lhist() requires literal min/max/step (got ~S)" a)))))))
                            (setf (minfo-kind info) :lhist
-                                 (minfo-key-size info) 4
-                                 (minfo-max-entries info) (+ n 2)
-                                 (minfo-hist-params info) (list lo hi st))))
+                                 (minfo-hist-params info)
+                                 (list (funcall literal 1)
+                                       (funcall literal 2)
+                                       (funcall literal 3)))))
                         ((string= fn "sum")
                          (setf (minfo-kind info) :sum))
                         ((string= fn "min")
@@ -456,23 +454,57 @@
         ;; lower time, after this pass.
         (dolist (defn (script-functions script))
           (mapc #'scan-stmt (getf (cdr defn) :body))))
-      ;; Histogram maps with no explicit user key always have 4-byte key.
+      ;; Histogram maps: the bucket index is always a u32 slot.
+      ;;   * Non-keyed (`@m = hist(x)') uses a percpu-array keyed by
+      ;;     bucket only — key-size = 4, max-entries = 64 (log2) or
+      ;;     N+2 (lhist).
+      ;;   * Keyed (`@m[k] = hist(x)') uses a percpu-hash whose key
+      ;;     is the user-key bytes followed by a u32 bucket — that's
+      ;;     the user-key-size we already computed + 4. max-entries
+      ;;     scales to fit many user-keys; we pick a generous default.
       (loop for info being the hash-values of table
             when (or (eq (minfo-kind info) :hist)
                      (eq (minfo-kind info) :lhist))
-              do (setf (minfo-key-size info) 4))
+              do (let ((bucket-count
+                         (if (eq (minfo-kind info) :hist)
+                             64
+                             (let* ((params (minfo-hist-params info)))
+                               (+ 2 (max 1 (floor (- (second params)
+                                                     (first params))
+                                                  (third params))))))))
+                   (cond
+                     ((minfo-keyed-p info)
+                      ;; Compound key = user-key bytes + u32 bucket.
+                      ;; max-entries is bucket-count × an arbitrary
+                      ;; user-key cap (1024 distinct keys).
+                      (setf (minfo-key-size info)
+                            (+ (minfo-key-size info) 4)
+                            (minfo-max-entries info)
+                            (* bucket-count 1024)))
+                     (t
+                      (setf (minfo-key-size info) 4
+                            (minfo-max-entries info) bucket-count)))))
       table)))
 
 ;;; ========== Defmap forms ==========
 
 (defun gen-defmap (info)
-  (let ((mtype (case (minfo-kind info)
-                 ((:hist :lhist)           :percpu-array)
-                 ;; sum/min/max/avg use percpu-hash so concurrent
-                 ;; updates from different CPUs don't race (no atomics
-                 ;; needed; userspace reduces across CPUs at print time).
-                 ((:sum :avg :stats :min :max) :percpu-hash)
-                 (t                        :hash))))
+  (let* ((kind (minfo-kind info))
+         (mtype (cond
+                  ;; Keyed hist/lhist needs a hash map — different
+                  ;; user-keys cohabit a single map, distinguished by
+                  ;; the user-key bytes in front of the bucket index.
+                  ((and (or (eq kind :hist) (eq kind :lhist))
+                        (minfo-keyed-p info))
+                   :percpu-hash)
+                  ;; Non-keyed hist/lhist stays the pre-allocated
+                  ;; percpu-array indexed by bucket.
+                  ((or (eq kind :hist) (eq kind :lhist)) :percpu-array)
+                  ;; sum/min/max/avg use percpu-hash so concurrent
+                  ;; updates from different CPUs don't race (no atomics
+                  ;; needed; userspace reduces across CPUs at print time).
+                  ((member kind '(:sum :avg :stats :min :max)) :percpu-hash)
+                  (t :hash))))
     `(whistler:defmap ,(minfo-name info)
        :type ,mtype
        :key-size ,(cond ((eq mtype :percpu-array) 4)
@@ -2707,19 +2739,17 @@
             (gen-avg-update mname keys
                             (lower-expr (first (getf (cdr rhs) :args)))))
            ((string= fn "hist")
-            (when (rest keys)
-              (unsupported "@m[k1,…] = hist(x) — per-key histograms not yet supported"))
-            (gen-hist-update mname (lower-expr (first (getf (cdr rhs) :args)))))
+            (gen-hist-update mname keys
+                             (lower-expr (first (getf (cdr rhs) :args)))
+                             info))
            ((string= fn "lhist")
-            (when (rest keys)
-              (unsupported "@m[k1,…] = lhist(x,…) — per-key lhist not yet supported"))
             (let* ((args (getf (cdr rhs) :args))
                    (value-form (lower-expr (first args)))
                    (params (minfo-hist-params info)))
               (unless params
                 (unsupported "internal: lhist info missing params"))
               (destructuring-bind (lo hi step) params
-                (gen-lhist-update mname value-form lo hi step))))
+                (gen-lhist-update mname keys value-form lo hi step info))))
            ;; `@m[k] = ntop(…)' — value slot stores 17 bytes
            ;; (family + address). See gen-ntop-set for the layout.
            ((and (string= fn "ntop") (minfo-value-ntop-p info))
@@ -2963,34 +2993,100 @@
         (:+= `(whistler:incf (whistler:getmap ,mname ,k) ,value))
         (:-= `(whistler:decf (whistler:getmap ,mname ,k) ,value))))))
 
-(defun gen-hist-update (mname value-form)
+(defun gen-hist-update (mname keys value-form &optional info)
+  "log2 histogram update. KEYS is the surface key list — empty for
+   non-keyed (the original percpu-array-indexed-by-bucket form), or
+   one user-key for the new compound-key percpu-hash form."
   (let ((val  (gensym "V"))
         (slot (gensym "S"))
         (p    (gensym "P")))
-    `(let* ((,val ,value-form)
-                    (,slot (whistler::log2 ,val)))
-       (when (whistler::>= ,slot 64) (setf ,slot 63))
-       (whistler:when-let ((,p (whistler::map-lookup ,mname ,slot)))
-         (whistler::atomic-add ,p 0 1)))))
+    (cond
+      ;; Non-keyed: original percpu-array path.
+      ((null keys)
+       `(let* ((,val ,value-form)
+               (,slot (whistler::log2 ,val)))
+          (when (whistler::>= ,slot 64) (setf ,slot 63))
+          (whistler:when-let ((,p (whistler::map-lookup ,mname ,slot)))
+            (whistler::atomic-add ,p 0 1))))
+      ((= 1 (length keys))
+       (gen-hist-update-keyed mname info keys value-form :log2))
+      (t
+       (unsupported "@m[k1, k2, …] = hist(x) — composite user-keys not yet supported")))))
 
-(defun gen-lhist-update (mname value-form lo hi step)
-  "Linear histogram update. Buckets:
-     0          → underflow (value < LO)
-     1..N       → [LO + (i-1)*STEP, LO + i*STEP)
-     N+1        → overflow  (value >= HI)
+(defun gen-lhist-update (mname keys value-form lo hi step &optional info)
+  "Linear histogram update. KEYS shape mirrors gen-hist-update.
+   Buckets:
+     0      → underflow (value < LO)
+     1..N   → [LO + (i-1)*STEP, LO + i*STEP)
+     N+1    → overflow  (value >= HI)
    where N = (HI - LO) / STEP."
   (let* ((n    (max 1 (floor (- hi lo) step)))
          (over (+ n 1))
          (val  (gensym "V"))
          (slot (gensym "S"))
-         (p    (gensym "P")))
+         (p    (gensym "P"))
+         (bucket-form `(cond
+                         ((whistler::< ,val ,lo) 0)
+                         ((whistler::>= ,val ,hi) ,over)
+                         (t (whistler::+ 1
+                                         (whistler::/ (whistler::- ,val ,lo)
+                                                      ,step))))))
+    (cond
+      ((null keys)
+       `(let* ((,val ,value-form)
+               (,slot ,bucket-form))
+          (whistler:when-let ((,p (whistler::map-lookup ,mname ,slot)))
+            (whistler::atomic-add ,p 0 1))))
+      ((= 1 (length keys))
+       (gen-hist-update-keyed mname info keys value-form
+                              (list :linear lo hi step over)))
+      (t
+       (unsupported "@m[k1, k2, …] = lhist(x,…) — composite user-keys not yet supported")))))
+
+(defun gen-hist-update-keyed (mname info keys value-form mode)
+  "Emit a keyed hist/lhist update. The map is a percpu-hash whose
+   key is USER-KEY-BYTES followed by a u32 bucket index. MODE is
+   either :log2 (the hist() shape) or (:linear LO HI STEP OVER)
+   for lhist(). incf-map's struct-key-map-p path handles the
+   create-if-missing semantics for us."
+  (let* ((user-key (first keys))
+         (user-key-size (or (and info (- (minfo-key-size info) 4))
+                            (expr-size user-key)))
+         (total (+ user-key-size 4))
+         (val   (gensym "V"))
+         (slot  (gensym "S"))
+         (kbuf  (gensym "KBUF"))
+         (bucket
+           (ecase (if (consp mode) (first mode) mode)
+             (:log2
+              `(let ((,slot (whistler::log2 ,val)))
+                 (when (whistler::>= ,slot 64) (setf ,slot 63))
+                 ,slot))
+             (:linear
+              (destructuring-bind (lo hi step over) (rest mode)
+                `(cond
+                   ((whistler::< ,val ,lo) 0)
+                   ((whistler::>= ,val ,hi) ,over)
+                   (t (whistler::+ 1
+                                   (whistler::/ (whistler::- ,val ,lo)
+                                                ,step)))))))))
     `(let* ((,val ,value-form)
-            (,slot (cond
-                     ((whistler::< ,val ,lo) 0)
-                     ((whistler::>= ,val ,hi) ,over)
-                     (t (whistler::+ 1 (whistler::/ (whistler::- ,val ,lo) ,step))))))
-       (whistler:when-let ((,p (whistler::map-lookup ,mname ,slot)))
-         (whistler::atomic-add ,p 0 1)))))
+            (,slot ,bucket)
+            (,kbuf (whistler::struct-alloc ,total)))
+       ,(emit-key-bytes kbuf 0 user-key user-key-size)
+       (whistler::store whistler::u32 ,kbuf ,user-key-size ,slot)
+       (whistler:incf-map ,mname ,kbuf))))
+
+(defun emit-key-bytes (buf offset key-expr key-size)
+  "Emit stores that copy KEY-EXPR's bytes into BUF starting at OFFSET.
+   For comm/str/composite-shaped keys we'd need a byte-copy; for the
+   single-key hist case we currently support only scalar u64-ish keys."
+  (let ((store-type (case key-size
+                      (1 (intern "U8"  :whistler))
+                      (2 (intern "U16" :whistler))
+                      (4 (intern "U32" :whistler))
+                      (t (intern "U64" :whistler)))))
+    `(whistler::store ,store-type ,buf ,offset ,(lower-expr key-expr))))
 
 (defun lower-incdec (stmt)
   (let* ((lhs   (getf (cdr stmt) :lhs))

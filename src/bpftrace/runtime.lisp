@@ -508,22 +508,94 @@
                (si-number (ash 1 (1- i)))
                (si-number (ash 1 i))))))
 
-(defun print-hist (label info)
-  "Render a log2 histogram (percpu-array of u64, 64 buckets), bpftrace style."
-  (let* ((buckets (loop for i below 64
-                        collect (lookup-percpu-sum info i)))
-         (last    (or (position-if-not #'zerop buckets :from-end t) -1))
-         (maxc    (or (reduce #'max buckets) 0)))
-    (format t "~%@~A:~%" label)
-    (when (minusp last)
-      (format t "    (no samples)~%")
-      (return-from print-hist))
-    (loop for i from 0 to last
-          for count = (nth i buckets)
-          do (format t "~16A ~10D |~A|~%"
-                     (hist-bucket-label i)
-                     count
-                     (render-bar count maxc 52)))))
+(defun keyed-hist-info (info-rec)
+  "If INFO-REC is a keyed hist/lhist map, return a plist with
+   :user-key-size / :key-builtin / :key-parts. NIL otherwise.
+   user-key-size = map's key-size minus the trailing 4-byte bucket
+   index that gen-hist-update-keyed appends."
+  (when (getf (cdr info-rec) :keyed-p)
+    (let ((ks (getf (cdr info-rec) :key-size)))
+      (when (and ks (> ks 4))
+        (list :user-key-size (- ks 4)
+              :key-builtin (getf (cdr info-rec) :key-builtin)
+              :key-parts (getf (cdr info-rec) :key-parts))))))
+
+(defun print-hist (label info &key keyed-info)
+  "Render a log2 histogram. Non-keyed maps are a percpu-array of u64,
+   64 buckets. KEYED-INFO non-NIL means the map is a percpu-hash whose
+   key is USER-KEY-BYTES followed by a u32 bucket — group by user-key
+   and render one bpftrace-style histogram per group."
+  (cond
+    (keyed-info (print-hist-keyed label info keyed-info))
+    (t
+     (let* ((buckets (loop for i below 64
+                           collect (lookup-percpu-sum info i)))
+            (last    (or (position-if-not #'zerop buckets :from-end t) -1))
+            (maxc    (or (reduce #'max buckets) 0)))
+       (format t "~%@~A:~%" label)
+       (when (minusp last)
+         (format t "    (no samples)~%")
+         (return-from print-hist))
+       (loop for i from 0 to last
+             for count = (nth i buckets)
+             do (format t "~16A ~10D |~A|~%"
+                        (hist-bucket-label i)
+                        count
+                        (render-bar count maxc 52)))))))
+
+(defun split-keyed-bucket (compound-key user-key-size)
+  "Split a keyed-hist map key (integer) into (user-key . bucket-index).
+   COMPOUND-KEY is interpreted as USER-KEY-SIZE little-endian bytes
+   followed by a u32 bucket index."
+  (let ((user-mask (1- (ash 1 (* 8 user-key-size)))))
+    (cons (logand compound-key user-mask)
+          (logand (ash compound-key (* -8 user-key-size)) #xffffffff))))
+
+(defun group-keyed-buckets (info user-key-size bucket-count)
+  "Walk a keyed-hist map and return a hash-table USER-KEY → vector of
+   per-bucket counts (BUCKET-COUNT entries). User-keys are summed
+   across CPUs."
+  (let ((groups (make-hash-table)))
+    (dolist (k (map-keys info))
+      (let* ((pair (split-keyed-bucket k user-key-size))
+             (uk   (car pair))
+             (bkt  (cdr pair))
+             (vec  (or (gethash uk groups)
+                       (setf (gethash uk groups)
+                             (make-array bucket-count :initial-element 0)))))
+        (when (< bkt bucket-count)
+          (incf (aref vec bkt) (lookup-percpu-sum info k)))))
+    groups))
+
+(defun print-hist-keyed (label info keyed-info)
+  "Per-user-key log2 histograms. KEYED-INFO is a plist
+   (:user-key-size N :key-builtin … :key-parts …) supplied by
+   decode-print-map-record."
+  (let* ((user-key-size (getf keyed-info :user-key-size))
+         (key-builtin   (getf keyed-info :key-builtin))
+         (key-parts     (or (getf keyed-info :key-parts) 1))
+         (groups        (group-keyed-buckets info user-key-size 64)))
+    (when (zerop (hash-table-count groups))
+      (format t "~%@~A: (no samples)~%" label)
+      (return-from print-hist-keyed))
+    (loop for uk being the hash-keys of groups
+            using (hash-value buckets)
+          for vector-list = (coerce buckets 'list)
+          for last = (or (position-if-not #'zerop vector-list :from-end t) -1)
+          for maxc = (or (reduce #'max vector-list) 0)
+          do (format t "~%@~A[~A]:~%"
+                     label
+                     (format-key uk
+                                 :parts key-parts
+                                 :key-builtin key-builtin))
+             (when (minusp last)
+               (format t "    (no samples)~%"))
+             (loop for i from 0 to last
+                   for count = (nth i vector-list)
+                   do (format t "~16A ~10D |~A|~%"
+                              (hist-bucket-label i)
+                              count
+                              (render-bar count maxc 52))))))
 
 (defun lhist-bucket-label (i lo hi step)
   "Bucket labels for a linear histogram. i=0 is underflow, i=N+1 is
@@ -535,28 +607,64 @@
       (t                 (format nil "[~D, ~D)" (+ lo (* (- i 1) step))
                                                 (+ lo (* i step)))))))
 
-(defun print-lhist (label info params)
-  "Render a linear histogram. PARAMS is (lo hi step) captured at codegen."
+(defun print-lhist (label info params &key keyed-info)
+  "Render a linear histogram. PARAMS is (lo hi step) captured at codegen.
+   KEYED-INFO non-NIL routes to print-lhist-keyed for the per-user-key
+   percpu-hash form."
   (unless params
     (format t "~%@~A: <missing lhist params>~%" label)
     (return-from print-lhist))
+  (cond
+    (keyed-info (print-lhist-keyed label info params keyed-info))
+    (t
+     (destructuring-bind (lo hi step) params
+       (let* ((n       (max 1 (floor (- hi lo) step)))
+              (total   (+ n 2))
+              (buckets (loop for i below total
+                             collect (lookup-percpu-sum info i)))
+              (last    (or (position-if-not #'zerop buckets :from-end t) -1))
+              (maxc    (or (reduce #'max buckets) 0)))
+         (format t "~%@~A:~%" label)
+         (when (minusp last)
+           (format t "    (no samples)~%")
+           (return-from print-lhist))
+         (loop for i from 0 to last
+               for count = (nth i buckets)
+               do (format t "~20A ~10D |~A|~%"
+                          (lhist-bucket-label i lo hi step)
+                          count
+                          (render-bar count maxc 52))))))))
+
+(defun print-lhist-keyed (label info params keyed-info)
+  "Per-user-key linear histograms."
   (destructuring-bind (lo hi step) params
-    (let* ((n       (max 1 (floor (- hi lo) step)))
-           (total   (+ n 2))
-           (buckets (loop for i below total
-                          collect (lookup-percpu-sum info i)))
-           (last    (or (position-if-not #'zerop buckets :from-end t) -1))
-           (maxc    (or (reduce #'max buckets) 0)))
-      (format t "~%@~A:~%" label)
-      (when (minusp last)
-        (format t "    (no samples)~%")
-        (return-from print-lhist))
-      (loop for i from 0 to last
-            for count = (nth i buckets)
-            do (format t "~20A ~10D |~A|~%"
-                       (lhist-bucket-label i lo hi step)
-                       count
-                       (render-bar count maxc 52))))))
+    (let* ((n             (max 1 (floor (- hi lo) step)))
+           (total         (+ n 2))
+           (user-key-size (getf keyed-info :user-key-size))
+           (key-builtin   (getf keyed-info :key-builtin))
+           (key-parts     (or (getf keyed-info :key-parts) 1))
+           (groups        (group-keyed-buckets info user-key-size total)))
+      (when (zerop (hash-table-count groups))
+        (format t "~%@~A: (no samples)~%" label)
+        (return-from print-lhist-keyed))
+      (loop for uk being the hash-keys of groups
+              using (hash-value buckets)
+            for vector-list = (coerce buckets 'list)
+            for last = (or (position-if-not #'zerop vector-list :from-end t) -1)
+            for maxc = (or (reduce #'max vector-list) 0)
+            do (format t "~%@~A[~A]:~%"
+                       label
+                       (format-key uk
+                                   :parts key-parts
+                                   :key-builtin key-builtin))
+               (when (minusp last)
+                 (format t "    (no samples)~%"))
+               (loop for i from 0 to last
+                     for count = (nth i vector-list)
+                     do (format t "~20A ~10D |~A|~%"
+                                (lhist-bucket-label i lo hi step)
+                                count
+                                (render-bar count maxc 52)))))))
 
 (defun lookup-percpu-u64s (info key &optional (n-fields 1))
   "For a percpu map, look up KEY and return a list of u64s, one per
@@ -732,9 +840,11 @@
            (mapinfo     (when entry (cdr entry))))
       (when mapinfo
         (case kind
-          (:hist  (print-hist raw-name mapinfo))
+          (:hist  (print-hist raw-name mapinfo
+                              :keyed-info (keyed-hist-info info-rec)))
           (:lhist (print-lhist raw-name mapinfo
-                               (getf (cdr info-rec) :hist-params)))
+                               (getf (cdr info-rec) :hist-params)
+                               :keyed-info (keyed-hist-info info-rec)))
           (t     (print-scalar-map raw-name mapinfo
                                    :key-parts key-parts
                                    :keyed-p (getf (cdr info-rec) :keyed-p)
@@ -1242,9 +1352,11 @@
         (find-map-by-id map-id-table id map-alist info-list)
       (when map-info
         (case (getf (cdr info-rec) :kind)
-          (:hist  (print-hist raw map-info))
+          (:hist  (print-hist raw map-info
+                              :keyed-info (keyed-hist-info info-rec)))
           (:lhist (print-lhist raw map-info
-                               (getf (cdr info-rec) :hist-params)))
+                               (getf (cdr info-rec) :hist-params)
+                               :keyed-info (keyed-hist-info info-rec)))
           (t     (print-scalar-map
                   raw map-info
                   :key-parts (or (getf (cdr info-rec) :key-parts) 1)
