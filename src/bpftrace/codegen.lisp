@@ -200,6 +200,7 @@
      (cond
        ((or (str-call-p expr) (kstr-call-p expr)) (str-key-size expr))
        (t 8)))
+    (:args   (or (bare-args-byte-width) 8))
     (:field
      (let ((name (getf (cdr expr) :name)))
        (cond
@@ -267,6 +268,8 @@
                         ;; ELT-SIZE × ARR-LEN.
                         ((and af-meta (first af-meta))
                          (* (second af-meta) (fourth af-meta)))
+                        ;; Bare `args' under fentry/fexit: param-count × 8.
+                        ((and (eq (first e) :args) (bare-args-byte-width)))
                         (t 8))
            for type = (cond
                         ((eq (first e) :comm) u8)
@@ -275,6 +278,7 @@
                         ((eq (first e) :str) u8)
                         ((or (str-call-p e) (kstr-call-p e)) u8)
                         ((and af-meta (first af-meta)) u8)
+                        ((and (eq (first e) :args) (bare-args-byte-width)) u8)
                         (t u64))
            collect (list offset size type e)
            do (incf offset size))
@@ -295,6 +299,8 @@
                     ((named-call-p expr "signal_name")  :signal-name)
                     (t nil)))
     (t        nil)))
+
+(declaim (special *probe-spec*))
 
 (defun infer-maps (script)
   "Return a hash table RAW-NAME (or \"@\") → MINFO."
@@ -382,6 +388,18 @@
                                   (getf (cdr rhs) :name))))
                       (when (and sname (null (minfo-value-struct info)))
                         (setf (minfo-value-struct info) sname))))
+                   ;; `@m = args' / `@m[k] = args' — value is the raw
+                   ;; concatenated param bytes (fentry/fexit: param-
+                   ;; count × 8). Treat as a wide-byte value: track
+                   ;; the size, mark needs-ptr-ops via wide value-size.
+                   ((and (consp rhs) (eq (first rhs) :args)
+                         (bare-args-byte-width))
+                    (let ((w (bare-args-byte-width)))
+                      (setf (minfo-kind info) :scalar
+                            (minfo-value-array-p info) t
+                            (minfo-value-array-elt-size info) 1
+                            (minfo-value-size info)
+                            (max (minfo-value-size info) w))))
                    ;; `@m[k] = (struct X *)e.arrfield' — array-field
                    ;; flow. Map's value-size becomes total array bytes,
                    ;; mark value-array-p so lower-map-assign dispatches
@@ -544,8 +562,14 @@
                (:for
                 (mapc #'scan-stmt (getf (cdr stmt) :body))))))
         (dolist (probe (script-probes script))
-          (let ((body (getf (cdr probe) :body))
-                (pred (getf (cdr probe) :predicate)))
+          (let* ((body (getf (cdr probe) :body))
+                 (pred (getf (cdr probe) :predicate))
+                 ;; The probe's first spec determines the args layout
+                 ;; for any `args' use inside the body. Bind it as a
+                 ;; dynvar so note-rhs / note-keys can size `@m = args'
+                 ;; or `@m[args]' from BTF without re-reaching into the
+                 ;; probe shape themselves.
+                 (*probe-spec* (first (getf (cdr probe) :specs))))
             (when pred (when (eq (first pred) :map) (note-keys pred)))
             (mapc #'scan-stmt body)))
         ;; Also walk macro/fn bodies so map references inside
@@ -896,7 +920,7 @@
     ;; userspace stack of the current task instead of the kernel one.
     (:ustack     `(whistler::get-stackid (whistler::ctx-ptr) ,*stacks-map-name*
                                          ,(ash 1 8)))
-    (:args       (unsupported "args without ->field"))
+    (:args       (lower-bare-args))
     (:probe-name (unsupported "probe builtin"))
     (:func       (unsupported "func builtin"))
     (:incdec-expr (lower-incdec-expr expr))
@@ -3186,6 +3210,43 @@
        (,helper ,scratch ,size (whistler::+ ,ptr-form ,offset))
        (whistler::load ,type-sym ,scratch 0))))
 
+(defun bare-args-byte-width ()
+  "Total bytes for `args' (no field) under the active probe. fentry/
+   fexit walks BTF params; each param is 8 bytes in the ctx layout
+   (one u64 register slot). NIL when we can't determine the count
+   (tracepoint args layout varies per event and we don't reduce it
+   to a fixed width — those scripts already need args.FIELD)."
+  (case (first *probe-spec*)
+    ((:kfunc :kretfunc)
+     (let* ((fname  (second *probe-spec*))
+            (vmbtf  (whistler:ensure-vmlinux-btf))
+            (params (whistler:btf-func-params vmbtf fname)))
+       (* 8 (length params))))))
+
+(defun lower-bare-args ()
+  "Lower `args' (used without `->field') to a stack buffer holding
+   the concatenated raw param values. fentry / fexit only — each
+   param is one u64 ctx slot, so the buffer is param-count × 8.
+   Returns the buffer pointer; downstream sites (map keys / values /
+   printf args) treat it like a sized byte buffer."
+  (let ((width (bare-args-byte-width)))
+    (unless width
+      (unsupported "args without ->field is only supported in fentry/fexit"))
+    (case (first *probe-spec*)
+      ((:kfunc :kretfunc)
+       (let* ((fname  (second *probe-spec*))
+              (vmbtf  (whistler:ensure-vmlinux-btf))
+              (params (whistler:btf-func-params vmbtf fname))
+              (buf    (gensym "ARGSBUF")))
+         `(let ((,buf (whistler::struct-alloc ,width)))
+            ,@(loop for (_n . off) in params
+                    for slot from 0
+                    collect `(whistler::store ,(intern "U64" :whistler)
+                                              ,buf ,(* slot 8)
+                                              (whistler::ctx ,(intern "U64" :whistler)
+                                                              ,off)))
+            ,buf))))))
+
 (defun lower-args-field (name)
   "Lower args->NAME based on the current probe type. Tracepoints
    read the field directly from the kernel-provided ctx using the
@@ -3278,6 +3339,15 @@
          (whistler::+ ,buf ,offset)
          ,(* elt-size arr-len)
          (whistler::+ ,(lower-expr base-ast) ,field-off))))
+    ;; Bare `args' (fentry/fexit) — emit the lower-bare-args buffer
+    ;; and memcpy its contents into the key slot. lower-bare-args
+    ;; returns a fresh stack buffer; copy its WIDTH bytes into the
+    ;; pre-allocated key slot.
+    ((and (eq (first expr) :args) (bare-args-byte-width))
+     (let ((tmp (gensym "ASRC"))
+           (width (bare-args-byte-width)))
+       `(let ((,tmp ,(lower-bare-args)))
+          (whistler::memcpy ,buf ,offset ,tmp 0 ,width))))
     (t `(whistler::store ,type ,buf ,offset ,(lower-expr expr)))))
 
 (defun with-key (keys body-fn)
@@ -4203,6 +4273,25 @@
       ((and (consp rhs) (eq (first rhs) :comm)
             (minfo-value-string-p info))
        (gen-comm-set info keys))
+      ;; `@m[k] = args' (fentry/fexit) — the value is a freshly-
+      ;; allocated buffer of param-count × 8 bytes. lower-bare-args
+      ;; already emits the buffer + writes; route the resulting
+      ;; pointer through map-update-ptr.
+      ((and (consp rhs) (eq (first rhs) :args)
+            (minfo-value-array-p info))
+       (let ((aval  (gensym "AVAL"))
+             (tmpk  (gensym "K"))
+             (mname (minfo-name info))
+             (ptr-p (keys-need-ptr-ops-p keys)))
+         (with-key keys
+           (lambda (k)
+             (if ptr-p
+                 `(let ((,aval ,(lower-bare-args)))
+                    (whistler::map-update-ptr ,mname ,k ,aval 0))
+                 `(let* ((,tmpk whistler::u64 ,k)
+                         (,aval ,(lower-bare-args)))
+                    (whistler::map-update-ptr
+                     ,mname (whistler::stack-addr ,tmpk) ,aval 0)))))))
       ;; `@m[k] = (struct A *)e.arrfield' — whole-array assignment.
       ;; Probe-read N×sizeof(elt) bytes from struct+field-off into a
       ;; stack buffer, then map-update-ptr.
@@ -4375,7 +4464,8 @@
                  (eq (first k) :str)
                  (str-call-p k)
                  (kstr-call-p k)
-                 (and (eq (first k) :field) (array-field-meta k)))))))
+                 (and (eq (first k) :field) (array-field-meta k))
+                 (and (eq (first k) :args) (bare-args-byte-width)))))))
 
 (defun gen-percpu-struct-update (mname keys value-form &key on-existing on-init)
   "Common scaffolding for sum/avg/min/max — all of which use a percpu
