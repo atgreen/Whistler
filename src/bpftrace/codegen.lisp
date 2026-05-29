@@ -1708,6 +1708,41 @@
                   ;; \$v slot: just compare in place.
                   (if (eq op :!=) `(whistler::not ,all-eq) all-eq)))))))))
 
+(defun lower-array-compare (op lhs-expr rhs-expr)
+  "Lower `$a.x == $b.x' / `$a.x != $b.x' where both sides are in-
+   script struct array fields. Probe-reads both arrays into stack
+   buffers, XOR-accumulates byte-by-byte, returns 1 / 0. The sizes
+   must match — if they don't we just return inequality (matches
+   bpftrace's `arrays of different sizes are never equal' rule)."
+  (multiple-value-bind (lbase lsz loff llen) (array-field-meta lhs-expr)
+    (multiple-value-bind (rbase rsz roff rlen) (array-field-meta rhs-expr)
+      (let ((lbytes (* lsz llen))
+            (rbytes (* rsz rlen)))
+        (cond
+          ((/= lbytes rbytes) (if (eq op :==) 0 1))
+          (t
+           (let ((lbuf (gensym "ABUF"))
+                 (rbuf (gensym "ABUF"))
+                 (acc  (gensym "ACC"))
+                 (helper (pick-probe-read-fn)))
+             `(let* ((,lbuf (whistler::struct-alloc ,lbytes))
+                     (,rbuf (whistler::struct-alloc ,lbytes))
+                     (,acc  whistler::u64 0))
+                (,helper ,lbuf ,lbytes
+                         (whistler::+ ,(lower-expr lbase) ,loff))
+                (,helper ,rbuf ,lbytes
+                         (whistler::+ ,(lower-expr rbase) ,roff))
+                ,@(loop for i below lbytes
+                        collect `(whistler:incf
+                                  ,acc
+                                  (whistler::logxor
+                                   (whistler::load whistler::u8 ,lbuf ,i)
+                                   (whistler::load whistler::u8 ,rbuf ,i))))
+                ,(if (eq op :==)
+                     `(whistler::if (whistler::= ,acc 0) 1 0)
+                     `(whistler::if (whistler::= ,acc 0) 0 1)))))))
+      )))
+
 (defun lower-bin (expr)
   (let* ((op  (getf (cdr expr) :op))
          (raw-lhs (getf (cdr expr) :lhs))
@@ -1716,6 +1751,12 @@
     (when (member op '(:== :!=))
       (let ((cmp (comm-string-comparison op raw-lhs raw-rhs)))
         (when cmp (return-from lower-bin cmp))))
+    ;; Special case: array-field == / != array-field. Read both into
+    ;; buffers, XOR-accumulate per byte, return (acc == 0) for ==.
+    (when (and (member op '(:== :!=))
+               (array-field-meta raw-lhs)
+               (array-field-meta raw-rhs))
+      (return-from lower-bin (lower-array-compare op raw-lhs raw-rhs)))
     (let ((lhs (lower-expr raw-lhs))
           (rhs (lower-expr raw-rhs)))
       (ecase op
