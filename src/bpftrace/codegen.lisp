@@ -55,15 +55,17 @@
     (t 8)))
 
 (defvar *tp-field-sizes* nil
-  "Hash table FIELD-NAME (string) → byte size, populated once per
-   generate() from every tracepoint format file referenced by the
-   script. NIL outside generate().")
+  "Hash table FIELD-NAME (string) → (SIZE ARRAY-SIZE C-TYPE-STRING),
+   populated once per generate() from every tracepoint format file
+   referenced by the script. C-TYPE-STRING is the raw declaration
+   text (e.g. \"struct __kernel_timespec *\") — used to flow the
+   pointed-to struct through @map[k] = args.FIELD assignments.
+   NIL outside generate().")
 
 (defun load-tracepoint-field-sizes (script)
   "Walk SCRIPT, parse each referenced tracepoint format file, and
-   build *TP-FIELD-SIZES*: name → (size . array-size). Skips silently
-   if a format file can't be read — the caller falls back to a
-   default size. array-size > 0 marks a char[]/u8[]-style field."
+   build *TP-FIELD-SIZES*. Skips silently if a format file can't be
+   read — the caller falls back to a default size."
   (let ((table (make-hash-table :test 'equal)))
     (dolist (probe (script-probes script))
       (dolist (spec (getf (cdr probe) :specs))
@@ -76,17 +78,19 @@
               (dolist (field (ignore-errors
                               (whistler::parse-tracepoint-format
                                (namestring path))))
-                (destructuring-bind (c-name _off size _signed array) field
+                (destructuring-bind (c-name _off size _signed array
+                                     &optional (c-type ""))
+                    field
                   (declare (ignore _off _signed))
                   (setf (gethash c-name table)
-                        (cons size (or array 0))))))))))
+                        (list size (or array 0) c-type)))))))))
     table))
 
 (defun tp-field-size (name)
   "Tracepoint args.FIELD width in bytes, or NIL if unknown."
   (let ((cell (and *tp-field-sizes* (gethash name *tp-field-sizes*))))
     (cond
-      ((consp cell) (car cell))
+      ((consp cell) (first cell))
       ((integerp cell) cell)
       (t nil))))
 
@@ -94,7 +98,29 @@
   "If tracepoint args.FIELD is an array, return its element count;
    otherwise 0 / NIL."
   (let ((cell (and *tp-field-sizes* (gethash name *tp-field-sizes*))))
-    (cond ((consp cell) (cdr cell)) (t 0))))
+    (cond ((consp cell) (second cell)) (t 0))))
+
+(defun tp-field-struct-pointer (name)
+  "If tracepoint args.FIELD's C type is `struct X *' (or `union X *'),
+   return X as a string. NIL otherwise — used by infer-maps to attach
+   value-struct to maps populated from struct-pointer tracepoint args."
+  (let* ((cell (and *tp-field-sizes* (gethash name *tp-field-sizes*)))
+         (c-type (and (consp cell) (third cell))))
+    (when (stringp c-type)
+      (let* ((trimmed (string-trim '(#\Space) c-type))
+             (star (position #\* trimmed)))
+        (when star
+          (let* ((head (string-trim '(#\Space) (subseq trimmed 0 star)))
+                 (prefix (cond
+                           ((and (>= (length head) 7)
+                                 (string= head "struct " :end1 7))
+                            (subseq head 7))
+                           ((and (>= (length head) 6)
+                                 (string= head "union " :end1 6))
+                            (subseq head 6))
+                           (t nil))))
+            (when prefix
+              (string-trim '(#\Space) prefix))))))))
 
 (defun str-key-size (expr)
   "Size (in bytes) of a str()/kstr() call when used as a map key —
@@ -273,6 +299,19 @@
                    ((and (consp rhs) (eq (first rhs) :cast))
                     (setf (minfo-value-struct info)
                           (getf (cdr rhs) :type)))
+                   ;; `@m[k] = args.FIELD' where the tracepoint format
+                   ;; declares FIELD as `struct X *' — propagate X
+                   ;; into value-struct so `$v = @m[k]; $v.field' works
+                   ;; without the user writing an explicit cast.
+                   ;; naptime.bt's `@rqtp[tid] = args.rqtp; $t.tv_sec'
+                   ;; idiom relies on this.
+                   ((and (consp rhs) (eq (first rhs) :field)
+                         (consp (getf (cdr rhs) :base))
+                         (eq (first (getf (cdr rhs) :base)) :args))
+                    (let ((sname (tp-field-struct-pointer
+                                  (getf (cdr rhs) :name))))
+                      (when (and sname (null (minfo-value-struct info)))
+                        (setf (minfo-value-struct info) sname))))
                    ;; `@m[k] = :str LITERAL' — direct string literal
                    ;; RHS. Size to hold the literal plus a NUL byte.
                    ((and (consp rhs) (eq (first rhs) :str))
@@ -2001,8 +2040,9 @@
             (field (find c-name fields :key #'first :test #'string=)))
        (cond
          (field
-          (destructuring-bind (c-name offset size signed-p array-size) field
-            (declare (ignore c-name))
+          (destructuring-bind (c-name offset size signed-p array-size
+                               &optional c-type) field
+            (declare (ignore c-name c-type))
             (let ((type (whistler::tracepoint-type size signed-p array-size)))
               (cond
                 (type `(whistler::ctx ,type ,offset))

@@ -670,7 +670,10 @@
 ;;; at macroexpand time and generates ctx-load accessors for each field.
 
 (defun parse-tracepoint-format (path)
-  "Parse a tracepoint format file. Returns list of (name offset size signed-p)."
+  "Parse a tracepoint format file. Returns list of
+   (name offset size signed-p array-size c-type). C-TYPE is the raw
+   declaration text minus the field name — e.g.
+   \"struct __kernel_timespec *\", \"char\", \"unsigned long\"."
   (let ((fields '()))
     (handler-bind ((error (lambda (e)
                             (whistler-error
@@ -694,15 +697,43 @@
                           (array-size (when bracket
                                         (parse-integer (subseq raw-name (1+ bracket))
                                                        :junk-allowed t)))
+                          ;; C-type is everything in the declaration before
+                          ;; the field name. Whitespace-normalize. `*' may
+                          ;; have been swallowed by split-field-decl; if
+                          ;; the raw declaration contained one before the
+                          ;; field name, re-append it as a suffix.
+                          (name-pos (search raw-name decl :from-end t))
+                          (raw-type (if (and name-pos (plusp name-pos))
+                                        (string-trim '(#\Space #\Tab)
+                                                     (subseq decl 0 name-pos))
+                                        ""))
+                          (c-type (canonicalise-c-type raw-type))
                           ;; Parse offset, size, signed from remaining "key:val;" pairs
                           (offset (parse-format-field line "offset"))
                           (size (parse-format-field line "size"))
                           (signed-p (= 1 (or (parse-format-field line "signed") 0))))
                      (when (and name offset size)
                        (push (list name offset size signed-p
-                                   (or array-size 0))
+                                   (or array-size 0)
+                                   c-type)
                              fields)))))))
     (nreverse fields))))
+
+(defun canonicalise-c-type (raw)
+  "Collapse runs of whitespace in a C type declaration and trim. Keeps
+   `*' adjacent to its type so `struct foo  *' becomes `struct foo *'."
+  (let ((out (make-array 0 :element-type 'character :adjustable t :fill-pointer t))
+        (last-space t))
+    (loop for c across raw
+          do (cond
+               ((or (char= c #\Space) (char= c #\Tab))
+                (unless last-space
+                  (vector-push-extend #\Space out)
+                  (setf last-space t)))
+               (t
+                (vector-push-extend c out)
+                (setf last-space nil))))
+    (string-trim '(#\Space) out)))
 
 (defun split-field-decl (decl)
   "Split a C declaration into tokens by spaces and *."
@@ -785,7 +816,8 @@
            (forms '()))
       ;; Generate accessor macros
       (dolist (field fields)
-        (destructuring-bind (c-name offset size signed-p array-size) field
+        (destructuring-bind (c-name offset size signed-p array-size &optional c-type) field
+          (declare (ignore c-type))
           (let* ((lisp-name (substitute #\- #\_ c-name))
                  (accessor (intern (format nil "TP-~a" (string-upcase lisp-name))
                                    (symbol-package category/event)))
