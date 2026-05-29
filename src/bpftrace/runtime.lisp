@@ -489,8 +489,12 @@
       (format nil "SIG~D" id)))
 
 (defun format-key (key &key (parts 1) key-builtin
-                            array-elt-size array-len)
-  "Render KEY (an integer) as bpftrace does.
+                            array-elt-size array-len
+                            json-p)
+  "Render KEY (an integer) as bpftrace does. JSON-P switches the
+   composite-slot separator from `, ' to `,' to match bpftrace's
+   JSON output (`bpftrace,2' for `(comm, 2)' instead of
+   `bpftrace, 2'); also flips the array-key brackets' separator.
    * KEY-BUILTIN :comm or :str — KEY's PARTS*8 little-endian bytes
      are a NUL-padded string.
    * KEY-BUILTIN :syscall-name — KEY is a syscall ID; render its name.
@@ -521,7 +525,8 @@
      (with-output-to-string (s)
        (loop for i below parts
              for v = (logand (ash key (* i -64)) #xffffffffffffffff)
-             do (when (plusp i) (write-string ", " s))
+             do (when (plusp i)
+                  (write-string (if json-p "," ", ") s))
                 (format s "~D" v))))))
 
 (defun si-number (n)
@@ -838,6 +843,31 @@
                                  :user-p (eq key-builtin :ustack)
                                  :symbolizer symbolizer)
                    (cdr kv))))
+        ;; JSON modes: one `{"type":"map", "data":{…}}' object per
+        ;; whole-map dump. Keyed maps nest a {KEY: VALUE} object;
+        ;; scalar maps put the bare value inline.
+        ((and keyed-p *json-output-p*)
+         ;; Single-line JSON per map dump — the runner's `.json'
+         ;; expect mode requires `len(output_lines) == 1' after
+         ;; stripping. Inner k:v pairs are comma-joined.
+         (format t "{\"type\": \"map\", \"data\": {\"~A\": {~{~A~^, ~}}}}~%"
+                 prefix
+                 (mapcar
+                  (lambda (kv)
+                    (format nil "~S: ~A"
+                            (format-key (car kv)
+                                        :parts key-parts
+                                        :key-builtin key-builtin
+                                        :array-elt-size key-array-elt-size
+                                        :array-len key-array-len
+                                        :json-p t)
+                            (json-format-scalar-value (cdr kv))))
+                  pairs)))
+        ((and (not keyed-p) *json-output-p*)
+         (dolist (kv pairs)
+           (format t "{\"type\": \"map\", \"data\": {\"~A\": ~A}}~%"
+                   prefix
+                   (json-format-scalar-value (cdr kv)))))
         (keyed-p
          (dolist (kv pairs)
            (format t "~A[~A]: ~A~%"
@@ -851,6 +881,18 @@
         (t
          (dolist (kv pairs)
            (format t "~A: ~A~%" prefix (format-scalar-value (cdr kv)))))))))
+
+(defun json-format-scalar-value (v)
+  "JSON-encode a scalar map value cell. Integers go bare; strings
+   are quoted; the stats sentinel becomes {count, average, total}."
+  (cond
+    ((and (consp v) (eq (first v) :stats))
+     (let ((c (second v))
+           (s (third v)))
+       (format nil "{\"count\": ~D, \"average\": ~D, \"total\": ~D}"
+               c (if (zerop c) 0 (floor s c)) s)))
+    ((stringp v) (format nil "~S" v))
+    (t (format nil "~D" v))))
 
 (defun format-scalar-value (v)
   "Render a scalar map's value cell. Most values are integers; stats()

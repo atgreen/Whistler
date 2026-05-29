@@ -1097,6 +1097,16 @@
          (p-pos  (position "-p" args :test #'string=))
          (c-pos  (position "-c" args :test #'string=))
          (named-params (parse-named-params args))
+         (quiet-p (member "-q" args :test #'string=))
+         ;; `-f FORMAT' picks the output format. The only non-default
+         ;; we recognise is `json'; anything else exits with an error
+         ;; (matching bpftrace's `Invalid output format' behaviour).
+         (f-pos (position "-f" args :test #'string=))
+         (format-arg (and f-pos (nth (1+ f-pos) args)))
+         (json-p (and format-arg (string= format-arg "json")))
+         (_ (when (and format-arg (not json-p))
+              (format *error-output* "ERROR: Invalid output format \"~A\"~%" format-arg)
+              (uiop:quit 1)))
          ;; The script-path token, if we're in file-mode (not -e). It
          ;; gets excluded from $N positional collection so users don't
          ;; see their script name show up as $1.
@@ -1139,6 +1149,8 @@
          (hook-var    (find-symbol "*POST-ATTACH-HOOK*" '#:whistler/bpftrace))
          (params-var  (find-symbol "*NAMED-PARAMS*"  '#:whistler/bpftrace))
          (positional-var (find-symbol "*POSITIONAL-ARGS*" '#:whistler/bpftrace))
+         (json-var    (find-symbol "*JSON-OUTPUT-P*"  '#:whistler/bpftrace))
+         (quiet-var   (find-symbol "*QUIET-OUTPUT-P*" '#:whistler/bpftrace))
          (cpid-var    (find-symbol "*CHILD-CPID*"    '#:whistler/bpftrace))
          (child-pid   (and child-process
                            (traced-child-pid child-process)))
@@ -1149,12 +1161,16 @@
                               (when release-thunk    hook-var)
                               (when named-params     params-var)
                               (when positional-args  positional-var)
+                              (when json-p           json-var)
+                              (when quiet-p          quiet-var)
                               (when child-pid        cpid-var)))
            (remove nil (list (when effective-pid effective-pid)
                               (when child-process    child-process)
                               (when release-thunk    release-thunk)
                               (when named-params     named-params)
                               (when positional-args  positional-args)
+                              (when json-p           json-p)
+                              (when quiet-p          quiet-p)
                               (when child-pid        child-pid)))
       (cond
         (dump-p

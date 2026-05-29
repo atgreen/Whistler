@@ -37,6 +37,14 @@
    indices yield 0 (matching bpftrace). Set by the CLI before
    compile-script runs.")
 
+(defvar *json-output-p* nil
+  "When T, map dumps and async events emit one JSON object per line
+   (`{\"type\": \"map\", \"data\": {…}}'). Set by `-f json'.")
+
+(defvar *quiet-output-p* nil
+  "When T (set by `-q'), suppress the probe-attach header and other
+   chatter. Map dumps and printf output still flow.")
+
 (defvar *child-cpid* nil
   "When `whistler bpftrace -c CMD' spawned a child, the CLI sets
    this to the child's pid before compile-script runs. The codegen
