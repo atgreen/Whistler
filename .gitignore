@@ -1,6 +1,10 @@
 # Build artifacts
 whistler
 *.fasl
+build/
+
+# Symlink staged by `make bpftrace-runtime-test'
+scripts/bpftrace
 
 # Compiled BPF objects
 *.bpf.o
