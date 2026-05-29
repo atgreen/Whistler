@@ -112,17 +112,21 @@
   (cond
     ((> star-count 0) 8)
     ((or (string= name "char") (string= name "uint8") (string= name "int8")
-         (string= name "u8")   (string= name "s8")   (string= name "bool"))
+         (string= name "u8")   (string= name "s8")   (string= name "bool")
+         (string= name "uint8_t") (string= name "int8_t"))
      1)
     ((or (string= name "short") (string= name "uint16") (string= name "int16")
-         (string= name "u16")   (string= name "s16"))
+         (string= name "u16")   (string= name "s16")
+         (string= name "uint16_t") (string= name "int16_t"))
      2)
     ((or (string= name "int")    (string= name "uint32") (string= name "int32")
-         (string= name "u32")    (string= name "s32")    (string= name "unsigned"))
+         (string= name "u32")    (string= name "s32")    (string= name "unsigned")
+         (string= name "uint32_t") (string= name "int32_t"))
      4)
     ((or (string= name "long")   (string= name "uint64") (string= name "int64")
          (string= name "u64")    (string= name "s64")    (string= name "size_t")
-         (string= name "ssize_t") (string= name "ptrdiff_t"))
+         (string= name "ssize_t") (string= name "ptrdiff_t")
+         (string= name "uint64_t") (string= name "int64_t"))
      8)
     (t nil)))
 
@@ -280,6 +284,7 @@
                                (norm-struct-decl inner)
                                nil)
                               (:enum-decl    nil)  ; accept-and-ignore
+                              (:union-decl   nil)  ; accept-and-ignore
                               (:map-decl     nil)  ; accept-and-ignore
                               (t (error "unexpected top-form: ~S"
                                         (tag-of inner))))

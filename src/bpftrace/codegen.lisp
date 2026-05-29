@@ -1271,6 +1271,13 @@
         (needle   (second args)))
     (unless (and (consp needle) (eq (first needle) :str))
       (unsupported "strcontains(): needle must be a string literal"))
+    ;; Literal haystack short-circuit: both args known at compile
+    ;; time, fold the search and return a constant 0/1.
+    (when (and (consp haystack) (eq (first haystack) :str))
+      (let ((h (second haystack))
+            (n (second needle)))
+        (return-from lower-strcontains
+          (if (search n h) 1 0))))
     (let* ((bytes (sb-ext:string-to-octets (second needle)
                                             :external-format :utf-8))
            (nlen  (length bytes))
@@ -1349,6 +1356,13 @@
         (needle   (second args)))
     (unless (and (consp needle) (eq (first needle) :str))
       (unsupported "strstr(): needle must be a string literal"))
+    ;; Literal-haystack short-circuit: fold to 1-based position
+    ;; (matching bpftrace's strstr return) or 0 when not found.
+    (when (and (consp haystack) (eq (first haystack) :str))
+      (let* ((h (second haystack))
+             (n (second needle))
+             (p (search n h)))
+        (return-from lower-strstr (if p (1+ p) 0))))
     (let* ((bytes (sb-ext:string-to-octets (second needle)
                                             :external-format :utf-8))
            (nlen  (length bytes))
@@ -2535,7 +2549,9 @@
    on any scalar / string / tuple. We synthesize a printf(FMT, VAL…)
    where FMT is inferred from VAL's syntactic shape and always ends
    in `\\n' (bpftrace's `print' is line-terminated). Tuples format as
-   `(elem1, elem2, …)' with `%d' for ints / `%s' for strings."
+   `(elem1, elem2, …)' with `%d' for ints / `%s' for strings. Nested
+   tuples flatten into the format: `(1, (2, X))' → `(%d, (%d, %s))'
+   with the three leaves as printf args."
   (unless (and args (= (length args) 1))
     (unsupported "print() takes one argument (a value or @map)"))
   (let* ((val (first args))
@@ -2544,16 +2560,11 @@
       ((eq tag :str)
        (lower-printf (list (list :str "%s\n") val)))
       ((eq tag :tuple)
-       (let* ((items   (getf (cdr val) :items))
-              (specs   (mapcar #'tuple-elem-printf-spec items))
-              (fmt     (format nil "(~{~A~^, ~})~~%" specs))
-              ;; Strip the literal `~%' suffix off the format string
-              ;; we're about to embed as a printf format — printf wants
-              ;; a literal `\n', not Lisp's `~%'.
-              (fmt-str (concatenate 'string
-                                    (subseq fmt 0 (- (length fmt) 2))
-                                    (string #\Newline))))
-         (lower-printf (cons (list :str fmt-str) items))))
+       (multiple-value-bind (fmt-fragment leaves) (tuple-printf-shape val)
+         (lower-printf (cons (list :str
+                                   (concatenate 'string fmt-fragment
+                                                (string #\Newline)))
+                             leaves))))
       ;; Default: numeric. Covers $vars, int literals, arithmetic,
       ;; builtins like pid/tid/cpu, etc. The runtime decoder treats
       ;; the payload as u64.
@@ -2561,12 +2572,30 @@
        (lower-printf (list (list :str "%d\n") val))))))
 
 (defun tuple-elem-printf-spec (elem)
-  "Pick a printf %-spec for a tuple element being lowered by
-   lower-print-value. String-typed elements use `%s'; everything
-   else falls back to `%d'."
+  "Pick a printf %-spec for a tuple element. String-typed elements use
+   `%s'; everything else falls back to `%d'."
   (cond
     ((and (consp elem) (eq (first elem) :str))  "%s")
     (t  "%d")))
+
+(defun tuple-printf-shape (tuple)
+  "Walk a (possibly nested) tuple AST and return (values FMT-STRING
+   LEAF-LIST). The format renders the tuple's nested shape with `(',
+   `)' and `, ', plugging in `%d' / `%s' per leaf — and LEAF-LIST is
+   the flat list of leaf ASTs in left-to-right order, ready to pass
+   to lower-printf as the post-format args."
+  (let ((leaves nil))
+    (labels ((walk (e)
+               (cond
+                 ((and (consp e) (eq (first e) :tuple))
+                  (let* ((items (getf (cdr e) :items))
+                         (parts (mapcar #'walk items)))
+                    (format nil "(~{~A~^, ~})" parts)))
+                 (t
+                  (push e leaves)
+                  (tuple-elem-printf-spec e)))))
+      (let ((fmt (walk tuple)))
+        (values fmt (nreverse leaves))))))
 
 (defun lower-printf (args &key (stream :stdout) (fn-name "printf"))
   "Lower a bpftrace `printf(\"FMT\", arg…)` to a ringbuf-submit using

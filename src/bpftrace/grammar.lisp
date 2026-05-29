@@ -171,12 +171,16 @@
 (defparameter *grammar-source*
   "
   script         = <ws> top-form (<ws> top-form)* <ws>
-  top-form       = function / macro-decl / config-block / map-decl / struct-decl / enum-decl / probe
+  top-form       = function / macro-decl / config-block / map-decl / struct-decl / enum-decl / union-decl / probe
   (* `enum [NAME] { K1 = V1, K2, … };' at script top-level. Parsed
      just to clear the way; we don't resolve K-as-constant yet, so
      scripts that *use* the enum values will fail at codegen with
      the regular `unknown identifier' error. *)
   enum-decl      = <'enum'> (<ws> ident)? <ws> <'{'> #'[^}]*' <'}'> (<ws> <';'>)?
+  (* `union N { … };' — accept-and-discard, like enum-decl. Codegen
+     doesn't resolve union members yet; scripts using them will hit
+     the regular `field access' error at use site. *)
+  union-decl     = <'union'> <ws> ident <ws> <'{'> #'[^}]*' <'}'> (<ws> <';'>)?
   (* `struct NAME { … }' at script top-level — bpftrace's in-script
      C struct declaration. We accept it so scripts parse, but the
      body is captured as opaque text; codegen reports a clearer
