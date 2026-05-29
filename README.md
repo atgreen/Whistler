@@ -456,11 +456,24 @@ Almost everything you'd write in a typical bpftrace script:
   `stats(x)`, `hist(x)`, `lhist(x, min, max, step)`.
 - **Async actions**: `printf` (with `%-16s`/`%05d` flags),
   `print(@m [, top [, div]])` (top-N + value scaling), `clear(@m)`,
-  `zero(@m)`, `delete(@m[k])`, `time()`, `exit()`.
+  `zero(@m)`, `delete(@m[k])`, `time()`, `cat("/path")`, `join(argv)`,
+  `system("cmd")` (shells out userspace), `errorf` / `warnf` (printf
+  to stderr), `fail("msg")` (compile-time abort), `exit()`.
 - **String / address builtins**: `str(ptr [, n])`, `kstr(ptr [, n])`,
   `ksym(addr)`, `usym(addr)`, `ntop([af,] addr)` (literal or runtime
-  family), `reg("ip"|"sp"|…)`, `syscall_name(id)` (x86-64 / arm64
-  baked-in tables), `signal_name(N)` (POSIX 1-31 + `SIG<N>` fallback).
+  family), `reg("ip"|"sp"|…)`, `syscall_name(id)`, `signal_name(N)`,
+  `macaddr(ptr)`, `path(struct path *)` (bpf_d_path), `kaddr("name")`
+  (kallsyms lookup), `pton("…")` (compile-time IP parse), `strerror(N)`.
+- **String operations**: `strncmp(s1, s2, n)`, `strcontains(haystack,
+  needle)`, `len(s)`, `assert(cond, msg)` (errorf+exit on fail),
+  `static_assert(cond, msg)` (compile-time abort).
+- **Misc helpers**: `socket_cookie(sk)`, `cgroupid("/path")`
+  (compile-time stat), `signal(N)` (send to current task),
+  `override(retval)` (kprobe error injection), `jiffies()`, `is_err(p)`,
+  `kptr(p)` / `uptr(p)` (identity), `cpid()` / `has_cpid()` (from `-c`).
+- **Compile-time type predicates**: `is_str`, `is_ptr`, `is_array`,
+  `is_integer`, `is_unsigned_integer`, `is_literal` — fold to 0/1 for
+  `if comptime (is_str($x)) { … }` macro dispatch.
 - **CLI integration**: `getopt(NAME, default)` reads
   `whistler bpftrace script.bt -- --NAME[=VALUE]` parameters and
   returns the parsed value. Bool, int, and string defaults all
