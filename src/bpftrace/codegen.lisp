@@ -1241,7 +1241,10 @@
          (msg-arg   (second args))
          (cond-form (lower-expr cond-expr)))
     `(whistler::unless ,cond-form
-       ,(lower-printf (list '(:str "assert failed: %s\\n") msg-arg)
+       ,(lower-printf (list (list :str (concatenate 'string
+                                                    "assert failed: %s"
+                                                    (string #\Newline)))
+                            msg-arg)
                       :stream :stderr :fn-name "assert")
        ,(lower-call '(:call :name "exit" :args ())))))
 
@@ -2671,7 +2674,9 @@
          (tag (and (consp val) (first val))))
     (cond
       ((eq tag :str)
-       (lower-printf (list (list :str "%s\n") val)))
+       (lower-printf (list (list :str (concatenate 'string "%s"
+                                                   (string #\Newline)))
+                           val)))
       ((eq tag :tuple)
        (multiple-value-bind (fmt-fragment leaves) (tuple-printf-shape val)
          (lower-printf (cons (list :str
@@ -2682,7 +2687,9 @@
       ;; builtins like pid/tid/cpu, etc. The runtime decoder treats
       ;; the payload as u64.
       (t
-       (lower-printf (list (list :str "%d\n") val))))))
+       (lower-printf (list (list :str (concatenate 'string "%d"
+                                                   (string #\Newline)))
+                           val))))))
 
 (defun tuple-elem-printf-spec (elem)
   "Pick a printf %-spec for a tuple element. String-typed elements use
