@@ -257,7 +257,8 @@
                                        :kind :counter
                                        :key-size 0
                                        :value-size 8
-                                       :max-entries 1024)))))
+                                       :max-entries
+                                       (script-max-map-keys 1024))))))
              (note-keys (mref)
                (let ((info (ensure mref))
                      (keys (getf (cdr mref) :keys)))
@@ -595,10 +596,11 @@
 ;;; CPU-local buffer pointer and every spilled alloc becomes
 ;;; `(+ scratch-base compile-time-offset)'.
 
-(defconstant +bt-scratch-threshold+ 32
+(defvar +bt-scratch-threshold+ 32
   "struct-alloc requests larger than this go to the per-CPU scratch
    map rather than the BPF stack. Matches bpftrace's on_stack_limit
-   default and gives us roughly the same stack/scratch split.")
+   default and gives us roughly the same stack/scratch split. Rebound
+   by `generate' from `config = { on_stack_limit = N }' when set.")
 
 (defvar *bt-scratch-map-name* (intern "--BT-SCRATCH--" :whistler)
   "Symbol naming the auto-defined per-CPU scratch array map.")
@@ -1529,6 +1531,26 @@
   "Default buffer size used by str(ptr) — matches bpftrace's default.
    Rebound by `generate' from the script's `config = { max_strlen = N }'
    when present.")
+
+(defun script-config-int (key default)
+  "Look KEY up in *script-config* and parse the value as an integer.
+   Returns DEFAULT when the key is absent or the value is unparseable."
+  (let* ((pair (assoc key *script-config* :test #'string=))
+         (n    (and pair (parse-integer (cdr pair) :junk-allowed t))))
+    (or n default)))
+
+(defun script-config-string (key default)
+  "Return KEY's value from *script-config* as a trimmed string, or
+   DEFAULT when absent."
+  (let ((pair (assoc key *script-config* :test #'string=)))
+    (if pair
+        (string-trim '(#\Space #\Tab) (cdr pair))
+        default)))
+
+(defun script-max-map-keys (default)
+  "Effective default max-entries for hash maps. Honors
+   `config = { max_map_keys = N }'."
+  (script-config-int "max_map_keys" default))
 
 (defun named-call-p (expr name)
   "T when EXPR is a (:call :name NAME :args …) form."
@@ -3992,9 +4014,11 @@
          ;; Honor `config = { max_strlen = N }' for the duration of
          ;; this generate(). Reverts when the let* unwinds.
          (+bt-str-default-len+
-           (let ((pair (assoc "max_strlen" *script-config* :test #'string=)))
-             (or (and pair (parse-integer (cdr pair) :junk-allowed t))
-                 +bt-str-default-len+)))
+           (script-config-int "max_strlen" +bt-str-default-len+))
+         ;; `config = { on_stack_limit = N }' — overrides the
+         ;; struct-alloc → scratch spill threshold.
+         (+bt-scratch-threshold+
+           (script-config-int "on_stack_limit" +bt-scratch-threshold+))
          (*test-run-counter* 0)
          (*printf-table* nil)
          (*printf-id-counter* 0)

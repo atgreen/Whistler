@@ -1066,10 +1066,16 @@
          (t
           (format nil "0x~16,'0X~@[ [~A]~]~@[~A~]" ip lib src-tag)))))))
 
+(defvar *stack-mode* :bpftrace
+  "How kstack/ustack frames are rendered. One of :bpftrace (default —
+   indented one-per-line, symbol-only), :perf (`HEX_ADDR SYMBOL'), or
+   :raw (hex addresses only). Set from
+   `config = { stack_mode = perf|bpftrace|raw }'.")
+
 (defun format-stack (stack-id stacks-info depth &key user-p pid symbolizer)
-  "Render a kstack/ustack key as bpftrace's indented multi-line stack.
-   Kernel stacks resolve against /proc/kallsyms; userspace stacks
-   resolve via SYMBOLIZER against the given PID's /proc/<pid>/maps."
+  "Render a kstack/ustack key. Style picked by *stack-mode*. Kernel
+   stacks resolve against /proc/kallsyms; userspace stacks resolve via
+   SYMBOLIZER against the given PID's /proc/<pid>/maps."
   (with-output-to-string (s)
     (let ((errname (stackid-errno stack-id)))
       (if errname
@@ -1080,10 +1086,20 @@
                       for first-p = t then nil
                       do (unless first-p (terpri s))
                          (format s "        ~A"
-                                 (if user-p
-                                     (format-user-frame ip pid symbolizer)
-                                     (resolve-symbol ip))))
+                                 (format-stack-frame ip user-p pid symbolizer)))
                 (format s "        <stack id ~D unavailable>" stack-id)))))))
+
+(defun format-stack-frame (ip user-p pid symbolizer)
+  "Render one stack frame per *stack-mode*."
+  (case *stack-mode*
+    (:raw (format nil "~16,'0X" ip))
+    (:perf (format nil "~16,'0X ~A" ip
+                   (if user-p
+                       (format-user-frame ip pid symbolizer)
+                       (resolve-symbol ip))))
+    (t (if user-p
+           (format-user-frame ip pid symbolizer)
+           (resolve-symbol ip)))))
 
 ;;; ========== printf record decoding ==========
 
@@ -1186,14 +1202,26 @@
                       (write-string (pad-str text width left-align-p pad) s))
                     (setf i (1+ j)))))))))
 
+(defvar *str-trunc-trailer* ""
+  "Appended to a str() / probe-read string when the buffer was filled
+   with no terminating NUL. Set from
+   `config = { str_trunc_trailer = \"…\" }'; the default empty string
+   matches bpftrace.")
+
 (defun sap-read-string-fixed (sap offset max-len)
   "Read MAX-LEN bytes from (SAP+OFFSET), trim at the first NUL, return
-   a Lisp string (assumed ASCII / UTF-8 clean for the `comm' use case)."
+   a Lisp string (assumed ASCII / UTF-8 clean for the `comm' use case).
+   When no NUL is found and *str-trunc-trailer* is non-empty, append it
+   so the user sees the truncation."
   (let ((bytes (make-array max-len :element-type '(unsigned-byte 8))))
     (dotimes (i max-len)
       (setf (aref bytes i) (sb-sys:sap-ref-8 sap (+ offset i))))
-    (let ((end (or (position 0 bytes) max-len)))
-      (sb-ext:octets-to-string bytes :end end :external-format :utf-8))))
+    (let* ((nul-pos (position 0 bytes))
+           (end (or nul-pos max-len))
+           (s (sb-ext:octets-to-string bytes :end end :external-format :utf-8)))
+      (if (and (null nul-pos) (plusp (length *str-trunc-trailer*)))
+          (concatenate 'string s *str-trunc-trailer*)
+          s))))
 
 (defun decode-printf-record (sap printf-table &optional time-format-table)
   "Pop a tag=0 (printf) record off the ringbuf and write its formatted
@@ -1546,6 +1574,25 @@
    or a kernel-side exit() flips the bt-exit flag. BEGIN/END probes
    are kernel programs invoked via BPF_PROG_TEST_RUN; everything
    else attaches normally."
+  (let ((*str-trunc-trailer*
+          ;; Honor `config = { str_trunc_trailer = "…" }'. Strip the
+          ;; optional surrounding quotes the user may have written —
+          ;; bpftrace tolerates either form.
+          (let* ((pair (assoc "str_trunc_trailer" (getf gen :config)
+                              :test #'string=))
+                 (raw  (and pair (string-trim '(#\Space #\Tab) (cdr pair)))))
+            (cond
+              ((null raw) "")
+              ((and (>= (length raw) 2)
+                    (char= (char raw 0) #\")
+                    (char= (char raw (1- (length raw))) #\"))
+               (subseq raw 1 (1- (length raw))))
+              (t raw))))
+        (*stack-mode*
+          ;; `config = { stack_mode = perf|bpftrace|raw }'. Anything
+          ;; else falls back to :bpftrace.
+          (config-enum gen "stack_mode" :bpftrace
+                       :bpftrace :perf :raw)))
   (multiple-value-bind (map-specs prog-specs info-list)
       (compile-generated gen)
     (let* ((map-alist  (whistler/loader::session-create-maps map-specs))
@@ -1676,4 +1723,4 @@
           (dolist (e map-alist)
             (let ((fd (whistler/loader::map-info-fd (cdr e))))
               (when (plusp fd)
-                (handler-case (sb-posix:close fd) (error () nil))))))))))
+                (handler-case (sb-posix:close fd) (error () nil)))))))))))
