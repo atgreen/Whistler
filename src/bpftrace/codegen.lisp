@@ -657,6 +657,13 @@
    Distinct from *var-types* (struct names) so the existing
    struct-pointer code paths aren't disturbed.")
 
+(defvar *var-array-types* nil
+  "Per-probe alist VAR-NAME → (ELT-SIZE ARR-LEN) for vars assigned
+   from a map whose value-array-p is set — e.g. `$x = @a[0]' where
+   @a's value-size is `N*ELT-SIZE'. The var is backed by an inline
+   `N*ELT-SIZE' stack buffer; the assignment fills it from the map,
+   and `$x[i]' loads ELT-SIZE bytes at offset i*ELT-SIZE.")
+
 (defvar *string-set-buf* nil
   "Per-probe scratch buffer symbol shared across all
    `gen-string-set' calls in the same probe. The BPF stack frame
@@ -3331,6 +3338,24 @@
          `(whistler::load ,(intern "U8" :whistler)
                           ,(var-sym (second base))
                           ,(lower-expr idx)))
+        ;; `$x[i]' where `$x' is backed by an inline whole-array
+        ;; buffer (filled via memcpy from a map whose value was a
+        ;; struct array field). Just read ELT-SIZE bytes at offset
+        ;; i*ELT-SIZE — no probe-read needed; the bytes are already
+        ;; in our stack buffer.
+        ((and (consp base) (eq (first base) :var)
+              (assoc (second base) *var-array-types* :test #'string=))
+         (let* ((cell  (cdr (assoc (second base) *var-array-types*
+                                   :test #'string=)))
+                (sz    (first cell))
+                (type-sym (case sz
+                            (1 (intern "U8"  :whistler))
+                            (2 (intern "U16" :whistler))
+                            (4 (intern "U32" :whistler))
+                            (8 (intern "U64" :whistler)))))
+           `(whistler::load ,type-sym
+                            ,(var-sym (second base))
+                            (whistler::* ,(lower-expr idx) ,sz))))
         ;; `$a[i]' where `$a' was assigned from a primitive-pointer
         ;; cast (`$a = (int32 *) arg0'). Read sizeof(elt) bytes at
         ;; `$a + i * sizeof(elt)' via probe-read-user/kernel.
@@ -3704,6 +3729,22 @@
       (:var
        (let ((sym (var-sym (second lhs))))
          (cond
+           ;; `$v = @m[k]' on a $v tracked as an array-var (its map's
+           ;; value is a whole array): copy the N×elt-size bytes from
+           ;; the map slot via map-lookup-ptr + memcpy. The var itself
+           ;; is the buffer; lower-index reads element bytes off it.
+           ((and (eq op :=)
+                 (consp rhs) (eq (first rhs) :map)
+                 (assoc (second lhs) *var-array-types* :test #'string=))
+            (let* ((cell  (cdr (assoc (second lhs) *var-array-types*
+                                      :test #'string=)))
+                   (sz    (first cell))
+                   (len   (second cell))
+                   (total (* sz len))
+                   (ptr   (gensym "MP")))
+              `(let ((,ptr ,(lower-map-value-ptr rhs)))
+                 (whistler::when ,ptr
+                   (whistler::memcpy ,sym 0 ,ptr 0 ,total)))))
            ;; `$v = ntop(…)' on a tracked ntop-var — write the
            ;; family byte + address bytes into $v's pre-allocated
            ;; 17-byte slot. $v itself stays a pointer for the
@@ -4668,6 +4709,34 @@
     (t
      (intern "PROBE-READ-KERNEL" :whistler))))
 
+(defun infer-var-array-types (stmts)
+  "Walk STMTS for `$v = @m[k]' where @m's minfo carries value-array-p
+   (set by infer-maps when the script stored a whole-array field as
+   the map's value). Returns an alist (VAR-NAME . (ELT-SIZE ARR-LEN))
+   so the var binding can allocate a backing buffer and lower-index
+   on the var can load typed bytes from it."
+  (let ((acc nil))
+    (labels ((maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var)
+                          (consp rhs) (eq (first rhs) :map)
+                          *map-table*)
+                 (let* ((nm (or (getf (cdr rhs) :name) "@"))
+                        (info (gethash nm *map-table*))
+                        (sz (and info (minfo-value-array-elt-size info)))
+                        (vs (and info (minfo-value-size info))))
+                   (when (and sz vs (minfo-value-array-p info))
+                     (push (cons (second lhs) (list sz (/ vs sz))) acc)))))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-record (getf (cdr s) :lhs)
+                                        (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk stmts))
+    acc))
+
 (defun infer-var-ptr-elt-types (stmts)
   "Walk STMTS for `$v = (T *) EXPR' assignments and return an alist
    (VAR-NAME . (TYPE-NAME ELT-SIZE)). RHS may also be:
@@ -5202,6 +5271,7 @@
     (let* ((*probe-spec* spec)
            (*var-types*  (infer-var-types body))
            (*var-ptr-elt-types* (infer-var-ptr-elt-types body))
+           (*var-array-types*   (infer-var-array-types body))
            (*ntop-vars*  (infer-ntop-vars body))
            (*comm-vars*  (infer-comm-vars body))
            (*str-vars*   (infer-str-vars body))
@@ -5253,6 +5323,9 @@
                    for str-size = (and as-bt
                                        (cdr (assoc as-bt *str-vars*
                                                    :test #'string-equal)))
+                   for array-cell = (and as-bt
+                                         (cdr (assoc as-bt *var-array-types*
+                                                     :test #'string=)))
                    collect (cond
                              (is-ntop `(,v (whistler::struct-alloc
                                             ,+bt-ntop-slot-size+)))
@@ -5260,6 +5333,9 @@
                                             ,+bt-comm-len+)))
                              (str-size `(,v (whistler::struct-alloc
                                              ,str-size)))
+                             (array-cell `(,v (whistler::struct-alloc
+                                               ,(* (first array-cell)
+                                                   (second array-cell)))))
                              (t `(,v 0)))))
            ;; Prepend the shared key buffer (struct-alloc 8) if any
            ;; gen-string-set call elected to reuse it. *string-set-buf*
