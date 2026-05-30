@@ -1284,6 +1284,12 @@
                                                     (subseq str 0 precision)
                                                     str)))
                                    ((#\r)     (if (stringp arg) arg ""))
+                                   ;; %B — bool: render 0 / 1 as
+                                   ;; `false' / `true'. Used by the
+                                   ;; print(tuple) path when an element
+                                   ;; is a bool literal or cast.
+                                   ((#\B)     (if (zerop (or arg 0))
+                                                  "false" "true"))
                                    (t         (format nil "%~C" spec)))))
                       (write-string (pad-str text width left-align-p pad) s))
                     (setf i (1+ j)))))))))

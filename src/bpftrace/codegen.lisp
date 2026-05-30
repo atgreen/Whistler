@@ -2717,9 +2717,16 @@
 
 (defun tuple-elem-printf-spec (elem)
   "Pick a printf %-spec for a tuple element. String-typed elements use
-   `%s'; everything else falls back to `%d'."
+   `%s'; bool-typed elements use `%B' (rendered as `true' / `false'
+   in userspace); everything else falls back to `%d'."
   (cond
     ((and (consp elem) (eq (first elem) :str))  "%s")
+    ((or (and (consp elem) (eq (first elem) :constant)
+              (or (string= (second elem) "true")
+                  (string= (second elem) "false")))
+         (and (consp elem) (eq (first elem) :int-cast)
+              (string= (getf (cdr elem) :type) "bool")))
+     "%B")
     (t  "%d")))
 
 (defun tuple-printf-shape (tuple)
