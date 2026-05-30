@@ -3831,7 +3831,7 @@
                             (4 (intern "U32" :whistler))
                             (8 (intern "U64" :whistler))))
                 (mp (gensym "MP")))
-           `(whistler:if-let ((,mp ,(lower-map-value-ptr base)))
+           `(whistler:if-let (,mp ,(lower-map-value-ptr base))
               (whistler::load ,type-sym ,mp
                               (whistler::* ,(lower-expr idx) ,sz))
               0)))
