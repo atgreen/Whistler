@@ -327,7 +327,16 @@
   (* `let $var;' or `let $var = expr;' — bpftrace's local-var decl.
      For us the bare decl is a no-op (variables are inferred from
      use); the assigning form becomes a regular :assign. *)
-  let-stmt       = <'let'> !ident-char <ws> <'$'> ident (<ws> <'='> <ws> expr)?
+  (* `let $x : TYPE;' or `let $x : TYPE = expr;' — bpftrace's typed
+     declaration form. We accept the colon + type tokens and silently
+     drop the annotation; whistler's IR is all u64-or-pointer so the
+     type only matters for downstream chained-field reads, which the
+     subsequent assignment carries through anyway. *)
+  let-stmt       = <'let'> !ident-char <ws> <'$'> ident
+                   (<ws> <':'> <ws> let-type)?
+                   (<ws> <'='> <ws> expr)?
+  let-type       = let-type-prim (<ws> '*'+)?
+  let-type-prim  = <'struct'> <ws> ident / int-type-name / ident
   if-stmt        = <'if'> <ws> if-cond <ws> block (<ws> <'else'> <ws> block)?
   if-cond        = <'('> <ws> expr <ws> <')'> / expr
   (* Postfix and prefix `++'/`--' both legal at statement level:

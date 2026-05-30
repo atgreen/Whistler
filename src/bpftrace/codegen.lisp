@@ -3260,7 +3260,7 @@
          ;; constant-key lookups to. Using map-lookup-ptr sidesteps
          ;; emit-key-to-stack entirely.
          ((eq (first arg) :map)
-          (let* ((info (gethash (getf (cdr arg) :name) *map-table*))
+          (let* ((info (gethash (or (getf (cdr arg) :name) "@") *map-table*))
                  (mname (minfo-name info))
                  (keys  (getf (cdr arg) :keys))
                  (p     (gensym "P"))
@@ -3274,6 +3274,15 @@
                       (whistler::probe-read-kernel
                        (+ ,rec ,off) ,size ,p)
                       0))))
+              ;; Empty key list (anon-map `@', or sentinel-key scalar
+              ;; maps) — `with-key' passes 0 directly; emit a plain
+              ;; map-lookup (no struct-key buffer).
+              ((null keys)
+               `(whistler:if-let
+                    (,p (whistler::map-lookup ,mname 0))
+                  (whistler::probe-read-kernel
+                   (+ ,rec ,off) ,size ,p)
+                  0))
               (t
                (setf *shared-key-buf-used* t)
                `(progn
@@ -6362,6 +6371,10 @@
                     (and info (minfo-value-struct info))))
                  ((eq (first rhs) :var)
                   (cdr (assoc (second rhs) acc :test #'string=)))
+                 ;; `$v = curtask' — bpftrace exposes curtask as
+                 ;; struct task_struct *, which is exactly what the
+                 ;; subsequent `$v.field' chain wants to know.
+                 ((eq (first rhs) :curtask) "task_struct")
                  (t nil)))
              (maybe-record (lhs rhs)
                (when (and (consp lhs) (eq (first lhs) :var))

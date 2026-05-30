@@ -576,13 +576,17 @@
       (:break-stmt    '(:break))
       (:continue-stmt '(:continue))
       (:let-stmt
-       ;; let $x;          → no-op (drop)
-       ;; let $x = expr;   → (:assign (:var "x") := expr)
+       ;; let $x;             → no-op (drop)
+       ;; let $x : TYPE;      → no-op (drop the type annotation)
+       ;; let $x = expr;      → (:assign (:var "x") := expr)
+       ;; let $x : TYPE = expr; → ditto, type annotation dropped.
        (let* ((ident-node (first-tagged inner :ident))
               (name       (text-of ident-node))
               (rhs        (find-if (lambda (c)
                                      (and (consp c)
-                                          (not (eq (tag-of c) :ident))))
+                                          (not (member (tag-of c)
+                                                       '(:ident :let-type
+                                                         :let-type-prim)))))
                                    (children-of inner))))
          (cond
            (rhs (list :assign
