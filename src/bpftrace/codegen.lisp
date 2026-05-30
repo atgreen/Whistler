@@ -875,6 +875,10 @@
     ;; sites (lower-index); here the result is just the underlying
     ;; pointer value, which we hand back as a u64.
     (:prim-ptr-cast (lower-expr (getf (cdr expr) :expr)))
+    ;; Plain `(int8)x' / `(uint32)x' integer cast. The IR is all u64,
+    ;; so we just lower the inner expression. Width-aware ops like
+    ;; bswap peek at this node before reaching here.
+    (:int-cast      (lower-expr (getf (cdr expr) :expr)))
     ;; Positional CLI parameter — `$1', `$2', …. Resolved from
     ;; *positional-args* at compile time. Numeric tokens lower to
     ;; their integer value; non-numeric tokens become 0 (matching
@@ -1967,11 +1971,7 @@
       ;; version is what we need. Use the 16-bit swap pattern that
       ;; works for u16 values; higher bytes pass through if any are set.
       ((string= name "bswap")
-       (let ((x (gensym "BSWAP")))
-         `(let ((,x ,(lower-expr (first (getf (cdr expr) :args)))))
-            (whistler::logior
-             (whistler::ash (whistler::logand ,x #xff) 8)
-             (whistler::ash (whistler::logand ,x #xff00) -8)))))
+       (lower-bswap (first (getf (cdr expr) :args))))
       ;; `getopt(NAME, DEFAULT, HELP)' — bpftrace's CLI-flag accessor.
       ;; If NAME was passed via `whistler bpftrace script.bt -- --NAME[=V]'
       ;; the parsed value lands in whistler/bpftrace:*named-params*, and
@@ -3222,6 +3222,70 @@
             (vmbtf  (whistler:ensure-vmlinux-btf))
             (params (whistler:btf-func-params vmbtf fname)))
        (* 8 (length params))))))
+
+(defun lower-bswap (arg-expr)
+  "Lower `bswap(EXPR)' with width dispatched from the syntactic shape
+   of EXPR. `bswap((int8)X)' is the identity; `(int16)' swaps 2
+   bytes; `(int32)' / `(int64)' swap 4 / 8 bytes. Plain `bswap(X)'
+   (no cast) defaults to a 16-bit swap, preserving the historical
+   behaviour the existing tools rely on (`bswap(\$port)' on u16
+   from skc_dport)."
+  (let ((width (bswap-width-from-cast arg-expr)))
+    (case width
+      (1 (lower-expr (strip-bswap-cast arg-expr)))
+      (2 (let ((x (gensym "BSWAP")))
+           `(let ((,x ,(lower-expr (strip-bswap-cast arg-expr))))
+              (whistler::logior
+               (whistler::ash (whistler::logand ,x #xff) 8)
+               (whistler::ash (whistler::logand ,x #xff00) -8)))))
+      (4 (let ((x (gensym "BSWAP")))
+           `(let ((,x ,(lower-expr (strip-bswap-cast arg-expr))))
+              (whistler::logior
+               (whistler::logior
+                (whistler::ash (whistler::logand ,x #xff)       24)
+                (whistler::ash (whistler::logand ,x #xff00)      8))
+               (whistler::logior
+                (whistler::ash (whistler::logand ,x #xff0000)   -8)
+                (whistler::ash (whistler::logand ,x #xff000000) -24))))))
+      (8 (let ((x (gensym "BSWAP")))
+           `(let ((,x ,(lower-expr (strip-bswap-cast arg-expr))))
+              (whistler::logior
+               (whistler::logior
+                (whistler::logior
+                 (whistler::ash (whistler::logand ,x #xff)              56)
+                 (whistler::ash (whistler::logand ,x #xff00)            40))
+                (whistler::logior
+                 (whistler::ash (whistler::logand ,x #xff0000)          24)
+                 (whistler::ash (whistler::logand ,x #xff000000)         8)))
+               (whistler::logior
+                (whistler::logior
+                 (whistler::ash (whistler::logand ,x #xff00000000)        -8)
+                 (whistler::ash (whistler::logand ,x #xff0000000000)     -24))
+                (whistler::logior
+                 (whistler::ash (whistler::logand ,x #xff000000000000)   -40)
+                 (whistler::ash (whistler::logand ,x #xff00000000000000) -56))))))))))
+
+(defun bswap-width-from-cast (expr)
+  "Return the byte width of bswap's arg based on its primitive cast
+   wrapper. `(int8)X' / `(uint8)X' → 1, `(int16)/(uint16)' → 2,
+   `(int32)/(uint32)' → 4, `(int64)/(uint64)/(int)/(uint)' → 8.
+   No cast defaults to 2 (legacy bpftrace tool compat)."
+  (cond
+    ((not (and (consp expr) (eq (first expr) :int-cast))) 2)
+    (t (let ((type (getf (cdr expr) :type)))
+         (cond
+           ((or (string= type "int8")  (string= type "uint8")) 1)
+           ((or (string= type "int16") (string= type "uint16")) 2)
+           ((or (string= type "int32") (string= type "uint32")) 4)
+           (t 8))))))
+
+(defun strip-bswap-cast (expr)
+  "Unwrap an int-cast wrapper so lower-expr sees the underlying
+   value — the cast's width was already consumed by
+   bswap-width-from-cast."
+  (if (and (consp expr) (eq (first expr) :int-cast))
+      (getf (cdr expr) :expr)
+      expr))
 
 (defun lower-bare-args ()
   "Lower `args' (used without `->field') to a stack buffer holding

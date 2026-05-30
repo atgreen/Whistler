@@ -745,13 +745,16 @@
          (list :cast :type type-name
                :expr (norm-expr-dispatch sub-primary))))
       (:primitive-cast
-       ;; (uint64)x, (int)x — drop the type; every value is u64
-       ;; downstream, so the cast is purely textual.
-       (let ((sub (find-if (lambda (c)
-                             (and (consp c)
-                                  (not (eq (tag-of c) :int-type-name))))
-                           (children-of inner))))
-         (norm-expr-dispatch sub)))
+       ;; (uint64)x, (int)x, (int8)x — preserved as `:int-cast' so
+       ;; width-sensitive ops (bswap, sizeof imprecision) can peek
+       ;; at the type. All values are u64 in the IR; lower-expr
+       ;; just lowers the inner expr.
+       (let* ((type (text-of (first-tagged inner :int-type-name)))
+              (sub  (find-if (lambda (c)
+                               (and (consp c)
+                                    (not (eq (tag-of c) :int-type-name))))
+                             (children-of inner))))
+         (list :int-cast :type type :expr (norm-expr-dispatch sub))))
       (:primitive-pointer-cast
        ;; (int32 *)x — the element type IS load-bearing: codegen needs
        ;; it to size `$v[i]' reads. We preserve it as :prim-ptr-cast
