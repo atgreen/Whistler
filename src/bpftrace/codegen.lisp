@@ -1288,12 +1288,40 @@
                 (setf (gethash (car e) tbl) (cdr e)))
               tbl))))
 
+(defvar *ncpus-cache* nil
+  "Memoised result of HOST-NCPUS — the host CPU count is fixed for
+   the lifetime of the process.")
+
+(defun host-ncpus ()
+  "Number of possible CPUs on the host, parsed from
+   /sys/devices/system/cpu/possible (e.g. `0-15' → 16). Falls back
+   to 1 if the file is unreadable or unparseable."
+  (or *ncpus-cache*
+      (setf *ncpus-cache*
+            (let* ((path (probe-file "/sys/devices/system/cpu/possible"))
+                   (val  (or (and path
+                                  (with-open-file (s path)
+                                    (read-line s nil nil)))
+                             "0-0"))
+                   (dash (position #\- val)))
+              (or (and dash
+                       (1+ (- (parse-integer val :start (1+ dash)
+                                                 :junk-allowed t)
+                              (parse-integer val :end dash))))
+                  1)))))
+
 (defun resolve-constant (name)
   "Look NAME up in (1) the script's own #define directives, then
    (2) script-level enum decl members, then (3) BTF enums + the
    curated table. Returns the integer value or NIL."
   (or (cdr (assoc name *user-cpp-defines* :test #'string=))
       (cdr (assoc name *script-enum-values* :test #'string=))
+      ;; `ncpus' / `__builtin_ncpus' — bpftrace's compile-time host
+      ;; CPU count. Inlined the same way both as a bare identifier
+      ;; and as a zero-arg call (see lower-call).
+      (and (or (string= name "ncpus")
+               (string= name "__builtin_ncpus"))
+           (host-ncpus))
       (gethash name (constants-table))))
 
 (defun lower-builtin (kw)
@@ -2354,6 +2382,10 @@
       ((string= name "percpu_kaddr")
        (lower-percpu-kaddr-call (getf (cdr expr) :args)))
       ((string= name "has_key") (lower-has-key-call (getf (cdr expr) :args)))
+      ;; `ncpus()' — bpftrace's host-CPU-count builtin. Folded at
+      ;; compile time (the same value backs the bare `ncpus' /
+      ;; `__builtin_ncpus' identifiers via resolve-constant).
+      ((string= name "ncpus") (host-ncpus))
       ;; `bswap(x)' — byte-swap. bpftrace's bswap on a u16/u32 reverses
       ;; the byte order. We pick the width from key context; for the
       ;; common `bswap(\$port)' (a u16 from skc_dport) the 16-bit
