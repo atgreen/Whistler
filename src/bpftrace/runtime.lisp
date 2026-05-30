@@ -442,12 +442,13 @@
 
 (defun format-tuple-value (slots)
   "Render a tuple-value list as `(v1, v2, …)' — strings unquoted to
-   match bpftrace's display."
+   match bpftrace's display. Integer slots are reinterpreted as
+   signed-64 (so `-100' stored as a u64 round-trips correctly)."
   (with-output-to-string (s)
     (write-char #\( s)
     (loop for (v . rest) on slots
           do (cond ((stringp v) (write-string v s))
-                   (t (format s "~D" v)))
+                   (t (format s "~D" (signed-64 v))))
              (when rest (write-string ", " s)))
     (write-char #\) s)))
 
