@@ -427,16 +427,18 @@
      binds to a full postfix expression so a struct-pointer cast
      followed by `.field' is parsed as `cast(args.field)' (matching
      bpftrace), not `cast(args).field'. *)
-  cast           = <'('> <ws> <'struct'> <ws> ident <ws> <'*'> <ws> <')'> <ws> postfix
+  cast           = <'('> <ws> <'struct'> <ws> ident <ws> <'*'> <ws> <')'> <ws> unary
   (* Primitive C cast: uint64 of expr, int of expr. Treated as a no-op
      since all values are u64 in our IR; preserves bpftrace
-     compatibility for scripts that lean on integer narrowing. *)
-  primitive-cast = <'('> <ws> int-type-name <ws> <')'> <ws> postfix
+     compatibility for scripts that lean on integer narrowing. `unary'
+     (not just `postfix') on the right so `(int8) -10' parses as a
+     cast of `-10' rather than `(int8) - 10' (binary subtraction). *)
+  primitive-cast = <'('> <ws> int-type-name <ws> <')'> <ws> unary
   (* Primitive-pointer cast: int32-star, uint64-star, etc. Distinct
      from primitive-cast because the element type is load-bearing —
      it tells the codegen how many bytes to read per element when the
      result is subscripted (`$a[i]'). *)
-  primitive-pointer-cast = <'('> <ws> int-type-name <ws> <'*'> <ws> <')'> <ws> postfix
+  primitive-pointer-cast = <'('> <ws> int-type-name <ws> <'*'> <ws> <')'> <ws> unary
   (* `bool' is a no-op alongside `int' / `uint' for cast purposes —
      all values are u64 in our IR. Accepting it matches bpftrace. *)
   int-type-name  = 'uint64' / 'uint32' / 'uint16' / 'uint8' /
