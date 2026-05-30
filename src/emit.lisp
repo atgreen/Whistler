@@ -1107,21 +1107,74 @@
           (let ((flags-reg (vreg-to-physical ctx flags-arg whistler/bpf:+bpf-reg-4+)))
             (unless (= flags-reg whistler/bpf:+bpf-reg-4+)
               (ectx-emit ctx (whistler/bpf:emit-mov64-reg whistler/bpf:+bpf-reg-4+ flags-reg))))))
-    ;; Move key/val pointers to R2/R3 FIRST (before ld_pseudo clobbers R1)
-    (let ((key-off (and (integerp key-vreg)
-                        (gethash key-vreg (emit-ctx-struct-offsets ctx))))
-          (val-off (and (integerp val-vreg)
-                        (gethash val-vreg (emit-ctx-struct-offsets ctx)))))
-      (if key-off
-          (emit-stack-ptr ctx key-off whistler/bpf:+bpf-reg-2+)
-          (let ((key-reg (vreg-to-physical ctx key-vreg whistler/bpf:+bpf-reg-2+)))
-            (unless (= key-reg whistler/bpf:+bpf-reg-2+)
-              (ectx-emit ctx (whistler/bpf:emit-mov64-reg whistler/bpf:+bpf-reg-2+ key-reg)))))
-      (if val-off
-          (emit-stack-ptr ctx val-off whistler/bpf:+bpf-reg-3+)
-          (let ((val-reg (vreg-to-physical ctx val-vreg whistler/bpf:+bpf-reg-3+)))
-            (unless (= val-reg whistler/bpf:+bpf-reg-3+)
-              (ectx-emit ctx (whistler/bpf:emit-mov64-reg whistler/bpf:+bpf-reg-3+ val-reg)))))
+    ;; Move key/val pointers to R2/R3 FIRST (before ld_pseudo clobbers R1).
+    ;; Key/val sources may currently live in R2/R3 with the roles swapped
+    ;; (regalloc had no reason to align them with the call's ABI). A naive
+    ;; "mov r2 from key; mov r3 from val" then clobbers val before val is
+    ;; read. Resolve the parallel copy explicitly.
+    (let* ((key-off (and (integerp key-vreg)
+                         (gethash key-vreg (emit-ctx-struct-offsets ctx))))
+           (val-off (and (integerp val-vreg)
+                         (gethash val-vreg (emit-ctx-struct-offsets ctx))))
+           ;; Resolve each source to its current physical register (when it
+           ;; isn't a struct-base). For stack-homed vregs, vreg-to-physical
+           ;; loads into the suggested temp — pick distinct temps so the two
+           ;; loads can't accidentally share a slot.
+           (key-src (and (not key-off)
+                         (vreg-to-physical ctx key-vreg whistler/bpf:+bpf-reg-2+)))
+           (val-src (and (not val-off)
+                         (vreg-to-physical ctx val-vreg whistler/bpf:+bpf-reg-3+))))
+      (cond
+        ;; Both via struct-offset: independent stack-ptr emissions, no
+        ;; register interference.
+        ((and key-off val-off)
+         (emit-stack-ptr ctx key-off whistler/bpf:+bpf-reg-2+)
+         (emit-stack-ptr ctx val-off whistler/bpf:+bpf-reg-3+))
+        ;; Key from struct-offset, val from register: emit val's mov first
+        ;; in case it currently lives in R2 (which key's stack-ptr would
+        ;; clobber).
+        (key-off
+         (unless (= val-src whistler/bpf:+bpf-reg-3+)
+           (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                           whistler/bpf:+bpf-reg-3+ val-src)))
+         (emit-stack-ptr ctx key-off whistler/bpf:+bpf-reg-2+))
+        ;; Val from struct-offset, key from register: emit key's mov first
+        ;; in case it lives in R3.
+        (val-off
+         (unless (= key-src whistler/bpf:+bpf-reg-2+)
+           (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                           whistler/bpf:+bpf-reg-2+ key-src)))
+         (emit-stack-ptr ctx val-off whistler/bpf:+bpf-reg-3+))
+        ;; Both from registers: order the moves so each source is read
+        ;; before its register is overwritten. Detect the swap case
+        ;; (key in R3, val in R2) and route through a temp.
+        ((and (= key-src whistler/bpf:+bpf-reg-3+)
+              (= val-src whistler/bpf:+bpf-reg-2+))
+         ;; Swap via R5 (R4 holds flags, R1 is reserved for map fd).
+         (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                         whistler/bpf:+bpf-reg-5+ whistler/bpf:+bpf-reg-2+))
+         (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                         whistler/bpf:+bpf-reg-2+ whistler/bpf:+bpf-reg-3+))
+         (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                         whistler/bpf:+bpf-reg-3+ whistler/bpf:+bpf-reg-5+)))
+        ;; Key currently in R3: emit val→R3 would clobber key. Do key→R2
+        ;; first (it leaves R3 untouched), then val→R3.
+        ((= key-src whistler/bpf:+bpf-reg-3+)
+         (unless (= key-src whistler/bpf:+bpf-reg-2+)
+           (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                           whistler/bpf:+bpf-reg-2+ key-src)))
+         (unless (= val-src whistler/bpf:+bpf-reg-3+)
+           (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                           whistler/bpf:+bpf-reg-3+ val-src))))
+        ;; Default order: val→R3 first (in case val sits in R2), then
+        ;; key→R2. Covers val-src=R2 and any non-conflicting layout.
+        (t
+         (unless (= val-src whistler/bpf:+bpf-reg-3+)
+           (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                           whistler/bpf:+bpf-reg-3+ val-src)))
+         (unless (= key-src whistler/bpf:+bpf-reg-2+)
+           (ectx-emit ctx (whistler/bpf:emit-mov64-reg
+                           whistler/bpf:+bpf-reg-2+ key-src)))))
       ;; R1 = map fd (after key/val are safe in R2/R3)
       (emit-map-fd ctx map-name whistler/bpf:+bpf-reg-1+))
     (ectx-emit ctx (whistler/bpf:emit-call whistler/bpf:+bpf-func-map-update-elem+))
