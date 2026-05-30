@@ -561,14 +561,14 @@
                do (when (plusp i) (write-string "," s))
                   (format s "~D" v)))
        (write-char #\] s)))
-    ((<= parts 1) (format nil "~D" key))
+    ((<= parts 1) (format nil "~D" (signed-64 key)))
     (t
      (with-output-to-string (s)
        (loop for i below parts
              for v = (logand (ash key (* i -64)) #xffffffffffffffff)
              do (when (plusp i)
                   (write-string (if json-p "," ", ") s))
-                (format s "~D" v))))))
+                (format s "~D" (signed-64 v)))))))
 
 (defun si-number (n)
   "bpftrace-style SI suffix: 1024 → \"1K\", 1048576 → \"1M\"."
