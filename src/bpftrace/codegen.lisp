@@ -5551,6 +5551,26 @@
       (mapc #'walk stmts))
     acc))
 
+(defun probe-spec-display (spec)
+  "User-visible probe name as bpftrace surfaces it: `BEGIN', `END',
+   `kprobe:vfs_open', `tracepoint:syscalls:sys_enter_open',
+   `uprobe:/lib/libc.so:malloc', etc. Distinct from the internal
+   BPF section name (`test_run/begin_1', etc.) which we route to
+   the kernel."
+  (case (first spec)
+    (:begin       "BEGIN")
+    (:end         "END")
+    (:kprobe      (format nil "kprobe:~A" (second spec)))
+    (:kretprobe   (format nil "kretprobe:~A" (second spec)))
+    (:kfunc       (format nil "kfunc:~A" (second spec)))
+    (:kretfunc    (format nil "kretfunc:~A" (second spec)))
+    (:uprobe      (format nil "uprobe:~A:~A" (second spec) (third spec)))
+    (:uretprobe   (format nil "uretprobe:~A:~A" (second spec) (third spec)))
+    (:tracepoint  (format nil "tracepoint:~A:~A" (second spec) (third spec)))
+    (:profile     (format nil "profile:~A:~A" (second spec) (third spec)))
+    (:interval    (format nil "interval:~A:~A" (second spec) (third spec)))
+    (t            (format nil "~A" (first spec)))))
+
 (defun probe-string-buf-size (body)
   "Walk BODY for `@m[k] = :str / :func / :probe-name / :comm' map
    assignments and return the largest value-size of any string-typed
@@ -5587,7 +5607,7 @@
            (*comm-vars*  (infer-comm-vars body))
            (*str-vars*   (infer-str-vars body))
            (*tuple-vars* (infer-tuple-vars body))
-           (probe-str (format nil "~A" section))
+           (probe-str (probe-spec-display spec))
            (func-str  (probe-func-name spec))
            (body      (rewrite-self-refs body probe-str func-str))
            (pred      (when pred (rewrite-self-refs pred probe-str func-str)))
