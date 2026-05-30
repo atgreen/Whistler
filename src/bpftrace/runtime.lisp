@@ -2086,18 +2086,29 @@
                      (force-output))
                    ;; Poll-sleep until interrupted or exit() fires.
                    ;; Drain the printf ringbuf on every tick.
+                   ;;
+                   ;; Skip the loop entirely when there's nothing to
+                   ;; wait for — no live kernel attachments AND no -c
+                   ;; child. Begin-only scripts (`begin { @x = ~10; }')
+                   ;; would otherwise hang forever after the BEGIN
+                   ;; probe finishes, matching the test-suite TIMEOUTs
+                   ;; on basic.bitwise_not / basic.increment-decrement
+                   ;; / has_key-error-scalar. bpftrace upstream also
+                   ;; exits in this shape — there are no probes to
+                   ;; service.
                    (setf *bpftrace-running* t)
-                   (handler-case
-                       (loop while (and *bpftrace-running*
-                                        (not (exit-flag-set-p exit-info))
-                                        (not (and *child-process*
-                                                  (child-exited-p *child-process*))))
-                             do (if ring-consumer
-                                    (whistler/loader::ring-poll
-                                     ring-consumer :timeout-ms 100)
-                                    (sleep 0.1)))
-                     (sb-sys:interactive-interrupt ()
-                       (format t "~&^C~%"))))
+                   (when (or atts *child-process*)
+                     (handler-case
+                         (loop while (and *bpftrace-running*
+                                          (not (exit-flag-set-p exit-info))
+                                          (not (and *child-process*
+                                                    (child-exited-p *child-process*))))
+                               do (if ring-consumer
+                                      (whistler/loader::ring-poll
+                                       ring-consumer :timeout-ms 100)
+                                      (sleep 0.1)))
+                       (sb-sys:interactive-interrupt ()
+                         (format t "~&^C~%")))))
                (bpftrace-attach-error (e)
                  (format *error-output* "~&~A~%" e)))
           ;; END — kernel test_run, then drain final printf output,

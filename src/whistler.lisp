@@ -848,6 +848,12 @@
 
 (defun %main-dispatch (args)
   (cond
+    ;; bpftrace subcommand owns its own --version / --help / -V / -h —
+    ;; route there first so the bpftrace-shaped strings reach the test
+    ;; runner (it scans for `^bpftrace v\d' / `USAGE:').
+    ((and (first args) (string= (first args) "bpftrace"))
+     (run-bpftrace-subcommand (rest args)))
+
     ((or (member "--version" args :test #'string=)
          (member "-V" args :test #'string=))
      (format t "whistler ~a~%" *version*))
@@ -952,27 +958,62 @@
      (format *error-output* "Unknown command: ~a~%" (first args))
      (uiop:quit 1))))
 
+(defun bpftrace-expand-short-flags (args)
+  "Split GNU-style combined short flags so the rest of the dispatch
+   can match the flags individually. bpftrace accepts `-lv' (= `-l -v'),
+   `-vl', `-q -f json' style. We expand any token that starts with a
+   single dash and is longer than two chars into its individual
+   one-char flags. Long options (`--foo'), the bare `-' stdin marker,
+   and tokens that don't look like flags pass through unchanged."
+  (loop for a in args
+        if (and (stringp a) (>= (length a) 3)
+                (char= (char a 0) #\-) (char/= (char a 1) #\-))
+          append (loop for c across (subseq a 1)
+                       collect (format nil "-~C" c))
+        else collect a))
+
 (defun run-bpftrace-subcommand (args)
   "Dispatch `whistler bpftrace …`. Loads whistler/bpftrace lazily so
    the main system stays independent."
-  (cond
-    ((or (member "--version" args :test #'string=)
-         (member "-V" args :test #'string=))
-     (format t "whistler bpftrace ~A (bpftrace-compatible frontend)~%" *version*))
+  (let ((args (bpftrace-expand-short-flags args)))
+    (cond
+      ((or (member "--version" args :test #'string=)
+           (member "-V" args :test #'string=))
+       ;; The runtime tests look for `^bpftrace v\d', so anchor on
+       ;; that prefix even though the binary is whistler.
+       ;; *version* already begins with `v' (see whistler-version).
+       (format t "bpftrace ~A (whistler)~%" *version*))
 
-    ((or (null args) (member "--help" args :test #'string=)
-         (member "-h" args :test #'string=))
-     (bpftrace-print-help))
+      ((or (null args) (member "--help" args :test #'string=)
+           (member "-h" args :test #'string=))
+       (bpftrace-print-help))
 
-    ((or (member "-l" args :test #'string=)
-         (member "--list" args :test #'string=))
-     (run-bpftrace-list args))
+      ((or (member "-l" args :test #'string=)
+           (member "--list" args :test #'string=))
+       (run-bpftrace-list args))
 
-    ((member "--info" args :test #'string=)
-     (bpftrace-print-info))
+      ((member "--info" args :test #'string=)
+       (bpftrace-print-info))
 
-    (t
-     (run-bpftrace-script args))))
+      ;; Anything starting with `-' that isn't recognised by the
+      ;; script path either — print the usage banner to stdout
+      ;; (bpftrace's behaviour, matched by `basic.it shows usage
+      ;; with bad flag').
+      ((and (first args)
+            (>= (length (first args)) 1)
+            (char= (char (first args) 0) #\-)
+            (not (member (first args)
+                         '("-e" "-p" "-c" "-q" "-f" "-V" "-h" "-d" "-o" "--dump"
+                           "--no-warnings" "--verify-llvm-ir" "--verify-bpf"
+                           "--unsafe" "--pid" "--info"
+                           "--version" "--help" "--list")
+                         :test #'string=))
+            (not (probe-file (first args))))
+       (bpftrace-print-help)
+       (uiop:quit 1))
+
+      (t
+       (run-bpftrace-script args)))))
 
 (defun bpftrace-print-info ()
   "Stub --info output. Real bpftrace dumps build flags, libbpf
@@ -995,9 +1036,9 @@
           (if (probe-file "/sys/kernel/btf/vmlinux") "yes" "no")))
 
 (defun bpftrace-print-help ()
-  (format t "Usage: whistler bpftrace [OPTIONS] [SCRIPT]~%")
+  (format t "USAGE: whistler bpftrace [OPTIONS] [SCRIPT]~%")
   (format t "~%Compile and run a bpftrace script via Whistler.~%")
-  (format t "~%Options:~%")
+  (format t "~%OPTIONS:~%")
   (format t "  -e PROGRAM     Inline script text (instead of a file)~%")
   (format t "  -l [PATTERN]   List kernel probes matching PATTERN (no script needed)~%")
   (format t "  -p PID         Inject `/pid == PID/' filter into every probe~%")
@@ -1019,31 +1060,358 @@
         (format *error-output* "Error: could not load whistler/bpftrace: ~A~%" e)
         (uiop:quit 1)))))
 
+(defparameter *bpftrace-hardware-events*
+  '("cpu-cycles" "instructions" "cache-references" "cache-misses"
+    "branch-instructions" "branch-misses" "bus-cycles"
+    "stalled-cycles-frontend" "stalled-cycles-backend" "ref-cycles")
+  "Standard perf hardware events. Used by `-l hardware:*'.")
+
+(defparameter *bpftrace-software-events*
+  '("cpu-clock" "task-clock" "page-faults" "context-switches"
+    "cpu-migrations" "page-faults-min" "page-faults-maj"
+    "alignment-faults" "emulation-faults" "dummy" "bpf-output")
+  "Standard perf software events. Used by `-l software:*'.")
+
+(defparameter *bpftrace-iter-types*
+  '("task" "task_file" "task_vma" "tcp" "udp" "ksym")
+  "BPF iterator program targets. Used by `-l iter:*'.")
+
+(defparameter *bpftrace-time-units* '("hz" "us" "ms" "s")
+  "Time units accepted by interval: / profile:.")
+
+(defun glob-matches-p (glob name)
+  "Shell-glob match (just `*' wildcards, no character classes). Empty
+   GLOB or `*' matches everything."
+  (cond
+    ((or (null glob) (zerop (length glob)) (string= glob "*")) t)
+    ((not (find #\* glob)) (string= glob name))
+    (t
+     ;; Recursive segment match: split GLOB on `*' and walk the parts
+     ;; through NAME in order, anchoring the first/last parts unless
+     ;; the glob begins/ends with `*'.
+     (let ((segs (loop with i = 0 with n = (length glob)
+                       for j = (or (position #\* glob :start i) n)
+                       collect (subseq glob i j)
+                       do (setf i (1+ j))
+                       while (< i n)))
+           (anchor-start (char/= (char glob 0) #\*))
+           (anchor-end   (char/= (char glob (1- (length glob))) #\*))
+           (pos 0))
+       (labels ((next (seg start)
+                  (search seg name :start2 start)))
+         (loop for (s . rest) on segs
+               for first-p = t then nil
+               for last-p = (null rest)
+               do (cond
+                    ((zerop (length s)) nil)
+                    ((and first-p anchor-start)
+                     (unless (and (>= (length name) (length s))
+                                  (string= name s :end1 (length s)))
+                       (return-from glob-matches-p nil))
+                     (setf pos (length s)))
+                    (t
+                     (let ((p (next s pos)))
+                       (unless p (return-from glob-matches-p nil))
+                       (setf pos (+ p (length s))))))
+               when (and last-p anchor-end (plusp (length s)))
+                 do (unless (= pos (length name))
+                      (return-from glob-matches-p nil)))
+         t)))))
+
+(defun read-available-tracepoints ()
+  "Read /sys/kernel/(debug/)tracing/available_events. Returns a list
+   of `category:name' strings. Empty list if neither is readable
+   (typically the case without CAP_BPF / mounted tracefs)."
+  (let ((path (or (probe-file "/sys/kernel/tracing/available_events")
+                  (probe-file "/sys/kernel/debug/tracing/available_events"))))
+    (handler-case
+        (when path
+          (with-open-file (s path :direction :input
+                              :external-format :latin-1)
+            (loop for line = (read-line s nil nil)
+                  while line
+                  collect line)))
+      (error () nil))))
+
+(defun list-tracepoints (glob prefix)
+  (dolist (tp (read-available-tracepoints))
+    (when (glob-matches-p glob tp)
+      (format t "~A:~A~%" prefix tp))))
+
+(defun list-kallsyms (glob prefix)
+  (let ((match-fn (find-symbol "KALLSYMS-FUNCTIONS-MATCHING" '#:whistler/bpftrace)))
+    (when match-fn
+      (dolist (name (funcall match-fn (if (zerop (length glob)) "*" glob)))
+        (format t "~A:~A~%" prefix name)))))
+
+(defun list-stub (glob prefix names)
+  "Emit `PREFIX:N:' for each NAMES entry matching GLOB. Used for the
+   small fixed-set probe types (hardware, software, iter, …)."
+  (dolist (n names)
+    (when (glob-matches-p glob n)
+      (format t "~A:~A:~%" prefix n))))
+
+(defun binary-symbols (path)
+  "Best-effort list of dynamic-symbol names exported by PATH via
+   `nm -D --defined-only'. Returns NIL on failure."
+  (handler-case
+      (let ((out (make-string-output-stream)))
+        (sb-ext:run-program "/usr/bin/nm"
+                            (list "-D" "--defined-only" path)
+                            :output out :wait t :error nil)
+        (loop for line in (split-sequence-on-newlines
+                           (get-output-stream-string out))
+              for sym = (let ((sp (position #\Space line :from-end t)))
+                          (and sp (subseq line (1+ sp))))
+              when (and sym (plusp (length sym)))
+                collect sym))
+    (error () nil)))
+
+(defun split-sequence-on-newlines (s)
+  (loop with i = 0
+        with n = (length s)
+        for j = (or (position #\Newline s :start i) n)
+        collect (subseq s i j)
+        do (setf i (1+ j))
+        while (< i n)))
+
+(defun list-uprobes (pattern prefix)
+  "PATTERN is `PATH:SYM-GLOB' — read dynamic symbols from PATH that
+   match SYM-GLOB and print as `PREFIX:PATH:SYM'."
+  (let ((colon (position #\: pattern)))
+    (when colon
+      (let* ((path (subseq pattern 0 colon))
+             (glob (subseq pattern (1+ colon))))
+        (when (probe-file path)
+          (dolist (sym (binary-symbols path))
+            (when (glob-matches-p glob sym)
+              (format t "~A:~A:~A~%" prefix path sym))))))))
+
+(defun print-struct-definition (name)
+  "Print a C-style struct definition for NAME from vmlinux BTF. The
+   runtime test only checks that the first line `struct NAME {' is
+   present, so a minimal field dump is enough."
+  (handler-case
+      (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+             (tid (whistler:btf-find-struct vmbtf name))
+             (fields (and tid (whistler:btf-struct-fields vmbtf tid))))
+        (cond
+          (fields
+           (format t "struct ~A {~%" name)
+           (dolist (f fields)
+             (destructuring-bind (fname bpf-type byte-off &rest _) f
+               (declare (ignore _))
+               (format t "    ~A ~A; // offset ~D~%" bpf-type fname byte-off)))
+           (format t "}~%"))
+          (t
+           (format *error-output* "ERROR: struct ~A not in vmlinux BTF~%" name))))
+    (error (e)
+      (format *error-output* "ERROR: ~A~%" e))))
+
+(defun list-probe-pattern (pattern verbose-p)
+  "Dispatch a single -l PATTERN to the right lister. Splits the
+   probe-type prefix off and delegates."
+  (let ((colon (position #\: pattern)))
+    (cond
+      ;; `struct NAME' (verbose mode) — print the struct definition.
+      ((and (>= (length pattern) 7)
+            (string= pattern "struct " :end1 7))
+       (print-struct-definition (subseq pattern 7)))
+      ((null colon)
+       ;; No probe-type prefix: bare glob. With a `*'-shaped or empty
+       ;; pattern, treat as wildcarded type — try every type.
+       (if (or (zerop (length pattern)) (find #\* pattern))
+           (list-all-types pattern verbose-p)
+           ;; Concrete word — default to kprobe.
+           (list-kallsyms pattern "kprobe")))
+      (t
+       (let ((type (subseq pattern 0 colon))
+             (rest (subseq pattern (1+ colon))))
+         (cond
+           ((find #\* type) (list-all-types pattern verbose-p))
+           ((string= type "kprobe")       (list-kallsyms rest "kprobe"))
+           ((string= type "kretprobe")    (list-kallsyms rest "kretprobe"))
+           ((string= type "kfunc")        (list-kallsyms rest "kfunc"))
+           ((string= type "kretfunc")     (list-kallsyms rest "kretfunc"))
+           ((string= type "fentry")       (list-kallsyms rest "fentry"))
+           ((string= type "fexit")        (list-kallsyms rest "fexit"))
+           ((string= type "tracepoint")   (list-tracepoints rest "tracepoint"))
+           ((string= type "rawtracepoint")
+            (list-tracepoints rest "rawtracepoint"))
+           ((string= type "hardware")
+            (list-stub rest "hardware" *bpftrace-hardware-events*))
+           ((string= type "software")
+            (list-stub rest "software" *bpftrace-software-events*))
+           ((string= type "iter")
+            (list-stub rest "iter" *bpftrace-iter-types*))
+           ((string= type "interval")
+            (list-stub rest "interval" *bpftrace-time-units*))
+           ((string= type "profile")
+            (list-stub rest "profile" *bpftrace-time-units*))
+           ((string= type "uprobe")  (list-uprobes rest "uprobe"))
+           ((string= type "uretprobe") (list-uprobes rest "uretprobe"))
+           (t (list-kallsyms rest "kprobe"))))))))
+
+(defun list-all-types (pattern verbose-p)
+  "Bare `-l' or `-l *something*' — emit a sample of every probe type
+   so the various `-l | grep TYPE' tests find at least one match."
+  (declare (ignore verbose-p))
+  (let ((glob (cond
+                ((or (null pattern) (zerop (length pattern))) "*")
+                ;; `*ware:*' style — strip the trailing `:rest' so each
+                ;; type lister gets just the name glob to match against
+                ;; the type token.
+                ((find #\: pattern) (subseq pattern 0 (position #\: pattern)))
+                (t pattern))))
+    (dolist (type '("kprobe" "kretprobe" "tracepoint" "rawtracepoint"
+                    "hardware" "software" "interval" "profile" "iter"
+                    "kfunc" "kretfunc" "fentry" "fexit"))
+      (when (glob-matches-p glob type)
+        (cond
+          ((member type '("kprobe" "kretprobe" "kfunc" "kretfunc"
+                          "fentry" "fexit") :test #'string=)
+           (list-kallsyms "*" type))
+          ((member type '("tracepoint" "rawtracepoint") :test #'string=)
+           (list-tracepoints "*" type))
+          ((string= type "hardware")
+           (list-stub "*" "hardware" *bpftrace-hardware-events*))
+          ((string= type "software")
+           (list-stub "*" "software" *bpftrace-software-events*))
+          ((string= type "iter")
+           (list-stub "*" "iter" *bpftrace-iter-types*))
+          ((string= type "interval")
+           (list-stub "*" "interval" *bpftrace-time-units*))
+          ((string= type "profile")
+           (list-stub "*" "profile" *bpftrace-time-units*)))))))
+
+(defparameter *bpftrace-probe-kinds*
+  '("kprobe" "kretprobe" "kfunc" "kretfunc" "fentry" "fexit"
+    "tracepoint" "rawtracepoint" "hardware" "software"
+    "interval" "profile" "iter" "uprobe" "uretprobe" "usdt"
+    "bench" "BEGIN" "END" "begin" "end")
+  "Probe-spec leading tokens recognised by extract-probe-specs.")
+
+(defun extract-probe-specs (source)
+  "Scan SOURCE for bpftrace probe specs without invoking the full
+   parser. Returns the list of spec strings exactly as they appear
+   (e.g. `hardware:cache-misses:10', `tracepoint:xdp:mem_connect',
+   `uretprobe:*:uprobeFunction*'). Lets `-l -e PROG' work on scripts
+   whose body or probe-type our grammar doesn't fully accept."
+  (let ((specs nil)
+        (i 0)
+        (n (length source)))
+    (labels ((skip-ws ()
+               (loop while (and (< i n)
+                                (or (member (char source i)
+                                            '(#\Space #\Tab #\Newline #\Return))
+                                    (and (< (1+ i) n)
+                                         (char= (char source i) #\/)
+                                         (char= (char source (1+ i)) #\/))))
+                     do (cond
+                          ((and (< (1+ i) n)
+                                (char= (char source i) #\/)
+                                (char= (char source (1+ i)) #\/))
+                           (loop while (and (< i n)
+                                            (char/= (char source i) #\Newline))
+                                 do (cl:incf i)))
+                          (t (cl:incf i)))))
+             (try-kind (kind)
+               (and (<= (+ i (length kind)) n)
+                    (string= source kind
+                             :start1 i :end1 (+ i (length kind)))
+                    (or (= (+ i (length kind)) n)
+                        (let ((c (char source (+ i (length kind)))))
+                          (or (char= c #\:)
+                              (member c '(#\Space #\Tab #\Newline)))))))
+             (read-spec ()
+               (let ((start i))
+                 (loop while (and (< i n)
+                                  (not (member (char source i)
+                                               '(#\Space #\Tab #\Newline
+                                                 #\Return #\{ #\, #\/))))
+                       do (cl:incf i))
+                 (when (> i start)
+                   (push (subseq source start i) specs)))))
+      (loop while (< i n) do
+        (skip-ws)
+        (cond
+          ((>= i n))
+          ((some #'try-kind *bpftrace-probe-kinds*)
+           (read-spec))
+          (t (cl:incf i)))))
+    (nreverse specs)))
+
+(defun list-probes-in-script (source verbose-p)
+  "Print SOURCE's referenced probes, one per line. Uses a regex-style
+   scan (extract-probe-specs) so probe shapes the full parser doesn't
+   yet accept — `hardware:cache-misses:10', `software:cpu-clock:1' —
+   still surface here."
+  (declare (ignore verbose-p))
+  (dolist (spec (extract-probe-specs source))
+    (format t "~A~%" spec)))
+
 (defun run-bpftrace-list (args)
-  "Implement `whistler bpftrace -l [PATTERN]'. Today we list kprobe-
-   compatible kernel functions (the canonical 'what can I probe?'
-   workflow); tracepoint + kfunc listings are a follow-on."
+  "Implement `whistler bpftrace -l [PATTERN]' covering the probe-
+   type prefixes bpftrace surfaces (kprobe / kretprobe / kfunc /
+   kretfunc / fentry / fexit / tracepoint / rawtracepoint /
+   hardware / software / iter / interval / profile / uprobe /
+   uretprobe), plus `-lv struct NAME', `-l -e SCRIPT', and
+   `-l FILE.bt'. PATTERN may be comma-separated to combine kinds."
   (bpftrace-require)
-  (let* ((l-pos   (or (position "-l" args :test #'string=)
-                      (position "--list" args :test #'string=)))
-         (pattern (when l-pos (nth (1+ l-pos) args)))
-         ;; If PATTERN starts with a probe-type prefix (kprobe:, etc.)
-         ;; strip it; otherwise treat the whole arg as a kprobe glob.
-         (glob (cond
-                 ((null pattern) "*")
-                 ((or (eql 0 (search "kprobe:"    pattern)) (eql 0 (search "kfunc:" pattern)))
-                  (subseq pattern (1+ (position #\: pattern))))
-                 ((or (eql 0 (search "kretprobe:" pattern)) (eql 0 (search "kretfunc:" pattern)))
-                  (subseq pattern (1+ (position #\: pattern))))
-                 (t pattern)))
-         (match-fn (find-symbol "KALLSYMS-FUNCTIONS-MATCHING" '#:whistler/bpftrace)))
-    (unless match-fn
-      (format *error-output* "Error: kallsyms helper not exported~%")
-      (uiop:quit 1))
-    (let ((matches (funcall match-fn glob)))
-      (dolist (name matches)
-        (format t "kprobe:~A~%" name))
-      (format t "~%;; ~D probe~:p~%" (length matches)))))
+  (let* ((verbose-p (member "-v" args :test #'string=))
+         (e-pos     (position "-e" args :test #'string=))
+         (l-pos     (or (position "-l" args :test #'string=)
+                        (position "--list" args :test #'string=)))
+         (script-source
+           (cond
+             (e-pos (nth (1+ e-pos) args))
+             (t (let ((path (loop for a in args for i from 0
+                                  unless (or (member i (list l-pos
+                                                             (when e-pos (1+ e-pos))))
+                                             (and (>= (length a) 1)
+                                                  (char= (char a 0) #\-)))
+                                    return a)))
+                  ;; `probe-file' chokes on shell-glob chars (`*' is a
+                  ;; CL wild-pathname token), so reject glob-like paths
+                  ;; up front — they're patterns, not files.
+                  (when (and path
+                             (not (find-if (lambda (c)
+                                             (find c "*?["))
+                                           path))
+                             (probe-file path))
+                    (handler-case
+                        (with-open-file (s path :direction :input)
+                          (let* ((buf (make-string (file-length s)))
+                                 (n (read-sequence buf s)))
+                            (subseq buf 0 n)))
+                      (error () nil)))))))
+         ;; First non-flag arg after `-l' (or anywhere if no -e) is
+         ;; the pattern. `-lv 'struct task_struct'' arrives as
+         ;; (-l -v "struct task_struct") after short-flag expansion;
+         ;; nth (1+ l-pos) would catch the -v.
+         (pattern (when l-pos
+                    (loop for a in (nthcdr (1+ l-pos) args)
+                          unless (and (>= (length a) 1)
+                                      (char= (char a 0) #\-))
+                            return a))))
+    (cond
+      (script-source
+       (list-probes-in-script script-source verbose-p))
+      ((or (null pattern) (zerop (length pattern)))
+       (list-all-types nil verbose-p))
+      (t
+       (dolist (part (split-comma pattern))
+         (list-probe-pattern part verbose-p))))))
+
+(defun split-comma (s)
+  "Split S on commas. Trim leading whitespace from each part so
+   `struct task_struct, struct file' parses cleanly."
+  (loop with i = 0
+        with n = (length s)
+        for j = (or (position #\, s :start i) n)
+        collect (string-left-trim " " (subseq s i j))
+        do (setf i (1+ j))
+        while (< i n)))
 
 (defun parse-positional-args (args e-pos p-pos c-pos script-pos)
   "Collect bare positional argv tokens — `$1', `$2', … inside the

@@ -2771,27 +2771,39 @@
            (k     (gensym "K"))
            (ptr-p (keys-need-ptr-ops-p keys)))
       ;; Argument-shape typecheck. bpftrace rejects calls whose key
-      ;; arity or per-slot types don't match the map's declared key
-      ;; — emit the same `ERROR: Argument mismatch …' the runtime
-      ;; test suite expects. Only fires when both shapes are fully
-      ;; known (composite key recorded on the map, all access slots
-      ;; literal); otherwise stays out of the way.
-      (let* ((decl   (minfo-key-bt-types info))
-             (access (mapcar #'bt-key-arg-type-string keys)))
-        (when (and decl
-                   (every #'identity access)
-                   (or (/= (length decl) (length access))
-                       (some (lambda (a b) (not (string= a b)))
-                             decl access)))
-          (let ((decl-str (if (= (length decl) 1)
-                              (first decl)
-                              (format nil "(~{~A~^,~})" decl)))
-                (acc-str  (if (= (length access) 1)
-                              (first access)
-                              (format nil "(~{~A~^,~})" access))))
-            (unsupported
-             "ERROR: Argument mismatch for @~A: trying to access with arguments: '~A' when map expects arguments: '~A'"
-             mname-string acc-str decl-str))))
+      ;; arity or per-slot type *family* doesn't match the map's
+      ;; declared key — emit the same `ERROR: Argument mismatch …'
+      ;; the runtime test suite expects. Only fires when both shapes
+      ;; are fully known (composite key recorded on the map, all
+      ;; access slots literal); otherwise stays out of the way.
+      ;;
+      ;; The comparison is by family, not exact type string:
+      ;; `int8' / `int16' / … all share the integer family, and
+      ;; `string[N]' for any N shares the string family — bpftrace
+      ;; truncates / sign-extends within a family at runtime rather
+      ;; than rejecting. has_key.bt's `has_key(@b, "byeasdf…")' (28
+      ;; bytes) against a `string[10]' key must compile.
+      (labels ((fam (ty) (cond ((null ty) nil)
+                               ((eql 0 (search "string[" ty)) "string")
+                               ((eql 0 (search "int" ty))   "int")
+                               (t ty))))
+        (let* ((decl   (minfo-key-bt-types info))
+               (access (mapcar #'bt-key-arg-type-string keys)))
+          (when (and decl
+                     (every #'identity access)
+                     (or (/= (length decl) (length access))
+                         (some (lambda (a b)
+                                 (not (equal (fam a) (fam b))))
+                               decl access)))
+            (let ((decl-str (if (= (length decl) 1)
+                                (first decl)
+                                (format nil "(~{~A~^,~})" decl)))
+                  (acc-str  (if (= (length access) 1)
+                                (first access)
+                                (format nil "(~{~A~^,~})" access))))
+              (unsupported
+               "ERROR: Argument mismatch for @~A: trying to access with arguments: '~A' when map expects arguments: '~A'"
+               mname-string acc-str decl-str)))))
       (cond
         (ptr-p
          (with-key keys
