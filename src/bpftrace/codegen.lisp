@@ -1648,10 +1648,16 @@
         (n  (third args)))
     (unless (and (consp s2) (eq (first s2) :str))
       (unsupported "strncmp(): second arg must be a string literal"))
-    (unless (and (consp n) (eq (first n) :int))
-      (unsupported "strncmp(): third arg must be a literal int"))
-    (let* ((literal (second s2))
-           (limit   (second n))
+    (let ((limit-from-positional
+            (and (consp n) (eq (first n) :positional)
+                 (let* ((idx (second n))
+                        (raw (nth (1- idx) *positional-args*)))
+                   (and raw (parse-integer raw :junk-allowed t))))))
+      (unless (or (and (consp n) (eq (first n) :int))
+                  limit-from-positional)
+        (unsupported "strncmp(): third arg must be a literal int"))
+      (let* ((literal (second s2))
+             (limit   (or limit-from-positional (second n)))
            (bytes   (sb-ext:string-to-octets literal :external-format :utf-8))
            (cmp-len (min limit (length bytes)))
            (acc     (gensym "ACC"))
@@ -1686,7 +1692,7 @@
          ,@(loop for i from cmp-len below limit
                  collect `(whistler:incf ,acc
                                          (whistler::load whistler::u8 ,buf ,i)))
-         ,acc))))
+         ,acc)))))
 
 (defun lower-pcomm-into-record (rec off size)
   "Emit the kernel-side reads that fill REC[OFF..OFF+SIZE) with the
@@ -3185,9 +3191,22 @@
           (lower-pcomm-into-record rec off size))
          ((str-call-p arg)
           (let* ((args (getf (cdr arg) :args))
-                 (ptr  (lower-expr (first args)))
-                 (helper (intern "PROBE-READ-USER-STR" :whistler)))
-            `(,helper (+ ,rec ,off) ,size ,ptr)))
+                 (first-arg (first args))
+                 ;; `str($N)` where $N is a positional arg: bpftrace
+                 ;; reads the raw CLI token as the string. Fold the
+                 ;; literal in at compile time so we don't probe-read
+                 ;; user memory at the integer parse value.
+                 (positional-literal
+                   (and (consp first-arg) (eq (first first-arg) :positional)
+                        (nth (1- (second first-arg))
+                             *positional-args*))))
+            (cond
+              (positional-literal
+               (lower-printf-string-literal rec off positional-literal size))
+              (t
+               (let* ((ptr  (lower-expr first-arg))
+                      (helper (intern "PROBE-READ-USER-STR" :whistler)))
+                 `(,helper (+ ,rec ,off) ,size ,ptr))))))
          ((kstr-call-p arg)
           (let* ((args (getf (cdr arg) :args))
                  (ptr  (lower-expr (first args))))
