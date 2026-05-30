@@ -495,6 +495,36 @@
       x
       (list :label x)))
 
+(defun rewrite-phis-for-threaded-edge (prog from-block-label new-target-label new-pred-label)
+  "When we redirect NEW-PRED-LABEL → NEW-TARGET-LABEL (bypassing
+   FROM-BLOCK-LABEL), any PHI in NEW-TARGET-LABEL that had an arg
+   `(V :label FROM-BLOCK-LABEL)' represented the value carried on the
+   path through FROM-BLOCK-LABEL. After the redirect, that same value
+   reaches NEW-TARGET-LABEL via NEW-PRED-LABEL — add a parallel
+   `(V :label NEW-PRED-LABEL)' entry so prune-stale-phi-args doesn't
+   later collapse the PHI to a single-input MOV and lose the value
+   on the threaded edge."
+  (let ((target (ir-find-block prog new-target-label)))
+    (when target
+      (dolist (insn (basic-block-insns target))
+        (when (eq (ir-insn-op insn) :phi)
+          (let ((new-args (copy-list (ir-insn-args insn))))
+            (dolist (arg (ir-insn-args insn))
+              (when (and (consp arg) (consp (cdr arg))
+                         (consp (second arg))
+                         (eq (first (second arg)) :label)
+                         (eq (second (second arg)) from-block-label))
+                ;; Avoid duplicating an existing entry for new-pred.
+                (unless (find-if (lambda (a)
+                                   (and (consp a) (consp (cdr a))
+                                        (consp (second a))
+                                        (eq (first (second a)) :label)
+                                        (eq (second (second a)) new-pred-label)))
+                                 new-args)
+                  (push (list (first arg) (list :label new-pred-label))
+                        new-args))))
+            (setf (ir-insn-args insn) new-args)))))))
+
 (defun phi-thread-one-input (prog block phi-insn phi-arg then-label else-label
                              def-map const-map on-change)
   "Thread one PHI input: redirect predecessor to skip the PHI+branch block."
@@ -515,8 +545,16 @@
           (cond
             ;; Constant value → redirect to then or else directly
             (const-val
-             (setf (ir-insn-args pred-term)
-                   (list (if (zerop const-val) else-label then-label)))
+             (let ((new-target (if (zerop const-val) else-label then-label)))
+               (setf (ir-insn-args pred-term) (list new-target))
+               ;; Add PRED-LABEL entries to any PHIs in NEW-TARGET that
+               ;; carried values for the path through BLOCK — otherwise
+               ;; the later prune-stale-phi-args pass would drop those
+               ;; entries (BLOCK no longer reaches NEW-TARGET via this
+               ;; edge) and the PHI collapses to a single-input MOV
+               ;; missing the threaded path's value.
+               (rewrite-phis-for-threaded-edge
+                prog (basic-block-label block) (second new-target) from-label))
              ;; Remove this input from the PHI so downstream passes
              ;; (simplify-cfg merge) see the correct input count.
              (setf (ir-insn-args phi-insn)
@@ -532,6 +570,13 @@
                          (third (ir-insn-args def-insn))
                          then-label
                          else-label))
+             ;; Same downstream-PHI repair as the const-val case but
+             ;; for both then- and else-targets — the new br-cond may
+             ;; reach either, depending on the CMP outcome.
+             (rewrite-phis-for-threaded-edge
+              prog (basic-block-label block) (second then-label) from-label)
+             (rewrite-phis-for-threaded-edge
+              prog (basic-block-label block) (second else-label) from-label)
              ;; Remove this input from the PHI
              (setf (ir-insn-args phi-insn)
                    (remove phi-arg (ir-insn-args phi-insn) :test #'equal))
