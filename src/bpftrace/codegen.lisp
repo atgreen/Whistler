@@ -2950,7 +2950,15 @@
          (and (consp elem) (eq (first elem) :int-cast)
               (string= (getf (cdr elem) :type) "bool"))
          (and (consp elem) (eq (first elem) :var)
-              (member (second elem) *bool-vars* :test #'string=)))
+              (member (second elem) *bool-vars* :test #'string=))
+         ;; `!expr' (logical not) and comparison ops are bool-typed
+         ;; for printf purposes — `print((!0, !10))` should render as
+         ;; `(true, false)' not `(1, 0)'.
+         (and (consp elem) (eq (first elem) :un)
+              (eq (getf (cdr elem) :op) :!))
+         (and (consp elem) (eq (first elem) :bin)
+              (member (getf (cdr elem) :op)
+                      '(:== :!= :< :> :<= :>= :&& :\|\|))))
      "%B")
     (t  "%d")))
 
