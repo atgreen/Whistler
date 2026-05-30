@@ -2643,18 +2643,51 @@
 
 (defun lower-async-cat (args)
   "Emit a tagged ringbuf record asking userspace to read and dump
-   the contents of the file named in PATH-ARG."
-  (unless (and (= (length args) 1)
-               (consp (first args))
-               (eq (first (first args)) :str))
-    (unsupported "cat() arg must be a string literal path"))
-  (let* ((path (second (first args)))
+   the contents of the file named in PATH-ARG. Accepts a single :str
+   literal, or `cat(\"/%s/…\", \"p\", \"r\", …)' where every additional
+   argument is also a :str literal — we constant-fold those at compile
+   time into a single resolved path."
+  (let* ((path
+           (cond
+             ((and (= (length args) 1)
+                   (consp (first args))
+                   (eq (first (first args)) :str))
+              (second (first args)))
+             ((and (>= (length args) 2)
+                   (consp (first args))
+                   (eq (first (first args)) :str)
+                   (every (lambda (a)
+                            (and (consp a) (eq (first a) :str)))
+                          (rest args)))
+              (cat-fold-literal-format (second (first args))
+                                       (mapcar #'second (rest args))))
+             (t (unsupported "cat() arg must be a string literal path"))))
          (id (1+ (length *cat-paths-table*)))
          (rec (gensym "REC")))
     (push (cons id path) *cat-paths-table*)
     `(whistler:with-ringbuf (,rec ,*print-map-name* 8)
        (whistler::store ,(intern "U32" :whistler) ,rec 0 ,+bt-tag-cat+)
        (whistler::store ,(intern "U32" :whistler) ,rec 4 ,id))))
+
+(defun cat-fold-literal-format (fmt args)
+  "Resolve a bpftrace-style format string with %s args, both literal.
+   Used by lower-async-cat to support cat(\"/proc/%s/…\", lit, lit).
+   Only %s is supported; anything else fails the compile."
+  (with-output-to-string (out)
+    (let ((i 0) (n (length fmt)) (ai 0))
+      (loop while (< i n) do
+        (let ((c (char fmt i)))
+          (cond
+            ((and (char= c #\%) (< (1+ i) n)
+                  (char= (char fmt (1+ i)) #\s))
+             (when (>= ai (length args))
+               (unsupported "cat(): more %s in format than literal args"))
+             (write-string (nth ai args) out)
+             (incf ai)
+             (incf i 2))
+            ((char= c #\%)
+             (unsupported "cat(): only %s is supported in the format string"))
+            (t (write-char c out) (incf i))))))))
 
 (defun lower-async-system (args)
   "Emit a tagged ringbuf record asking userspace to spawn the literal
@@ -2915,12 +2948,19 @@
        (lower-printf (list (list :str (concatenate 'string "%s"
                                                    (string #\Newline)))
                            val)))
-      ;; `print(str(p))' / `print(kstr(p))' / `print(comm)' — the call
-      ;; produces a string slot, not a number. Without this, the default
-      ;; branch picks "%d" and the runtime formatter dies trying to
-      ;; render the string bytes as an integer.
+      ;; `print(str(p))' / `print(kstr(p))' / `print(comm)' and other
+      ;; string-producing calls — the value is a string slot, not a
+      ;; number. printf-arg-type already classifies each of these as
+      ;; (:string . N) / :ksym / :usym / :ipv-any / :strftime — picking
+      ;; %s here routes them through the matching printf decoder path.
       ((or (str-call-p val) (kstr-call-p val)
-           (eq tag :comm) (eq tag :pcomm))
+           (eq tag :comm) (eq tag :pcomm)
+           (and (eq tag :call)
+                (stringp (getf (cdr val) :name))
+                (member (getf (cdr val) :name)
+                        '("ksym" "usym" "ntop" "cgroup_path"
+                          "strftime" "username" "uaddr" "kaddr")
+                        :test #'string=)))
        (lower-printf (list (list :str (concatenate 'string "%s"
                                                    (string #\Newline)))
                            val)))
@@ -6534,11 +6574,21 @@
 
 (defun script-uses-kstack-p (script)
   "T iff `kstack' or `ustack' appears anywhere — gates injection of
-   the hidden bt-stacks stack-trace map (shared by both)."
-  (labels ((walk (form)
+   the hidden bt-stacks stack-trace map (shared by both). Catches both
+   the bare-builtin shape (:kstack / :ustack) and the call shape
+   `kstack()' / `ustack(N)' / `len(kstack)' that lower-call funnels
+   through the same get_stackid helper."
+  (labels ((kstack-call-p (form)
+             (and (consp form) (eq (first form) :call)
+                  (stringp (getf (cdr form) :name))
+                  (member (getf (cdr form) :name)
+                          '("kstack" "ustack")
+                          :test #'string=)))
+           (walk (form)
              (cond
                ((not (consp form)) nil)
                ((or (eq (first form) :kstack) (eq (first form) :ustack)) t)
+               ((kstack-call-p form) t)
                (t (some #'walk form)))))
     (some (lambda (probe) (walk (getf (cdr probe) :body)))
           (script-probes script))))
