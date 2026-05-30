@@ -4328,15 +4328,30 @@
       (:var
        (let ((sym (var-sym (second lhs))))
          (cond
+           ;; `$v = ((struct T *)e).f' where f is an in-script struct
+           ;; array field: probe-read the array bytes directly into
+           ;; $v's buffer. The buffer was already allocated by
+           ;; var-inits via *var-array-types*.
+           ((and (eq op :=)
+                 (assoc (second lhs) *var-array-types*
+                        :test #'string-equal)
+                 (multiple-value-bind (b sz o len) (array-field-meta rhs)
+                   (declare (ignore b o))
+                   (and sz len)))
+            (multiple-value-bind (base-ast sz off len) (array-field-meta rhs)
+              `(,(pick-probe-read-fn)
+                ,sym
+                ,(* sz len)
+                (whistler::+ ,(lower-expr base-ast) ,off))))
            ;; `$v = @m[k]' on a $v tracked as an array-var (its map's
            ;; value is a whole array): copy the N×elt-size bytes from
            ;; the map slot via map-lookup-ptr + memcpy. The var itself
            ;; is the buffer; lower-index reads element bytes off it.
            ((and (eq op :=)
                  (consp rhs) (eq (first rhs) :map)
-                 (assoc (second lhs) *var-array-types* :test #'string=))
+                 (assoc (second lhs) *var-array-types* :test #'string-equal))
             (let* ((cell  (cdr (assoc (second lhs) *var-array-types*
-                                      :test #'string=)))
+                                      :test #'string-equal)))
                    (sz    (first cell))
                    (len   (second cell))
                    (total (* sz len))
@@ -5570,22 +5585,35 @@
     acc))
 
 (defun infer-var-array-types (stmts)
-  "Walk STMTS for `$v = @m[k]' where @m's minfo carries value-array-p
-   (set by infer-maps when the script stored a whole-array field as
-   the map's value). Returns an alist (VAR-NAME . (ELT-SIZE ARR-LEN))
-   so the var binding can allocate a backing buffer and lower-index
-   on the var can load typed bytes from it."
+  "Walk STMTS for `$v = …' assignments whose RHS is a whole array,
+   and return an alist (VAR-NAME . (ELT-SIZE ARR-LEN)) so the var
+   binding can allocate a backing buffer and lower-index on the var
+   can load typed bytes from it. Two RHS shapes feed in:
+     * `$v = @m[k]' where @m's minfo carries value-array-p (set by
+       infer-maps when the script stored a whole-array field into
+       the map).
+     * `$v = ((struct T *)e).f' where f is an in-script struct
+       field declared as an array (the same shape lower-map-assign
+       handles via gen-array-field-set on the map side)."
   (let ((acc nil))
     (labels ((maybe-record (lhs rhs)
-               (when (and (consp lhs) (eq (first lhs) :var)
-                          (consp rhs) (eq (first rhs) :map)
-                          *map-table*)
-                 (let* ((nm (or (getf (cdr rhs) :name) "@"))
-                        (info (gethash nm *map-table*))
-                        (sz (and info (minfo-value-array-elt-size info)))
-                        (vs (and info (minfo-value-size info))))
-                   (when (and sz vs (minfo-value-array-p info))
-                     (push (cons (second lhs) (list sz (/ vs sz))) acc)))))
+               (when (and (consp lhs) (eq (first lhs) :var))
+                 (cond
+                   ;; $v = @m[k] (map's value is an array)
+                   ((and (consp rhs) (eq (first rhs) :map) *map-table*)
+                    (let* ((nm (or (getf (cdr rhs) :name) "@"))
+                           (info (gethash nm *map-table*))
+                           (sz (and info (minfo-value-array-elt-size info)))
+                           (vs (and info (minfo-value-size info))))
+                      (when (and sz vs (minfo-value-array-p info))
+                        (push (cons (second lhs) (list sz (/ vs sz))) acc))))
+                   ;; $v = ((struct T *)e).f where f is an array field
+                   (t
+                    (multiple-value-bind (_b sz _o len)
+                        (array-field-meta rhs)
+                      (declare (ignore _b _o))
+                      (when (and sz len)
+                        (push (cons (second lhs) (list sz len)) acc)))))))
              (walk (s)
                (case (first s)
                  (:assign (maybe-record (getf (cdr s) :lhs)
