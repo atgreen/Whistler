@@ -2800,11 +2800,16 @@
        (lower-printf (list (list :str (concatenate 'string "%s"
                                                    (string #\Newline)))
                            val)))
-      ;; print($v) where $v is strftime-typed → printf("%s\n", $v),
-      ;; the printf-arg-type path picks the :strftime token up from
-      ;; the *strftime-vars* table.
+      ;; print($v) where $v is string-typed (strftime, str/kstr,
+      ;; comm, ntop) → printf("%s\n", $v). printf-arg-type already
+      ;; recognises each of those var flavours and picks the right
+      ;; slot encoding; here we just need to pick "%s" instead of
+      ;; the default "%d".
       ((and (eq tag :var)
-            (assoc (second val) *strftime-vars* :test #'string=))
+            (or (assoc (second val) *strftime-vars* :test #'string=)
+                (assoc (second val) *str-vars* :test #'string-equal)
+                (member (second val) *comm-vars* :test #'string-equal)
+                (member (second val) *ntop-vars* :test #'string-equal)))
        (lower-printf (list (list :str (concatenate 'string "%s"
                                                    (string #\Newline)))
                            val)))
