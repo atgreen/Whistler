@@ -2071,8 +2071,16 @@
       ((string= name "hist")  (unsupported "hist() must be on the RHS of @map = …"))
       ((string= name "lhist") (unsupported "lhist() must be on the RHS of @map = …"))
       ((string= name "exit")
-       ;; Set the exit flag the userspace print loop polls every tick.
-       `(setf (whistler:getmap ,*exit-map-name* 0) 1))
+       ;; Encode the optional argument as (N+1) so 0 still means
+       ;; "exit() never fired"; userspace subtracts 1 before quitting.
+       (let* ((args (getf (cdr expr) :args))
+              (code (cond
+                      ((null args) 1)
+                      ((and (consp (first args))
+                            (eq (first (first args)) :int))
+                       (1+ (second (first args))))
+                      (t `(whistler::+ ,(lower-expr (first args)) 1)))))
+         `(setf (whistler:getmap ,*exit-map-name* 0) ,code)))
       ((string= name "printf") (lower-printf (getf (cdr expr) :args)))
       ;; errorf("fmt", …) — same as printf() but the userspace decoder
       ;; routes the line to *error-output* (stderr).
@@ -5201,13 +5209,13 @@
            (:post
             (let ((tmp (gensym "POST")))
               `(let ((,tmp ,sym))
-                 (setq ,sym ,(if (eq op :inc)
+                 (setf ,sym ,(if (eq op :inc)
                                  `(whistler::+ ,sym 1)
                                  `(whistler::- ,sym 1)))
                  ,tmp)))
            (:pre
             `(progn
-               (setq ,sym ,(if (eq op :inc)
+               (setf ,sym ,(if (eq op :inc)
                                `(whistler::+ ,sym 1)
                                `(whistler::- ,sym 1)))
                ,sym)))))
@@ -5257,8 +5265,8 @@
       (:var
        (let ((sym (var-sym (second lhs))))
          (ecase op
-           (:inc `(setq ,sym (whistler::+ ,sym 1)))
-           (:dec `(setq ,sym (whistler::- ,sym 1)))))))))
+           (:inc `(setf ,sym (whistler::+ ,sym 1)))
+           (:dec `(setf ,sym (whistler::- ,sym 1)))))))))
 
 (defun lower-expr-stmt (stmt)
   (let ((e (second stmt)))
@@ -6540,9 +6548,11 @@
          (uses-kstack (script-uses-kstack-p script))
          (uses-elapsed (script-uses-elapsed-p script))
          (exit-map-form
+           ;; value-size = 4 so we can carry the user-supplied exit
+           ;; code from `exit(N)' (stored as N+1 — 0 stays "not set").
            (when uses-exit
              `(whistler:defmap ,*exit-map-name*
-                :type :array :key-size 4 :value-size 1 :max-entries 1)))
+                :type :array :key-size 4 :value-size 4 :max-entries 1)))
          ;; For every @m that `len(@m)' touches, emit a single-entry
          ;; percpu-array sidecar named `__len_<map>'. The kernel-side
          ;; update/delete sites incf/decf this counter; len(@m) reads

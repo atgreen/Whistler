@@ -416,7 +416,8 @@
    per slot, decoded by TUPLE-TYPES. Layout matches what
    composite-key-layout wrote: each slot is u64 unless TUPLE-TYPES
    marks it as `:str' (a `+bt-func-name-key-len+'-byte NUL-padded
-   string)."
+   string) or `(:array ELT-SIZE LEN)' (ELT-SIZE × LEN raw bytes,
+   rendered as `[v1,v2,…]' by format-tuple-value)."
   (let* ((kbytes (whistler/loader::encode-int-key
                   key (whistler/loader::map-info-key-size info)))
          (raw (whistler/loader::map-lookup info kbytes)))
@@ -433,6 +434,21 @@
                                        do (write-char (code-char b) s)))))
                        (incf off cap)
                        s))
+                    ((and (consp ty) (eq (car ty) :array))
+                     (let* ((elt-size (second ty))
+                            (len (third ty))
+                            (mask (1- (ash 1 (* elt-size 8))))
+                            (cells (loop for j below len
+                                         for o = (+ off (* j elt-size))
+                                         collect (logand
+                                                  (loop for b below elt-size
+                                                        sum (ash (aref raw (+ o b))
+                                                                 (* b 8)))
+                                                  mask))))
+                       (incf off (* elt-size len))
+                       ;; Wrap in :array sentinel so format-tuple-value
+                       ;; can tell the slot apart from a string.
+                       (cons :array cells)))
                     (t
                      (let ((v (loop for i below 8
                                     sum (ash (aref raw (+ off i))
@@ -443,11 +459,18 @@
 (defun format-tuple-value (slots)
   "Render a tuple-value list as `(v1, v2, …)' — strings unquoted to
    match bpftrace's display. Integer slots are reinterpreted as
-   signed-64 (so `-100' stored as a u64 round-trips correctly)."
+   signed-64 (so `-100' stored as a u64 round-trips correctly).
+   `(:array v1 v2 …)' sentinels render as `[v1,v2,…]'."
   (with-output-to-string (s)
     (write-char #\( s)
     (loop for (v . rest) on slots
           do (cond ((stringp v) (write-string v s))
+                   ((and (consp v) (eq (car v) :array))
+                    (write-char #\[ s)
+                    (loop for (c . r) on (cdr v)
+                          do (format s "~D" c)
+                             (when r (write-char #\, s)))
+                    (write-char #\] s))
                    (t (format s "~D" (signed-64 v))))
              (when rest (write-string ", " s)))
     (write-char #\) s)))
@@ -1130,13 +1153,21 @@
    flow to release the pipe-blocked child so it runs with probes
    already in place.")
 
+(defvar *bpftrace-exit-code* 0
+  "After run-generated returns, the user's `exit(N)' code (defaulting
+   to 0). The CLI driver uses this to set the process exit status.")
+
 (defun exit-flag-set-p (exit-info)
   "Read the hidden bt-exit map and return T if the kernel side set the
    flag. EXIT-INFO is the whistler/loader::map-info or NIL if the
-   script doesn't use exit()."
+   script doesn't use exit(). The kernel stores `N+1' so 0 stays as
+   `not set'; on a hit we stash N into *bpftrace-exit-code* for the
+   CLI to propagate."
   (and exit-info
        (let ((v (whistler/loader::map-lookup-int exit-info 0)))
-         (and v (plusp v)))))
+         (when (and v (plusp v))
+           (setf *bpftrace-exit-code* (1- v))
+           t))))
 
 (defun find-exit-map (gen map-alist)
   "Look up the bt-exit map's map-info from MAP-ALIST, if any."

@@ -1198,7 +1198,14 @@
                (error () nil))
              (handler-case
                  (sb-posix:waitpid (traced-child-pid child-process) 0)
-               (error () nil)))))))))
+               (error () nil))))
+         ;; Propagate `exit(N)' to our process exit status (matches
+         ;; bpftrace). The dynvar gets bumped by exit-flag-set-p.
+         (let* ((code-sym (find-symbol "*BPFTRACE-EXIT-CODE*"
+                                       '#:whistler/bpftrace))
+                (code (and code-sym (symbol-value code-sym))))
+           (when (and code (integerp code) (plusp code))
+             (uiop:quit code))))))))
 
 (defun read-bpftrace-source (args e-pos p-pos c-pos)
   "Resolve the script source: -e takes precedence; otherwise the first
@@ -1232,10 +1239,19 @@
                     while line
                     do (write-line line out))))
            (t
-            (with-open-file (s path :direction :input)
-              (let* ((buf (make-string (file-length s)))
-                     (n   (read-sequence buf s)))
-                (subseq buf 0 n))))))))))
+            (handler-case
+                (with-open-file (s path :direction :input)
+                  (let* ((buf (make-string (file-length s)))
+                         (n   (read-sequence buf s)))
+                    (subseq buf 0 n)))
+              (file-error ()
+                ;; bpftrace prints exactly "ERROR: failed to open file
+                ;; 'PATH': <reason>". Match that text so test scripts
+                ;; matching the error string keep working.
+                (format *error-output*
+                        "ERROR: failed to open file '~A': No such file or directory~%"
+                        path)
+                (uiop:quit 1))))))))))
 
 ;;; ========== ptrace-stopped child spawn (matches bpftrace -c) ==========
 ;;;
