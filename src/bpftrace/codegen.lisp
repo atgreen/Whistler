@@ -3023,6 +3023,17 @@
    in userspace); everything else falls back to `%d'."
   (cond
     ((and (consp elem) (eq (first elem) :str))  "%s")
+    ;; comm / pcomm / strish-call elements → %s.
+    ((and (consp elem)
+          (or (eq (first elem) :comm) (eq (first elem) :pcomm)
+              (str-call-p elem) (kstr-call-p elem)))
+     "%s")
+    ;; @m[k] where m has a string value-slot — same render.
+    ((and (consp elem) (eq (first elem) :map) *map-table*
+          (let* ((nm (or (getf (cdr elem) :name) "@"))
+                 (info (gethash nm *map-table*)))
+            (and info (minfo-value-string-p info))))
+     "%s")
     ((or (and (consp elem) (eq (first elem) :constant)
               (or (string= (second elem) "true")
                   (string= (second elem) "false")))
@@ -4020,14 +4031,36 @@
               (array-field-lookup base))
          (multiple-value-bind (ptr-form elt-size field-off arr-len)
              (array-field-lookup base)
-           (when (and (consp idx) (eq (first idx) :int))
-             (let ((i (second idx)))
-               (when (or (minusp i) (>= i arr-len))
-                 (unsupported
-                  "ERROR: the index ~D is out of bounds for array of size ~D"
-                  i arr-len))))
-           (lower-ptr-index `(whistler::+ ,ptr-form ,field-off)
-                            (lower-expr idx) elt-size)))
+           (cond
+             ;; Literal index — compile-time bounds check; out-of-range
+             ;; is a hard error.
+             ((and (consp idx) (eq (first idx) :int))
+              (let ((i (second idx)))
+                (when (or (minusp i) (>= i arr-len))
+                  (unsupported
+                   "ERROR: the index ~D is out of bounds for array of size ~D"
+                   i arr-len)))
+              (lower-ptr-index `(whistler::+ ,ptr-form ,field-off)
+                               (lower-expr idx) elt-size))
+             ;; Runtime index — emit a guard that warnf's once if
+             ;; (idx >= arr-len) before doing the read. bpftrace prints
+             ;; "WARNING: Array access out of bounds. This can lead to
+             ;; unexpected results." and continues; we route through
+             ;; warnf() which the userspace decoder prefixes with
+             ;; "WARNING: ".
+             (t
+              (let ((idx-tmp (gensym "IDX")))
+                `(whistler::let* ((,idx-tmp ,(lower-expr idx)))
+                   (whistler::when (whistler::>= ,idx-tmp ,arr-len)
+                     ,(lower-printf
+                       (list (list :str (concatenate 'string
+                                                     "Array access out of bounds. "
+                                                     "This can lead to unexpected results."
+                                                     (string #\Newline))))
+                       :stream :stderr-warning :fn-name "warnf"))
+                   ,(lower-ptr-index
+                     `(whistler::+ ,ptr-form ,field-off)
+                     idx-tmp elt-size)))))))
         (t (unsupported "array indexing outside @maps"))))))
 
 (defun array-field-dims (field-expr)

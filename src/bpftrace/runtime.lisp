@@ -1450,7 +1450,11 @@
                            (text (case spec
                                    ((#\d #\i) (format nil "~D" (signed-64 (or arg 0))))
                                    ((#\u)     (format nil "~D" (or arg 0)))
-                                   ((#\x #\p) (format nil "~(~X~)" (or arg 0)))
+                                   ((#\x)     (format nil "~(~X~)" (or arg 0)))
+                                   ;; %p — pointer; bpftrace prefixes
+                                   ;; the hex with `0x' to match libc
+                                   ;; printf(3). Match that here.
+                                   ((#\p)     (format nil "0x~(~X~)" (or arg 0)))
                                    ((#\X)     (format nil "~X" (or arg 0)))
                                    ((#\o)     (format nil "~O" (or arg 0)))
                                    ((#\b)     (format nil "~B" (or arg 0)))
