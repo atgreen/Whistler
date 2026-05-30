@@ -6882,8 +6882,15 @@
     (:uprobe      (format nil "uprobe:~A:~A" (second spec) (third spec)))
     (:uretprobe   (format nil "uretprobe:~A:~A" (second spec) (third spec)))
     (:tracepoint  (format nil "tracepoint:~A:~A" (second spec) (third spec)))
-    (:profile     (format nil "profile:~A:~A" (second spec) (third spec)))
-    (:interval    (format nil "interval:~A:~A" (second spec) (third spec)))
+    ;; profile/interval specs are plists — `(:profile :unit :HZ :count 99)' —
+    ;; not positional triples. (second spec) / (third spec) would yield
+    ;; `:UNIT' / `:HZ', which is what the `probe' builtin would print.
+    (:profile     (format nil "profile:~(~A~):~A"
+                          (getf (rest spec) :unit)
+                          (getf (rest spec) :count)))
+    (:interval    (format nil "interval:~(~A~):~A"
+                          (getf (rest spec) :unit)
+                          (getf (rest spec) :count)))
     (t            (format nil "~A" (first spec)))))
 
 (defun probe-string-buf-size (body)

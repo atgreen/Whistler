@@ -463,25 +463,46 @@
        ;; advance past parse and emit instructions.
        (list :begin))
       (:rawtracepoint-spec
-       ;; rawtracepoint:NAME — accept syntactically; codegen routes
-       ;; via the kprobe path which will fail at attach but at
-       ;; least lets the parse complete.
-       (list :kprobe (text-of (first-tagged inner :ident))))
+       ;; rawtracepoint:NAME attaches via BPF_PROG_TYPE_RAW_TRACEPOINT —
+       ;; a different program type and load path from kprobes. Silently
+       ;; routing through :kprobe would attach to a kprobe-shaped slot
+       ;; that doesn't exist for the named tracepoint, mis-instrumenting
+       ;; or failing opaquely. Reject until the raw-tp loader lands.
+       (unsupported "rawtracepoint probes are not yet supported"))
       (:kprobe-spec
-       ;; The last :glob-ident is the function name; any preceding
-       ;; one is the kernel module ("vmlinux", "kvm", …). Module
-       ;; routing isn't wired into the loader yet — accept the
-       ;; syntax, attach against the bare function name.
-       (list :kprobe
-             (text-of (car (last (all-tagged inner :glob-ident))))))
+       ;; `kprobe:[MODULE:]NAME[+OFFSET]'. Until module routing and
+       ;; offset attachment are implemented, reject both forms instead
+       ;; of silently dropping them — attaching the wrong symbol or
+       ;; missing an intended offset is worse than refusing the script.
+       (let ((idents (all-tagged inner :glob-ident)))
+         (when (> (length idents) 1)
+           (unsupported "kprobe: module qualifier ~S not yet supported"
+                        (text-of (first idents))))
+         (when (first-tagged inner :kprobe-offset)
+           (unsupported "kprobe: `+OFFSET' suffix not yet supported"))
+         (list :kprobe (text-of (first idents)))))
       (:kretprobe-spec
-       (list :kretprobe
-             (text-of (car (last (all-tagged inner :glob-ident))))))
-      ;; kfunc[:vmlinux]:funcname — last :ident is the function. The
-      ;; optional "vmlinux" token is silently dropped; we only support
-      ;; the vmlinux module today.
-      (:kfunc-spec      (list :kfunc    (text-of (car (last (all-tagged inner :ident))))))
-      (:kretfunc-spec   (list :kretfunc (text-of (car (last (all-tagged inner :ident))))))
+       (let ((idents (all-tagged inner :glob-ident)))
+         (when (> (length idents) 1)
+           (unsupported "kretprobe: module qualifier ~S not yet supported"
+                        (text-of (first idents))))
+         (list :kretprobe (text-of (first idents)))))
+      ;; kfunc[:MODULE]:funcname — the optional module qualifier routes
+      ;; the BTF lookup to that module's BTF blob instead of vmlinux.
+      ;; Until that's wired in, reject rather than silently bind to the
+      ;; vmlinux symbol of the same name.
+      (:kfunc-spec
+       (let ((idents (all-tagged inner :ident)))
+         (when (> (length idents) 1)
+           (unsupported "kfunc: module qualifier ~S not yet supported"
+                        (text-of (first idents))))
+         (list :kfunc (text-of (first idents)))))
+      (:kretfunc-spec
+       (let ((idents (all-tagged inner :ident)))
+         (when (> (length idents) 1)
+           (unsupported "kretfunc: module qualifier ~S not yet supported"
+                        (text-of (first idents))))
+         (list :kretfunc (text-of (first idents)))))
       (:uprobe-spec
        (list :uprobe
              (text-of (first-tagged inner :upath))
