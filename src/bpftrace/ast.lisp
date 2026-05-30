@@ -450,6 +450,17 @@
     (ecase (tag-of inner)
       (:begin-spec      '(:begin))
       (:end-spec        '(:end))
+      (:bench-spec
+       ;; Accept the syntax; treat as a BEGIN-style userspace probe
+       ;; until the real --mode bench runner lands. The body
+       ;; still compiles through gen-kernel-prog so most scripts
+       ;; advance past parse and emit instructions.
+       (list :begin))
+      (:rawtracepoint-spec
+       ;; rawtracepoint:NAME — accept syntactically; codegen routes
+       ;; via the kprobe path which will fail at attach but at
+       ;; least lets the parse complete.
+       (list :kprobe (text-of (first-tagged inner :ident))))
       (:kprobe-spec
        ;; The last :glob-ident is the function name; any preceding
        ;; one is the kernel module ("vmlinux", "kvm", …). Module
