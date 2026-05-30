@@ -1093,6 +1093,16 @@
    trailing script file."
   (bpftrace-require)
   (let* ((dump-p (member "--dump" args :test #'string=))
+         ;; bpftrace's `--verify-llvm-ir' (and the umbrella `--verify-bpf')
+         ;; asks the upstream tool to verify the generated IR without
+         ;; running. We don't use LLVM, so the closest equivalent is to
+         ;; compile the script and exit — surfacing any codegen error
+         ;; the same way the run path would, but never attaching probes
+         ;; or entering the poll loop. The runtime test suite passes
+         ;; this flag heavily and would otherwise hang on probes whose
+         ;; binaries don't exist (`uprobe:./testprogs/x:fn').
+         (verify-p (or (member "--verify-llvm-ir" args :test #'string=)
+                       (member "--verify-bpf" args :test #'string=)))
          (e-pos  (position "-e" args :test #'string=))
          (p-pos  (position "-p" args :test #'string=))
          (c-pos  (position "-c" args :test #'string=))
@@ -1183,6 +1193,11 @@
            (dolist (p (getf gen :progs)) (format t "~S~%" p))
            (format t "~&;; ----- user-side probes (BEGIN/END/interval) -----~%")
            (format t "~S~%" (getf gen :user-probes))))
+        (verify-p
+         ;; Compile only — any codegen error throws out through the
+         ;; outer (error c) handler, matching what the run path would
+         ;; surface. Success exits 0 without attaching.
+         (funcall (find-symbol "COMPILE-SCRIPT" '#:whistler/bpftrace) source))
         (t
          (when child-process
            (format t ";; -c spawned pid ~D (ptrace-stopped) — tracing until it exits.~%"

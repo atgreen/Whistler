@@ -888,11 +888,15 @@
    `true'/`false' instead of `1'/`0'.")
 
 (defvar *var-array-types* nil
-  "Per-probe alist VAR-NAME → (ELT-SIZE ARR-LEN) for vars assigned
-   from a map whose value-array-p is set — e.g. `$x = @a[0]' where
-   @a's value-size is `N*ELT-SIZE'. The var is backed by an inline
-   `N*ELT-SIZE' stack buffer; the assignment fills it from the map,
-   and `$x[i]' loads ELT-SIZE bytes at offset i*ELT-SIZE.")
+  "Per-probe alist VAR-NAME → (ELT-SIZE ARR-LEN DIMS) for vars
+   assigned from a map whose value-array-p is set — e.g. `$x = @a[0]'
+   where @a's value-size is `N*ELT-SIZE'. The var is backed by an
+   inline `N*ELT-SIZE' stack buffer; the assignment fills it from the
+   map, and `$x[i]' loads ELT-SIZE bytes at offset i*ELT-SIZE. DIMS
+   is the list of per-dimension extents — `(N)' for `T x[N]', `(2 2)'
+   for `T y[2][2]' — used by the multi-subscript lowering. Older
+   call sites that only read (FIRST CELL) / (SECOND CELL) continue
+   to work; the dims tail is optional.")
 
 (defvar *string-set-buf* nil
   "Per-probe scratch buffer symbol shared across all
@@ -4316,6 +4320,16 @@
         ;; struct+field-off+sum.
         ((multi-dim-array-subscript-p expr)
          (lower-multi-dim-array-subscript expr))
+        ;; `@m[k][i][j]…' — extra subscripts past the map key index
+        ;; into a multi-dim array stored as the map value. Goes through
+        ;; map-lookup-ptr so the load reads from the on-map buffer.
+        ((multi-dim-map-subscript-p expr)
+         (lower-multi-dim-map-subscript expr))
+        ;; `$v[i][j]…' — multi-dim subscript on a var backed by an
+        ;; inline array buffer (copied from a map slot or struct
+        ;; field at assignment time).
+        ((multi-dim-var-subscript-p expr)
+         (lower-multi-dim-var-subscript expr))
         ;; `$a.field[i]' or `(struct X *)e.field[i]' — element access
         ;; on an array field of an in-script struct. The struct
         ;; pointer + field offset + i * sizeof(elt) gives the address;
@@ -4326,10 +4340,13 @@
              (array-field-lookup base)
            (cond
              ;; Literal index — compile-time bounds check; out-of-range
-             ;; is a hard error.
+             ;; is a hard error. Zero-length arrays (`T x[0]', C99
+             ;; flex-array tail) skip the check: bpftrace treats them
+             ;; as unbounded since the real size is data-driven.
              ((and (consp idx) (eq (first idx) :int))
               (let ((i (second idx)))
-                (when (or (minusp i) (>= i arr-len))
+                (when (and (plusp arr-len)
+                           (or (minusp i) (>= i arr-len)))
                   (unsupported
                    "ERROR: the index ~D is out of bounds for array of size ~D"
                    i arr-len)))
@@ -4343,7 +4360,12 @@
              ;; before WARNING, so we synthesise a `stdin:1:1: '
              ;; placeholder. We bake the full prefix into the format
              ;; string and route through :stderr (raw) so the runtime
-             ;; doesn't add a second "WARNING: ".
+             ;; doesn't add a second "WARNING: ". Zero-length arrays
+             ;; (C99 flex tails) skip the guard — the real bound is
+             ;; data-driven and can't be checked statically.
+             ((zerop arr-len)
+              (lower-ptr-index `(whistler::+ ,ptr-form ,field-off)
+                               (lower-expr idx) elt-size))
              (t
               (let ((idx-tmp (gensym "IDX")))
                 `(whistler::let* ((,idx-tmp ,(lower-expr idx)))
@@ -4506,6 +4528,90 @@
            (,helper ,scratch ,elt-size
                     (whistler::+ ,(lower-expr base-ast) ,offset-form))
            (whistler::load ,type-sym ,scratch 0))))))
+
+(defun strides-for-dims (elt-size dims)
+  "Per-dim byte strides for a row-major buffer: stride_k = elt-size *
+   product(dims[k+1..]). For `(2 2)' with elt-size 4 this is `(8 4)'."
+  (loop for i below (length dims)
+        collect (* elt-size
+                   (apply #'* (subseq dims (1+ i))))))
+
+(defun build-offset-form (keys strides)
+  "Sum_k (lower(key_k) * stride_k) as a whistler `+'/`*' tree. Used
+   by every multi-dim subscript lowering — field, map value, var
+   buffer."
+  (reduce (lambda (acc pair)
+            `(whistler::+ ,acc
+                          (whistler::* ,(first pair) ,(second pair))))
+          (mapcar #'list (mapcar #'lower-expr keys) strides)
+          :initial-value 0))
+
+(defun multi-dim-map-subscript-p (expr)
+  "T when EXPR is `@m[k][i1][i2]…' with as many trailing subscripts
+   as the map's value-array-dims. The root `@m[k]' itself stays a
+   :map ref (its keys live in :KEYS on the map node); the extra
+   `[i…]' wrappers are :index nodes that walk-index-chain peels off."
+  (multiple-value-bind (root keys) (walk-index-chain expr)
+    (and (consp root) (eq (first root) :map)
+         keys *map-table*
+         (let* ((nm   (or (getf (cdr root) :name) "@"))
+                (info (gethash nm *map-table*))
+                (dims (and info (minfo-value-array-dims info))))
+           (and info
+                (minfo-value-array-p info)
+                (minfo-value-array-elt-size info)
+                dims (> (length dims) 1)
+                (= (length dims) (length keys)))))))
+
+(defun lower-multi-dim-map-subscript (expr)
+  "Lower `@m[k][i1][i2]…' to a sized load against the on-map array
+   buffer reached via map-lookup-ptr. The map's value-size is the
+   total buffer; strides come from minfo-value-array-dims."
+  (multiple-value-bind (root keys) (walk-index-chain expr)
+    (let* ((nm       (or (getf (cdr root) :name) "@"))
+           (info     (gethash nm *map-table*))
+           (elt-size (minfo-value-array-elt-size info))
+           (dims     (minfo-value-array-dims info))
+           (strides  (strides-for-dims elt-size dims))
+           (offset   (build-offset-form keys strides))
+           (mp       (gensym "MP"))
+           (type-sym (case elt-size
+                       (1 (intern "U8"  :whistler))
+                       (2 (intern "U16" :whistler))
+                       (4 (intern "U32" :whistler))
+                       (8 (intern "U64" :whistler)))))
+      `(whistler:if-let (,mp ,(lower-map-value-ptr root))
+         (whistler::load ,type-sym ,mp ,offset)
+         0))))
+
+(defun multi-dim-var-subscript-p (expr)
+  "T when EXPR is `$v[i1][i2]…' for a $v in *var-array-types* with
+   recorded multi-dim shape, and the subscript count equals the
+   number of dims."
+  (multiple-value-bind (root keys) (walk-index-chain expr)
+    (and (consp root) (eq (first root) :var) keys
+         (let* ((cell (cdr (assoc (second root) *var-array-types*
+                                  :test #'string=)))
+                (dims (third cell)))
+           (and cell dims (> (length dims) 1)
+                (= (length dims) (length keys)))))))
+
+(defun lower-multi-dim-var-subscript (expr)
+  "Lower `$v[i1][i2]…' to a sized load against the var's backing
+   buffer. Strides come from the dims tail of *var-array-types*."
+  (multiple-value-bind (root keys) (walk-index-chain expr)
+    (let* ((cell     (cdr (assoc (second root) *var-array-types*
+                                 :test #'string=)))
+           (elt-size (first cell))
+           (dims     (third cell))
+           (strides  (strides-for-dims elt-size dims))
+           (offset   (build-offset-form keys strides))
+           (type-sym (case elt-size
+                       (1 (intern "U8"  :whistler))
+                       (2 (intern "U16" :whistler))
+                       (4 (intern "U32" :whistler))
+                       (8 (intern "U64" :whistler)))))
+      `(whistler::load ,type-sym ,(var-sym (second root)) ,offset))))
 
 (defun lower-ptr-index (ptr-form idx-form elt-size)
   "Emit a typed-pointer subscript read: probe-read ELT-SIZE bytes at
@@ -6139,14 +6245,19 @@
                            (sz (and info (minfo-value-array-elt-size info)))
                            (vs (and info (minfo-value-size info))))
                       (when (and sz vs (minfo-value-array-p info))
-                        (push (cons (second lhs) (list sz (/ vs sz))) acc))))
+                        (push (cons (second lhs)
+                                    (list sz (/ vs sz)
+                                          (minfo-value-array-dims info)))
+                              acc))))
                    ;; $v = ((struct T *)e).f where f is an array field
                    (t
-                    (multiple-value-bind (_b sz _o len)
+                    (multiple-value-bind (_b sz _o len dims)
                         (array-field-meta rhs)
                       (declare (ignore _b _o))
                       (when (and sz len)
-                        (push (cons (second lhs) (list sz len)) acc)))))))
+                        (push (cons (second lhs)
+                                    (list sz len (or dims (list len))))
+                              acc)))))))
              (walk (s)
                (case (first s)
                  (:assign (maybe-record (getf (cdr s) :lhs)
