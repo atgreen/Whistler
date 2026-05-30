@@ -954,7 +954,7 @@
                c (if (zerop c) 0 (floor s c)) s)))
     ((and (consp v) (not (keywordp (first v))))
      (format-tuple-value v))
-    (t (format nil "~D" v))))
+    (t (format nil "~D" (signed-64 v)))))
 
 (defun print-all-maps (info-list map-alist &key stacks-info stack-depth
                                                 symbolizer)
