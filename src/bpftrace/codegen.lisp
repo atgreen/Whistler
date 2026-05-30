@@ -67,7 +67,14 @@
                    ;   array field, sizeof(elt). The userspace printer
                    ;   uses this with key-array-len to render keys as
                    ;   `[v1,v2,…]' matching bpftrace's array-key style.
-  key-array-len    ; Number of elements in the array key when set.
+  key-array-len    ; Total element count for the array key when set
+                   ;   (product of all dimensions).
+  key-array-dims   ; List of per-dimension extents for the array key —
+                   ;   e.g. (2 2) for `int y[2][2]'. Single-dim arrays
+                   ;   leave it as a one-element list so the renderer's
+                   ;   nested walk degenerates to flat `[v1,…]'.
+  value-array-dims ; Same as KEY-ARRAY-DIMS but for the map's value
+                   ;   slot when value-array-p is set.
   value-tuple-p    ; T when the value slot holds a tuple, packed
                    ;   using the same composite-key-layout strategy
                    ;   (each component a u64 except strings which take
@@ -408,12 +415,13 @@
                    ;; field: record the array shape so the printer
                    ;; can render the key as `[v1,v2,…]'.
                    (when (= (length keys) 1)
-                     (multiple-value-bind (_b sz _o len)
+                     (multiple-value-bind (_b sz _o len dims)
                          (array-field-meta (first keys))
                        (declare (ignore _b _o))
                        (when (and sz len)
                          (setf (minfo-key-array-elt-size info) sz
-                               (minfo-key-array-len info) len))))
+                               (minfo-key-array-len info) len
+                               (minfo-key-array-dims info) (or dims (list len))))))
                    ;; Single-key that's `@other-map' — the lookup
                    ;; returns whatever the other map stored. If that
                    ;; was an in-script array (e.g.
@@ -431,9 +439,12 @@
                                   (plusp (minfo-value-array-elt-size src-info)))
                          (let* ((sz (minfo-value-array-elt-size src-info))
                                 (vs (minfo-value-size src-info))
-                                (len (floor vs sz)))
+                                (len (floor vs sz))
+                                (dims (or (minfo-value-array-dims src-info)
+                                          (list len))))
                            (setf (minfo-key-array-elt-size info) sz
                                  (minfo-key-array-len info) len
+                                 (minfo-key-array-dims info) dims
                                  (minfo-key-size info)
                                  (max (minfo-key-size info) vs))))))
                    ;; Single-key strftime(): `@[strftime("FMT", TS)] = …'
@@ -538,11 +549,13 @@
                              (array-field-meta rhs)
                            (declare (ignore _b _o))
                            (and sz len)))
-                    (multiple-value-bind (_b sz _o len) (array-field-meta rhs)
+                    (multiple-value-bind (_b sz _o len dims)
+                        (array-field-meta rhs)
                       (declare (ignore _b _o))
                       (setf (minfo-kind info) :scalar
                             (minfo-value-array-p info) t
                             (minfo-value-array-elt-size info) sz
+                            (minfo-value-array-dims info) (or dims (list len))
                             (minfo-value-size info)
                             (max (minfo-value-size info) (* sz len)))))
                    ;; `@m[k] = :str LITERAL' — direct string literal
@@ -4252,11 +4265,12 @@
 
 (defun array-field-meta (field-expr)
   "Pure-AST lookup of array-field metadata: returns (values BASE-AST
-   ELT-SIZE FIELD-OFFSET ARR-LEN) when FIELD-EXPR is `$var.field' /
-   `(struct X *)e.field' and the field is an in-script struct array,
-   else NIL. Unlike ARRAY-FIELD-LOOKUP, doesn't call LOWER-EXPR — so
-   safe to call from infer-maps / expr-size at AST time. Tag-guarded
-   so callers can pass any expr; non-`:field' inputs return NIL."
+   ELT-SIZE FIELD-OFFSET ARR-LEN ARR-DIMS) when FIELD-EXPR is
+   `$var.field' / `(struct X *)e.field' and the field is an in-script
+   struct array, else NIL. ARR-LEN is the product of all dimensions;
+   ARR-DIMS is the list — `(4)' for `int x[4]', `(2 2)' for
+   `int y[2][2]'. Unlike ARRAY-FIELD-LOOKUP, doesn't call LOWER-EXPR —
+   so safe to call from infer-maps / expr-size at AST time."
   (unless (and (consp field-expr) (eq (first field-expr) :field))
     (return-from array-field-meta nil))
   (let ((base (getf (cdr field-expr) :base))
@@ -4273,9 +4287,10 @@
                                      :test #'string= :key #'first)))
              (elt-size (and cell (second cell)))
              (offset   (and cell (third cell)))
-             (arr-len  (and cell (fourth cell))))
+             (arr-len  (and cell (fourth cell)))
+             (arr-dims (and cell (sixth cell))))
         (when (and cell arr-len (member elt-size '(1 2 4 8)))
-          (values base elt-size offset arr-len))))))
+          (values base elt-size offset arr-len (or arr-dims (list arr-len))))))))
 
 (defun array-field-lookup (field-expr)
   "If FIELD-EXPR is a `:field' AST whose base is a $var typed to an
@@ -7115,6 +7130,7 @@
                                                    1)
                                     :key-array-elt-size (minfo-key-array-elt-size info)
                                     :key-array-len (minfo-key-array-len info)
+                                    :key-array-dims (minfo-key-array-dims info)
                                     :value-array-elt-size
                                     (and (minfo-value-array-p info)
                                          (minfo-value-array-elt-size info))
@@ -7124,6 +7140,9 @@
                                          (plusp (minfo-value-array-elt-size info))
                                          (/ (minfo-value-size info)
                                             (minfo-value-array-elt-size info)))
+                                    :value-array-dims
+                                    (and (minfo-value-array-p info)
+                                         (minfo-value-array-dims info))
                                     :keyed-p (minfo-keyed-p info)
                                     :value-tuple-p (minfo-value-tuple-p info)
                                     :value-tuple-types (minfo-value-tuple-types info)

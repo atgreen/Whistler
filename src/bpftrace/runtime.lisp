@@ -552,8 +552,37 @@
   (or (cdr (assoc id *signal-names*))
       (format nil "SIG~D" id)))
 
+(defun render-array-bignum (out value elt-size dims sep)
+  "Render VALUE's little-endian bytes as a nested array per DIMS
+   (e.g. `(2 2)' for `int y[2][2]' → `[[v1,v2],[v3,v4]]'). SEP is
+   the per-element separator (`,' for JSON/array style, `, ' for
+   composite-key style)."
+  (cond
+    ((null (cdr dims))
+     (let* ((n (or (car dims) 0))
+            (bits (* elt-size 8))
+            (mask (1- (ash 1 bits))))
+       (write-char #\[ out)
+       (loop for i below n
+             for v = (logand (ash value (- (* i bits))) mask)
+             do (when (plusp i) (write-string sep out))
+                (format out "~D" v))
+       (write-char #\] out)))
+    (t
+     (let* ((outer (car dims))
+            (inner (cdr dims))
+            (chunk-elts (reduce #'* inner))
+            (chunk-bits (* elt-size chunk-elts 8)))
+       (write-char #\[ out)
+       (loop for i below outer
+             for v = (ash value (- (* i chunk-bits)))
+             do (when (plusp i) (write-string sep out))
+                (render-array-bignum out v elt-size inner sep))
+       (write-char #\] out)))))
+
 (defun format-key (key &key (parts 1) key-builtin
                             array-elt-size array-len
+                            array-dims
                             key-types
                             json-p)
   "Render KEY (an integer) as bpftrace does. JSON-P switches the
@@ -580,14 +609,21 @@
      (signal-id->name key))
     ((and array-elt-size array-len)
      (with-output-to-string (s)
-       (write-char #\[ s)
-       (let ((bits (* array-elt-size 8))
-             (mask (1- (ash 1 (* array-elt-size 8)))))
-         (loop for i below array-len
-               for v = (logand (ash key (- (* i bits))) mask)
-               do (when (plusp i) (write-string "," s))
-                  (format s "~D" v)))
-       (write-char #\] s)))
+       (cond
+         ;; Multi-dim — walk the dim list so `int y[2][2]' renders as
+         ;; `[[5,6],[7,8]]', not the flat `[5,6,7,8]'.
+         ((and array-dims (cdr array-dims))
+          (render-array-bignum s key array-elt-size array-dims
+                               (if json-p "," ",")))
+         (t
+          (write-char #\[ s)
+          (let ((bits (* array-elt-size 8))
+                (mask (1- (ash 1 (* array-elt-size 8)))))
+            (loop for i below array-len
+                  for v = (logand (ash key (- (* i bits))) mask)
+                  do (when (plusp i) (write-string "," s))
+                     (format s "~D" v)))
+          (write-char #\] s)))))
     ((<= parts 1) (format nil "~D" (signed-64 key)))
     ((and key-types (some (lambda (ty) (and (consp ty) (eq (car ty) :array)))
                           key-types))
@@ -869,7 +905,9 @@
                                           (kind :counter) key-builtin
                                           key-types
                                           key-array-elt-size key-array-len
+                                          key-array-dims
                                           value-array-elt-size value-array-len
+                                          value-array-dims
                                           value-tuple-p value-tuple-types
                                           value-strftime-id key-strftime-id
                                           time-format-table
@@ -969,6 +1007,7 @@
                                         :key-builtin key-builtin
                                         :array-elt-size key-array-elt-size
                                         :array-len key-array-len
+                                        :array-dims key-array-dims
                                         :key-types key-types
                                         :json-p t)
                             (json-format-scalar-value (cdr kv))))
@@ -994,6 +1033,7 @@
                                     :key-builtin key-builtin
                                     :array-elt-size key-array-elt-size
                                     :array-len key-array-len
+                                    :array-dims key-array-dims
                                     :key-types key-types)))
                    (cond
                      (value-strftime-id
@@ -1004,7 +1044,8 @@
                        (cdr kv)))
                      (t (format-scalar-value (cdr kv)
                                               :array-elt-size value-array-elt-size
-                                              :array-len value-array-len))))))
+                                              :array-len value-array-len
+                                              :array-dims value-array-dims))))))
         (t
          (dolist (kv pairs)
            (format t "~A: ~A~%"
@@ -1018,7 +1059,8 @@
                        (cdr kv)))
                      (t (format-scalar-value (cdr kv)
                                               :array-elt-size value-array-elt-size
-                                              :array-len value-array-len))))))))))
+                                              :array-len value-array-len
+                                              :array-dims value-array-dims))))))))))
 
 (defun json-format-scalar-value (v)
   "JSON-encode a scalar map value cell. Integers go bare; strings
@@ -1032,7 +1074,7 @@
     ((stringp v) (format nil "~S" v))
     (t (format nil "~D" v))))
 
-(defun format-scalar-value (v &key array-elt-size array-len)
+(defun format-scalar-value (v &key array-elt-size array-len array-dims)
   "Render a scalar map's value cell. Most values are integers; stats()
    threads a (:stats COUNT SUM) sentinel that pretty-prints as
    `count NN, average AA, total TT`, mirroring bpftrace. A plain
@@ -1050,14 +1092,19 @@
      (format-tuple-value v))
     ((and array-elt-size array-len)
      (with-output-to-string (s)
-       (write-char #\[ s)
-       (let ((bits (* array-elt-size 8))
-             (mask (1- (ash 1 (* array-elt-size 8)))))
-         (loop for i below array-len
-               for cell = (logand (ash v (- (* i bits))) mask)
-               do (when (plusp i) (write-char #\, s))
-                  (format s "~D" cell)))
-       (write-char #\] s)))
+       (cond
+         ;; Multi-dim — same nested walk format-key uses.
+         ((and array-dims (cdr array-dims))
+          (render-array-bignum s v array-elt-size array-dims ","))
+         (t
+          (write-char #\[ s)
+          (let ((bits (* array-elt-size 8))
+                (mask (1- (ash 1 (* array-elt-size 8)))))
+            (loop for i below array-len
+                  for cell = (logand (ash v (- (* i bits))) mask)
+                  do (when (plusp i) (write-char #\, s))
+                     (format s "~D" cell)))
+          (write-char #\] s)))))
     (t (format nil "~D" (signed-64 v)))))
 
 (defun print-all-maps (info-list map-alist &key stacks-info stack-depth
@@ -1089,10 +1136,14 @@
                                    (getf (cdr info-rec) :key-array-elt-size)
                                    :key-array-len
                                    (getf (cdr info-rec) :key-array-len)
+                                   :key-array-dims
+                                   (getf (cdr info-rec) :key-array-dims)
                                    :value-array-elt-size
                                    (getf (cdr info-rec) :value-array-elt-size)
                                    :value-array-len
                                    (getf (cdr info-rec) :value-array-len)
+                                   :value-array-dims
+                                   (getf (cdr info-rec) :value-array-dims)
                                    :value-tuple-p
                                    (getf (cdr info-rec) :value-tuple-p)
                                    :value-tuple-types
@@ -1716,10 +1767,14 @@
                   (getf (cdr info-rec) :key-array-elt-size)
                   :key-array-len
                   (getf (cdr info-rec) :key-array-len)
+                  :key-array-dims
+                  (getf (cdr info-rec) :key-array-dims)
                   :value-array-elt-size
                   (getf (cdr info-rec) :value-array-elt-size)
                   :value-array-len
                   (getf (cdr info-rec) :value-array-len)
+                  :value-array-dims
+                  (getf (cdr info-rec) :value-array-dims)
                   :kind      (getf (cdr info-rec) :kind)
                   :top       (when (plusp top) top)
                   :div       (when (plusp div) div)
@@ -2020,12 +2075,15 @@
                        (error () nil)))
                    ;; bpftrace's runtime test engine waits for this
                    ;; exact line on stdout before launching the AFTER
-                   ;; testprog. Without it, AFTER never fires, so the
-                   ;; uprobe never gets a hit, so exit() never sets
-                   ;; the flag, so we time out after 5s with empty
-                   ;; output. The line is a no-op for normal users.
-                   (format t "__BPFTRACE_NOTIFY_PROBES_ATTACHED~%")
-                   (force-output)
+                   ;; testprog. The harness signals it wants the line
+                   ;; via the __BPFTRACE_NOTIFY_PROBES_ATTACHED env
+                   ;; var (matches bpftrace.cpp:844). Without the env
+                   ;; gate normal `whistler bpftrace …' invocations
+                   ;; would print a noisy diagnostic line on every
+                   ;; run.
+                   (when (sb-ext:posix-getenv "__BPFTRACE_NOTIFY_PROBES_ATTACHED")
+                     (format t "__BPFTRACE_NOTIFY_PROBES_ATTACHED~%")
+                     (force-output))
                    ;; Poll-sleep until interrupted or exit() fires.
                    ;; Drain the printf ringbuf on every tick.
                    (setf *bpftrace-running* t)
