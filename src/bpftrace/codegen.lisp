@@ -2099,9 +2099,10 @@
                            (2 (intern "U16" :whistler))
                            (4 (intern "U32" :whistler))
                            (t (intern "U64" :whistler))))
+              (helper  (pick-probe-read-fn))
               (scratch (gensym "DEREF")))
          `(let ((,scratch (whistler::struct-alloc ,size)))
-            (whistler::probe-read-kernel ,scratch ,size ,arg)
+            (,helper ,scratch ,size ,arg)
             (whistler::load ,load-type ,scratch 0)))))))
 
 (defun lower-tern (expr)
@@ -6874,8 +6875,25 @@
    warnf / join / strftime. All of these route through the same
    ringbuf, so any of them gates injection of the bt-print map.
    Walks user-defined macros / functions too — `macro x() { printf … }'
-   called from a probe still needs the bt-print map injected."
-  (labels ((walk (form)
+   called from a probe still needs the bt-print map injected.
+   Also detects implicit warnf emissions — a runtime (non-literal)
+   subscript on an in-script struct array field triggers the runtime
+   bounds-check warnf and therefore needs the same map."
+  (labels ((runtime-array-index-p (form)
+             ;; Field-subscript with a non-literal index is the
+             ;; precondition for our runtime bounds-check warnf. We
+             ;; over-approximate at AST time (no *var-types* yet) by
+             ;; not checking that the field is actually an array;
+             ;; spurious bt-print injection is harmless, an absent
+             ;; one trips the emitter with "Unknown map: --BT-PRINT--".
+             (and (consp form) (eq (first form) :index)
+                  (let ((base (getf (cdr form) :base))
+                        (keys (getf (cdr form) :keys)))
+                    (and (consp base) (eq (first base) :field)
+                         keys (= 1 (length keys))
+                         (not (and (consp (first keys))
+                                   (eq (first (first keys)) :int)))))))
+           (walk (form)
              (cond
                ((not (consp form)) nil)
                ((and (eq (first form) :call)
@@ -6885,6 +6903,7 @@
                                "strftime")
                              :test #'string=))
                 t)
+               ((runtime-array-index-p form) t)
                (t (some #'walk form)))))
     (or (some (lambda (probe) (walk (getf (cdr probe) :body)))
               (script-probes script))
