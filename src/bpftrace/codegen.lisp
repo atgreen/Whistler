@@ -58,6 +58,11 @@
   value-array-elt-size ; When value-array-p is T, this is sizeof(elt)
                    ;   so `@m[k][i]' subscripts the value buffer
                    ;   with a sized load.
+  value-strftime-id ; Set when `@m = strftime(FMT, TS)' is the only
+                   ;   shape that writes the value. The slot holds a
+                   ;   u64 timestamp; userspace looks up FMT-ID in
+                   ;   the time-format-table and strftime's it.
+  key-strftime-id  ; Same as above but for `@[strftime(FMT, TS)] = …'.
   key-array-elt-size ; When the (single) map key is an in-script-struct
                    ;   array field, sizeof(elt). The userspace printer
                    ;   uses this with key-array-len to render keys as
@@ -361,6 +366,23 @@
                        (when (and sz len)
                          (setf (minfo-key-array-elt-size info) sz
                                (minfo-key-array-len info) len))))
+                   ;; Single-key strftime(): `@[strftime("FMT", TS)] = …'
+                   ;; — register the format and stash the id on the
+                   ;; map so the userspace key formatter strftime's
+                   ;; the u64 ts at print time.
+                   (when (and (= (length keys) 1)
+                              (consp (first keys))
+                              (eq (first (first keys)) :call)
+                              (string= (getf (cdr (first keys)) :name)
+                                       "strftime"))
+                     (let* ((fmt-arg (first (getf (cdr (first keys)) :args)))
+                            (fmt    (and (consp fmt-arg)
+                                         (eq (first fmt-arg) :str)
+                                         (second fmt-arg))))
+                       (when fmt
+                         (let ((id (1+ (length *time-format-table*))))
+                           (push (cons id fmt) *time-format-table*)
+                           (setf (minfo-key-strftime-id info) id)))))
                    ;; Composite: track per-slot hints so the printer
                    ;; can dispatch on individual slots.
                    (when (and (null (minfo-key-types info))
@@ -400,6 +422,20 @@
                    ;; concatenated param bytes (fentry/fexit: param-
                    ;; count × 8). Treat as a wide-byte value: track
                    ;; the size, mark needs-ptr-ops via wide value-size.
+                   ;; `@m = strftime("FMT", TS)' — store the bare u64
+                   ;; timestamp; userspace strftime's it via FMT-ID
+                   ;; at decode time.
+                   ((and (consp rhs) (eq (first rhs) :call)
+                         (string= (getf (cdr rhs) :name) "strftime")
+                         (let ((fmt-arg (first (getf (cdr rhs) :args))))
+                           (and (consp fmt-arg) (eq (first fmt-arg) :str))))
+                    (let* ((fmt (second (first (getf (cdr rhs) :args))))
+                           (id  (1+ (length *time-format-table*))))
+                      (push (cons id fmt) *time-format-table*)
+                      (setf (minfo-kind info) :scalar
+                            (minfo-value-strftime-id info) id
+                            (minfo-value-size info)
+                            (max (minfo-value-size info) 8))))
                    ;; `@m = (a, b, …)' — tuple value. Use the same
                    ;; per-component layout as composite-key-layout
                    ;; (each component takes a u64 slot or a wider
@@ -2000,6 +2036,13 @@
       ;; emit the same ktime-ns the bare-builtin form would.
       ((string= name "nsecs")
        '(whistler::ktime-ns))
+      ;; `strftime(FMT, TS)' outside a printf arg position — used as
+      ;; a map key or value. printf-arg-type handles the printf case;
+      ;; here we just yield the TS expr (a u64). The format id was
+      ;; registered by infer-maps' note-keys / note-rhs path when the
+      ;; result lands on a map.
+      ((string= name "strftime")
+       (lower-expr (second (getf (cdr expr) :args))))
       ((string= name "delete") 0)           ; lower-expr-stmt handles the real call
       ((string= name "reg")    (lower-reg-call (getf (cdr expr) :args)))
       ((string= name "kaddr")  (lower-kaddr-call (getf (cdr expr) :args)))
@@ -4425,6 +4468,15 @@
       ((and (consp rhs) (eq (first rhs) :comm)
             (minfo-value-string-p info))
        (gen-comm-set info keys))
+      ;; `@m = strftime("FMT", TS)' — store the timestamp as a plain
+      ;; u64; the userspace decoder strftime's it via the FMT-ID we
+      ;; stashed on the minfo.
+      ((and (consp rhs) (eq (first rhs) :call)
+            (string= (getf (cdr rhs) :name) "strftime")
+            (minfo-value-strftime-id info))
+       (gen-scalar-set mname keys
+                       (lower-expr (second (getf (cdr rhs) :args)))
+                       op))
       ;; `@m[k] = (a, b, …)' — tuple value. Allocate a value-sized
       ;; buffer using composite-key-layout's planning, fill each
       ;; slot, then map-update-ptr.
@@ -6272,6 +6324,8 @@
                                     :keyed-p (minfo-keyed-p info)
                                     :value-tuple-p (minfo-value-tuple-p info)
                                     :value-tuple-types (minfo-value-tuple-types info)
+                                    :value-strftime-id (minfo-value-strftime-id info)
+                                    :key-strftime-id (minfo-key-strftime-id info)
                                     :value-size (minfo-value-size info)
                                     :max-entries (minfo-max-entries info)
                                     :hist-params (minfo-hist-params info)))))))

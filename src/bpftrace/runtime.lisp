@@ -810,6 +810,8 @@
                                           key-types
                                           key-array-elt-size key-array-len
                                           value-tuple-p value-tuple-types
+                                          value-strftime-id key-strftime-id
+                                          time-format-table
                                           top div
                                           stacks-info stack-depth
                                           symbolizer)
@@ -918,15 +920,38 @@
          (dolist (kv pairs)
            (format t "~A[~A]: ~A~%"
                    prefix
-                   (format-key (car kv)
-                               :parts key-parts
-                               :key-builtin key-builtin
-                               :array-elt-size key-array-elt-size
-                               :array-len key-array-len)
-                   (format-scalar-value (cdr kv)))))
+                   (cond
+                     (key-strftime-id
+                      (strftime-light
+                       (or (cdr (assoc key-strftime-id time-format-table
+                                       :test #'=))
+                           "?")
+                       (car kv)))
+                     (t (format-key (car kv)
+                                    :parts key-parts
+                                    :key-builtin key-builtin
+                                    :array-elt-size key-array-elt-size
+                                    :array-len key-array-len)))
+                   (cond
+                     (value-strftime-id
+                      (strftime-light
+                       (or (cdr (assoc value-strftime-id time-format-table
+                                       :test #'=))
+                           "?")
+                       (cdr kv)))
+                     (t (format-scalar-value (cdr kv)))))))
         (t
          (dolist (kv pairs)
-           (format t "~A: ~A~%" prefix (format-scalar-value (cdr kv)))))))))
+           (format t "~A: ~A~%"
+                   prefix
+                   (cond
+                     (value-strftime-id
+                      (strftime-light
+                       (or (cdr (assoc value-strftime-id time-format-table
+                                       :test #'=))
+                           "?")
+                       (cdr kv)))
+                     (t (format-scalar-value (cdr kv)))))))))))
 
 (defun json-format-scalar-value (v)
   "JSON-encode a scalar map value cell. Integers go bare; strings
@@ -957,8 +982,9 @@
     (t (format nil "~D" (signed-64 v)))))
 
 (defun print-all-maps (info-list map-alist &key stacks-info stack-depth
-                                                symbolizer)
-  "Dump every known map in bpftrace END style."
+                                                symbolizer time-format-table)
+  "Dump every known map in bpftrace END style. TIME-FORMAT-TABLE is
+   passed through so strftime-typed map keys/values can render."
   (dolist (info-rec info-list)
     (let* ((raw-name    (first info-rec))
            (mname       (getf (cdr info-rec) :name))
@@ -988,6 +1014,11 @@
                                    (getf (cdr info-rec) :value-tuple-p)
                                    :value-tuple-types
                                    (getf (cdr info-rec) :value-tuple-types)
+                                   :value-strftime-id
+                                   (getf (cdr info-rec) :value-strftime-id)
+                                   :key-strftime-id
+                                   (getf (cdr info-rec) :key-strftime-id)
+                                   :time-format-table time-format-table
                                    :kind kind
                                    :stacks-info stacks-info
                                    :stack-depth stack-depth
@@ -1921,7 +1952,8 @@
             (print-all-maps info-list map-alist
                             :stacks-info stacks-info
                             :stack-depth stack-depth
-                            :symbolizer symbolizer))
+                            :symbolizer symbolizer
+                            :time-format-table time-format-table))
           (whistler/symbolize:close-symbolizer symbolizer)
           (dolist (a atts) (handler-case (whistler/loader::detach a) (error () nil)))
           (dolist (e prog-alist)
