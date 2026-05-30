@@ -572,6 +572,24 @@
 
      (t (error "Unknown IR op for emission: ~a" op)))))
 
+(defun emit-mov-imm-to-stack (ctx imm stack-off)
+  "Materialize integer IMM into the stack slot at R10+STACK-OFF.
+   For a 32-bit signed IMM, this is a single ST_MEM (no temp register
+   needed — important to avoid clobbering whatever's in R1)."
+  (cond
+    ((typep imm '(signed-byte 32))
+     (ectx-emit ctx (whistler/bpf:emit-st-mem
+                     whistler/bpf:+bpf-dw+
+                     whistler/bpf:+bpf-reg-10+ stack-off imm)))
+    (t
+     ;; 64-bit immediate (rare — most appear as :ld-imm rather than :mov).
+     ;; Use R0 as scratch: regalloc never assigns R0 to a vreg.
+     (let ((tmp whistler/bpf:+bpf-reg-0+))
+       (ectx-emit ctx (whistler/bpf:emit-ld-imm64 tmp imm))
+       (ectx-emit ctx (whistler/bpf:emit-stx-mem
+                       whistler/bpf:+bpf-dw+
+                       whistler/bpf:+bpf-reg-10+ tmp stack-off))))))
+
 (defun emit-mov-insn (ctx dst args)
   "Emit a mov instruction (vreg-to-vreg copy or immediate load)."
   (when dst
@@ -590,13 +608,7 @@
                      (ectx-emit ctx (whistler/bpf:emit-mov64-imm (cadr dst-loc) imm))
                      (ectx-emit ctx (whistler/bpf:emit-ld-imm64 (cadr dst-loc) imm))))
                 (:stack
-                 (let ((tmp whistler/bpf:+bpf-reg-1+))
-                   (if (typep imm '(signed-byte 32))
-                       (ectx-emit ctx (whistler/bpf:emit-mov64-imm tmp imm))
-                       (ectx-emit ctx (whistler/bpf:emit-ld-imm64 tmp imm)))
-                   (ectx-emit ctx (whistler/bpf:emit-stx-mem
-                                   whistler/bpf:+bpf-dw+
-                                   whistler/bpf:+bpf-reg-10+ tmp (cadr dst-loc))))))))))))))
+                 (emit-mov-imm-to-stack ctx imm (cadr dst-loc))))))))))))
 
 (defun emit-neg-insn (ctx dst args)
   "Emit a negation instruction."
