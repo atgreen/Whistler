@@ -2939,6 +2939,13 @@
     ((and (eq (first expr) :var)
           (member (second expr) *comm-vars* :test #'string-equal))
      (cons :string +bt-comm-len+))
+    ;; A `\$v' whose latest assignment came from a string literal —
+    ;; the var is a stack-buffer pointer to that string's bytes.
+    ;; *str-vars* maps NAME → buffer size in bytes.
+    ((and (eq (first expr) :var)
+          (assoc (second expr) *str-vars* :test #'string-equal))
+     (cons :string
+           (cdr (assoc (second expr) *str-vars* :test #'string-equal))))
     ;; A `\$v' assigned from `strftime(FMT, TS)' — the var holds the
     ;; raw u64 timestamp; printf %s pulls the matching format-id
     ;; back so the runtime strftime's it just like the bare
@@ -3142,6 +3149,17 @@
           (let* ((nm (or (getf (cdr elem) :name) "@"))
                  (info (gethash nm *map-table*)))
             (and info (minfo-value-string-p info))))
+     "%s")
+    ;; A `$v' tracked as string-typed (str-vars / comm-vars /
+    ;; ntop-vars / strftime-vars) — render as %s. The same lists the
+    ;; bare `print($v)' path consults, just on the tuple-element
+    ;; side. Without this, `print(($n, $s))' where $s = "abc" formats
+    ;; the buffer-pointer as decimal.
+    ((and (consp elem) (eq (first elem) :var)
+          (or (assoc (second elem) *str-vars* :test #'string-equal)
+              (member (second elem) *comm-vars* :test #'string-equal)
+              (member (second elem) *ntop-vars* :test #'string-equal)
+              (assoc (second elem) *strftime-vars* :test #'string=)))
      "%s")
     ((or (and (consp elem) (eq (first elem) :constant)
               (or (string= (second elem) "true")
@@ -3358,6 +3376,12 @@
           ;; Unrolled byte copy (whistler::memcpy widens to u64/u32
           ;; chunks at compile time). Avoids the regalloc snag the
           ;; runtime-loop form hit.
+          `(whistler::memcpy ,rec ,off ,(lower-expr arg) 0 ,size))
+         ;; A \$v backed by an inline str-slot (assigned from a string
+         ;; literal). lower-expr gives us the buffer pointer; memcpy
+         ;; the bytes into the record slot.
+         ((and (eq (first arg) :var)
+               (assoc (second arg) *str-vars* :test #'string-equal))
           `(whistler::memcpy ,rec ,off ,(lower-expr arg) 0 ,size))
          ;; A field-chain whose leaf is a char[] / u8[] array — emit
          ;; one probe_read_kernel of SIZE bytes from the chain's
