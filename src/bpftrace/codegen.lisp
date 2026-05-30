@@ -5532,6 +5532,34 @@
                                           :test #'string=))))
                   (list :call :name "print"
                         :args (list (list :tuple :items items)))))
+               ;; `$t.N' on a tuple var — look up the N'th component
+               ;; in *tuple-vars* and substitute. `$t.3.0' (nested
+               ;; tuple) handled recursively. Tight shape guard: a
+               ;; field node has exactly :base+:name in its plist
+               ;; (5-element list); shorter conses are key/value
+               ;; pairs from another plist that walk descended into.
+               ((and (eq (first f) :field) (= (length f) 5)
+                     (stringp (getf (cdr f) :name))
+                     (consp (getf (cdr f) :base))
+                     (eq (first (getf (cdr f) :base)) :var)
+                     (assoc (second (getf (cdr f) :base)) *tuple-vars*
+                            :test #'string=)
+                     (every #'digit-char-p (getf (cdr f) :name)))
+                (let* ((items (cdr (assoc (second (getf (cdr f) :base))
+                                          *tuple-vars* :test #'string=)))
+                       (idx (parse-integer (getf (cdr f) :name)))
+                       (item (and (< idx (length items)) (nth idx items))))
+                  (walk (or item f))))
+               ;; `(tuple-literal).N' — pick the literal's N'th item.
+               ((and (eq (first f) :field) (= (length f) 5)
+                     (stringp (getf (cdr f) :name))
+                     (consp (getf (cdr f) :base))
+                     (eq (first (getf (cdr f) :base)) :tuple)
+                     (every #'digit-char-p (getf (cdr f) :name)))
+                (let* ((items (getf (cdr (getf (cdr f) :base)) :items))
+                       (idx (parse-integer (getf (cdr f) :name)))
+                       (item (and (< idx (length items)) (nth idx items))))
+                  (walk (or item f))))
                ;; delete(@m, $v[, …]) / has_key(@m, $v) — keys are in
                ;; positional args 1+.
                ((and (eq (first f) :call)

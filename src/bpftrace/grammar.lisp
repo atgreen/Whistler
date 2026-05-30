@@ -355,7 +355,12 @@
      sees the right value. *)
   postfix-tail   = field-access / arrow-access / index-access / postfix-incdec
   postfix-incdec = '++' / '--'
-  field-access   = <'.'> ident
+  (* `.ident' is a struct/tuple field; `.N' (digits) is tuple
+     component access (`$t.0' / `$t.3.1'). Both shapes flow through
+     :field at AST time — tuple-component lookup happens during
+     expand-tuple-vars. *)
+  field-access   = <'.'> (ident / tuple-index)
+  tuple-index    = #'[0-9]+'
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 

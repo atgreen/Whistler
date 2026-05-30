@@ -699,8 +699,12 @@
                                (find-if #'consp (children-of tail-wrapper))
                                tail-wrapper)))
                 (ecase (tag-of inner)
-                  (:field-access (list :field :base acc
-                                       :name (text-of (first-tagged inner :ident))))
+                  (:field-access
+                   ;; .ident or .NUMBER (tuple-component access).
+                   (let ((idx (first-tagged inner :tuple-index)))
+                     (list :field :base acc
+                           :name (text-of (or idx
+                                              (first-tagged inner :ident))))))
                   (:arrow-access (list :field :base acc
                                        :name (text-of (first-tagged inner :ident))))
                   (:index-access (list :index :base acc
