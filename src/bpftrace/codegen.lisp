@@ -5320,6 +5320,45 @@
                   (if (consp form) (fold-stdlib-aliases form) form))
                 (rest script))))
 
+(defun fold-literal-buf (expr)
+  "Constant-fold `buf(\"literal\", N)' to a `:str' AST node when both
+   args are literals. The N bytes from the literal become a string
+   slot — existing map / var string-value paths take it from there.
+   Recursively descends into sub-expressions."
+  (cond
+    ((not (consp expr)) expr)
+    ((and (eq (first expr) :call)
+          (string= (getf (cdr expr) :name) "buf")
+          (let ((args (getf (cdr expr) :args)))
+            (and (= (length args) 2)
+                 (consp (first args)) (eq (first (first args)) :str)
+                 (consp (second args)) (eq (first (second args)) :int))))
+     (let* ((args (getf (cdr expr) :args))
+            (s    (second (first args)))
+            (n    (second (second args)))
+            (cap  (min n (length s))))
+       (list :str (subseq s 0 cap))))
+    (t (cons (fold-literal-buf (first expr))
+             (fold-literal-buf (rest expr))))))
+
+(defun fold-literal-buf-script (script)
+  "Apply fold-literal-buf to every probe / macro / function body so
+   the buf-literal-as-value path looks like a string-literal assign."
+  (cons (first script)
+        (mapcar (lambda (form)
+                  (cond
+                    ((and (consp form)
+                          (member (first form) '(:probe :function :macro)))
+                     (let ((body (getf (cdr form) :body)))
+                       (append (list (first form))
+                               (loop for (k v) on (cdr form) by #'cddr
+                                     append (list k
+                                                  (if (eq k :body)
+                                                      (fold-literal-buf body)
+                                                      v))))))
+                    (t form)))
+                (rest script))))
+
 (defun fold-getopt-script (script)
   "Apply fold-getopt to every probe / macro / function body so the
    resolved :str literals reach infer-* and rewrite-self-refs."
@@ -6016,6 +6055,11 @@
          ;; rest of the pipeline runs, so downstream code only ever
          ;; sees the canonical AST shape.
          (script    (fold-stdlib-aliases-script script))
+         ;; `buf("literal", N)' → `:str' literal so the existing
+         ;; string-value map / var paths handle storage. Only the
+         ;; both-literal case is folded; runtime `buf(ptr, n)' is
+         ;; still unsupported.
+         (script    (fold-literal-buf-script script))
          ;; Resolve getopt(name, string-default) calls against
          ;; *named-params* BEFORE tuple expansion / map inference so
          ;; the resulting :str literals flow through the regular
