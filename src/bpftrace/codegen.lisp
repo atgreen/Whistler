@@ -3087,6 +3087,47 @@
     ((and (consp arg-type) (eq (car arg-type) :enum))     8)  ; u64; userspace resolves name
     (t (error "printf-arg-size: unrecognised ~A" arg-type))))
 
+(defun lower-print-int-array-cast-str-literal (val)
+  "Fold print((intN[])\"literal\") to a literal printf — bpftrace
+   prints the bytes of the string (plus the trailing NUL) as
+   `[v1,v2,…]'. ELT-SIZE = sizeof(intN), bytes regrouped accordingly."
+  (let* ((elt-type (getf (cdr val) :elt-type))
+         (elt-size (or (cdr (assoc (string-downcase elt-type)
+                                   '(("int8" . 1) ("int16" . 2)
+                                     ("int32" . 4) ("int64" . 8)
+                                     ("uint8" . 1) ("uint16" . 2)
+                                     ("uint32" . 4) ("uint64" . 8)
+                                     ("int" . 4) ("uint" . 4))
+                                   :test #'string=))
+                       (unsupported "(intN[]) cast: unknown element type ~A"
+                                    elt-type)))
+         (inner-str (second (getf (cdr val) :expr)))
+         (raw-bytes (concatenate 'vector
+                                 (sb-ext:string-to-octets
+                                  inner-str :external-format :utf-8)
+                                 #(0)))
+         ;; Pad up to the next ELT-SIZE multiple so every element has
+         ;; ELT-SIZE bytes to pull from.
+         (padded-len (* elt-size (ceiling (length raw-bytes) elt-size)))
+         (padded (make-array padded-len :initial-element 0
+                                        :element-type '(unsigned-byte 8))))
+    (loop for i below (length raw-bytes)
+          do (setf (aref padded i) (aref raw-bytes i)))
+    (let* ((n-elts (/ padded-len elt-size))
+           (parts (loop for i below n-elts
+                        collect (loop for b below elt-size
+                                      sum (ash (aref padded
+                                                     (+ (* i elt-size) b))
+                                               (* b 8)))))
+           (txt (with-output-to-string (s)
+                  (write-char #\[ s)
+                  (loop for (p . rest) on parts
+                        do (format s "~D" p)
+                           (when rest (write-char #\, s)))
+                  (write-char #\] s)
+                  (write-char #\Newline s))))
+      (lower-printf (list (list :str txt))))))
+
 (defun lower-print-value (args)
   "Lower `print(VAL)' where VAL isn't an @map — bpftrace allows print()
    on any scalar / string / tuple. We synthesize a printf(FMT, VAL…)
@@ -3099,6 +3140,16 @@
     (unsupported "print() takes one argument (a value or @map)"))
   (let* ((val (first args))
          (tag (and (consp val) (first val))))
+    ;; `print((intN[])"literal")` — both sides compile-time-known.
+    ;; bpftrace renders the bytes (plus the NUL terminator for byte
+    ;; element types) as `[v1,v2,…]'. We fold the whole thing to a
+    ;; literal printf(STRING) at compile time — no per-byte arg
+    ;; gymnastics needed.
+    (when (and (eq tag :int-array-cast)
+               (let ((inner (getf (cdr val) :expr)))
+                 (and (consp inner) (eq (first inner) :str))))
+      (return-from lower-print-value
+        (lower-print-int-array-cast-str-literal val)))
     (cond
       ((eq tag :str)
        (lower-printf (list (list :str (concatenate 'string "%s"
