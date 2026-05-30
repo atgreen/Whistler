@@ -2102,7 +2102,10 @@
        (let ((args (getf (cdr expr) :args)))
          (cond
            ;; print(@map[, top[, div]]) — original async-map path.
-           ((and args (consp (first args)) (eq (first (first args)) :map))
+           ;; Distinguished from print(@map[k]) by the absence of keys;
+           ;; the indexed form fetches a single value and prints it.
+           ((and args (consp (first args)) (eq (first (first args)) :map)
+                 (null (getf (cdr (first args)) :keys)))
             (lower-async-map +bt-tag-print-map+ args "print"))
            ;; print(non-map) — bpftrace allows print(VAL) for any
            ;; scalar/string. We route through printf with an inferred
@@ -2134,10 +2137,31 @@
       ((string= name "kstack")
        `(whistler::get-stackid (whistler::ctx-ptr) ,*stacks-map-name* 0))
       ;; `nsecs(CLOCK)' — bpftrace 0.22+ accepts an optional clock
-      ;; selector. We don't yet thread the clock through, so just
-      ;; emit the same ktime-ns the bare-builtin form would.
+      ;; selector. Map the four clocks bpftrace recognises onto the
+      ;; matching BPF helper; everything else (and the no-arg
+      ;; default) goes through ktime-get-ns just like bare `nsecs'.
       ((string= name "nsecs")
-       '(whistler::ktime-ns))
+       (let* ((args (getf (cdr expr) :args))
+              (clk  (and args (consp (first args))
+                         (or (and (eq (first (first args)) :constant)
+                                  (second (first args)))
+                             (and (eq (first (first args)) :builtin)
+                                  (let ((b (second (first args))))
+                                    (and (symbolp b) (symbol-name b))))
+                             (and (eq (first (first args)) :ident)
+                                  (second (first args)))))))
+         (cond
+           ((or (null clk)
+                (string-equal clk "monotonic"))
+            '(whistler::ktime-get-ns))
+           ((string-equal clk "boot")
+            '(whistler::ktime-get-boot-ns))
+           ((or (string-equal clk "tai")
+                (string-equal clk "sw_tai"))
+            '(whistler::ktime-get-tai-ns))
+           ((string-equal clk "realtime")
+            '(whistler::ktime-get-coarse-ns))
+           (t '(whistler::ktime-get-ns)))))
       ;; `strftime(FMT, TS)' outside a printf arg position — used as
       ;; a map key or value. printf-arg-type handles the printf case;
       ;; here we just yield the TS expr (a u64). The format id was

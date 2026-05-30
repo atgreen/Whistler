@@ -45,6 +45,7 @@
     ("GET-CURRENT-TASK-BTF" . 159)
     ("KTIME-GET-COARSE-NS"  . 161)
     ("KTIME-GET-BOOT-NS"    . 125)
+    ("KTIME-GET-TAI-NS"     . 226)
     ("GET-STACKID"          . 27)
     ;; bpf_d_path(struct path *path, char *buf, u32 sz) — only
     ;; usable from specific LSM/fmod-style probes; for general
@@ -76,7 +77,7 @@
     ("RINGBUF-RESERVE" . 3) ("RINGBUF-SUBMIT" . 2) ("RINGBUF-DISCARD" . 2)
     ("RINGBUF-OUTPUT" . 4)
     ("GET-SOCKET-COOKIE" . 1) ("GET-CURRENT-TASK-BTF" . 0)
-    ("KTIME-GET-COARSE-NS" . 0) ("KTIME-GET-BOOT-NS" . 0)
+    ("KTIME-GET-COARSE-NS" . 0) ("KTIME-GET-BOOT-NS" . 0) ("KTIME-GET-TAI-NS" . 0)
     ("GET-STACKID" . 3))
   "Expected argument counts for BPF helpers that users call directly.
    BPF allows max 5 args (R1-R5). Helpers not listed here are not checked.")
