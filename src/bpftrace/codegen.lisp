@@ -5519,6 +5519,19 @@
                                            (t v)))
                         into rest
                       finally (return (cons :map rest))))
+               ;; print($t) where $t is a tuple var → print((c1, c2, …)).
+               ;; The single-arg print() path renders tuples; with $t
+               ;; left as a :var, we'd send only its u64 slot.
+               ((and (eq (first f) :call)
+                     (string= (getf (cdr f) :name) "print")
+                     (let ((arg (first (getf (cdr f) :args))))
+                       (and (consp arg) (eq (first arg) :var)
+                            (assoc (second arg) *tuple-vars* :test #'string=))))
+                (let* ((arg (first (getf (cdr f) :args)))
+                       (items (cdr (assoc (second arg) *tuple-vars*
+                                          :test #'string=))))
+                  (list :call :name "print"
+                        :args (list (list :tuple :items items)))))
                ;; delete(@m, $v[, …]) / has_key(@m, $v) — keys are in
                ;; positional args 1+.
                ((and (eq (first f) :call)
