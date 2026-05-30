@@ -390,8 +390,14 @@
   arrow-access   = <'->'> ident
   index-access   = <'['> <ws> expr (<ws> <','> <ws> expr)* <ws> <']'>
 
-  primary        = cast / enum-cast / primitive-pointer-cast / primitive-cast / block-expr / offsetof-expr / sizeof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
+  primary        = cast / enum-cast / int-array-cast / primitive-pointer-cast / primitive-cast / block-expr / offsetof-expr / sizeof-expr / tuple / parens / func-call / map-access / scalar-var / builtin /
                    duration-literal / constant / string-lit / hex-int / integer
+  (* `(int8[N])X' / `(int8[])X' — reinterpret X's bytes as an int8
+     array. Optional N forces a specific element count; an empty
+     bracket lets the codegen pick the right N for X's natural size.
+     Placed before primitive-pointer-cast so the open-paren
+     disambiguation tries the bracketed form first. *)
+  int-array-cast = <'('> <ws> int-type-name <ws> <'['> <ws> integer? <ws> <']'> <ws> <')'> <ws> unary
   (* `(enum NAME)EXPR' — cast that turns an integer into its enum
      member name at print time. Compile-time folded when EXPR is a
      literal and the value matches a member; otherwise emits a u64

@@ -198,8 +198,13 @@
                  (aligned   (if (zerop align) offset
                                 (* align (ceiling offset align))))
                  (slot-size (* base-size (or arr-len 1))))
+            ;; 7th slot (STARS) preserves the pointer indirection
+            ;; count so `*((struct C*)e).z[i]' can size the deref
+            ;; from the underlying base type rather than the pointer
+            ;; itself.
             (push (list (text-of ident-node)
-                        base-size aligned arr-len type-str arr-dims)
+                        base-size aligned arr-len type-str arr-dims
+                        stars)
                   fields)
             (setf offset (+ aligned slot-size))
             (setf max-align (max max-align align))))))
@@ -819,6 +824,23 @@
                                    (not (eq (tag-of c) :int-type-name))))
                             (children-of inner))))
          (list :prim-ptr-cast :elt-type type-name
+               :expr (norm-expr-dispatch sub))))
+      (:int-array-cast
+       ;; `(int8[N])X' / `(int8[])X' — reinterpret X's u64 value as a
+       ;; little-endian byte array of element type INT-TYPE and length
+       ;; N (or, when N is omitted, sizeof(int-type) elements covering
+       ;; the natural width of X). Codegen needs (elt-type, length)
+       ;; so subscript reads pull the right byte.
+       (let* ((type-name (text-of (first-tagged inner :int-type-name)))
+              (int-node  (first-tagged inner :integer))
+              (len       (when int-node
+                           (parse-integer (text-of int-node))))
+              (sub (find-if (lambda (c)
+                              (and (consp c)
+                                   (not (member (tag-of c)
+                                                '(:int-type-name :integer)))))
+                            (children-of inner))))
+         (list :int-array-cast :elt-type type-name :len len
                :expr (norm-expr-dispatch sub))))
       (:constant     (list :constant
                            (text-of (first-tagged inner :ident))))

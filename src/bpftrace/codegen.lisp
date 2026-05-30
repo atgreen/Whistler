@@ -1029,12 +1029,70 @@
     (:prim-ptr-cast (lower-expr (getf (cdr expr) :expr)))
     ;; Plain `(int8)x' / `(uint32)x' integer cast. The IR is all u64,
     ;; so we just lower the inner expression. Width-aware ops like
-    ;; bswap peek at this node before reaching here.
-    (:int-cast      (lower-expr (getf (cdr expr) :expr)))
+    ;; bswap peek at this node before reaching here. Also special-
+    ;; cases `(intN)((struct *)e).field' when FIELD is a byte-array
+    ;; of size ≤ sizeof(intN), and `(intN)pton("ip")' where pton
+    ;; returns the network-order bytes — both fold to a single
+    ;; integer load matching the target width.
+    (:int-cast
+     (let* ((target-type (getf (cdr expr) :type))
+            (target-size (cdr (assoc (string-downcase target-type)
+                                     '(("int8" . 1) ("int16" . 2)
+                                       ("int32" . 4) ("int64" . 8)
+                                       ("uint8" . 1) ("uint16" . 2)
+                                       ("uint32" . 4) ("uint64" . 8)
+                                       ("int" . 4) ("uint" . 4))
+                                     :test #'string=)))
+            (inner (getf (cdr expr) :expr)))
+       (cond
+         ;; (intN)((struct *)e).field where field is `T x[K]' and
+         ;; K * sizeof(T) ≤ N: probe-read the whole array bytes into
+         ;; a scratch slot and load as the target int width.
+         ((and target-size
+               (multiple-value-bind (b sz _o len) (array-field-meta inner)
+                 (declare (ignore _o))
+                 (and b sz len (<= (* sz len) target-size))))
+          (multiple-value-bind (base-ast sz off len) (array-field-meta inner)
+            (let* ((total (* sz len))
+                   (load-type (case target-size
+                                (1 (intern "U8"  :whistler))
+                                (2 (intern "U16" :whistler))
+                                (4 (intern "U32" :whistler))
+                                (t (intern "U64" :whistler))))
+                   (buf (gensym "IBUF")))
+              `(let ((,buf (whistler::struct-alloc ,total)))
+                 (,(pick-probe-read-fn) ,buf ,total
+                  (whistler::+ ,(lower-expr base-ast) ,off))
+                 (whistler::load ,load-type ,buf 0)))))
+         ;; (intN) pton("LITERAL") — fold the IP bytes into a single
+         ;; little-endian-loaded integer matching the target width.
+         ((and target-size
+               (consp inner) (eq (first inner) :call)
+               (string= (getf (cdr inner) :name) "pton")
+               (let ((a (first (getf (cdr inner) :args))))
+                 (and (consp a) (eq (first a) :str))))
+          (let* ((text (second (first (getf (cdr inner) :args))))
+                 (v4 (parse-ipv4 text))
+                 (v6 (unless v4 (parse-ipv6 text))))
+            (unless (or v4 v6)
+              (unsupported "pton(): could not parse ~S" text))
+            (let ((bytes (subseq (or v4 v6) 0
+                                 (min target-size (length (or v4 v6))))))
+              ;; Compose little-endian-loaded integer (matches how the
+              ;; downstream load would see the bytes when stored at the
+              ;; pton() buffer's address-zero).
+              (loop for b in bytes
+                    for i from 0
+                    sum (ash b (* i 8))))))
+         (t (lower-expr inner)))))
     ;; `(enum NAME)EXPR' — value cast. The printf-arg-type path
     ;; recognises the wrapper and emits an :enum slot; in a non-
     ;; printf position we just lower the underlying value.
     (:enum-cast     (lower-expr (getf (cdr expr) :expr)))
+    ;; `(int8[N])X' outside a subscript — treat as a no-op, returning
+    ;; X's raw u64 value. The interesting case is the indexed form
+    ;; `((int8[N])X)[i]', which lower-index handles directly.
+    (:int-array-cast (lower-expr (getf (cdr expr) :expr)))
     ;; Positional CLI parameter — `$1', `$2', …. Resolved from
     ;; *positional-args* at compile time. Numeric tokens lower to
     ;; their integer value; non-numeric tokens become 0 (matching
@@ -1980,20 +2038,71 @@
         (:<<   `(whistler::ash ,lhs ,rhs))
         (:>>   `(whistler::>> ,lhs ,rhs))))))
 
+(defun pointer-array-elt-deref-size (arg-ast)
+  "If ARG-AST is `(:index :base (:field …) :keys (k))' where the
+   in-script struct field is `T *NAME[N]' (pointer-array), return
+   sizeof(T) — the byte width to probe-read through the i'th
+   pointer. NIL when ARG-AST doesn't match that shape."
+  (when (and (consp arg-ast)
+             (eq (first arg-ast) :index))
+    (let ((base (getf (cdr arg-ast) :base)))
+      (when (and (consp base) (eq (first base) :field))
+        ;; field-meta-stars: walk *script-struct-decls* for the
+        ;; field's STARS and TYPE-STR. We only care about the
+        ;; pointer-array case (stars > 0 AND arr-len > 0).
+        (let* ((field-name (getf (cdr base) :name))
+               (struct-name
+                 (cond
+                   ((and (consp (getf (cdr base) :base))
+                         (eq (first (getf (cdr base) :base)) :cast))
+                    (getf (cdr (getf (cdr base) :base)) :type))
+                   ((and (consp (getf (cdr base) :base))
+                         (eq (first (getf (cdr base) :base)) :var))
+                    (cdr (assoc (second (getf (cdr base) :base))
+                                *var-types* :test #'string=)))))
+               (entry (and struct-name
+                           (assoc struct-name *script-struct-decls*
+                                  :test #'string=)))
+               (cell  (and entry
+                           (find field-name (cddr entry)
+                                 :test #'string= :key #'first)))
+               (stars (and cell (nth 6 cell)))
+               (arr-len (and cell (fourth cell)))
+               (type-str (and cell (fifth cell))))
+          (when (and stars arr-len (plusp stars) (plusp arr-len) type-str)
+            (let* ((base-name (if (and (>= (length type-str) 7)
+                                       (string= type-str "struct "
+                                                :end1 7))
+                                  (subseq type-str 7)
+                                  type-str))
+                   ;; Star count drops by one because the array slot
+                   ;; already gave us the bottom-level pointer.
+                   (size (ctype-size base-name (1- stars))))
+              (and size (member size '(1 2 4 8)) size))))))))
+
 (defun lower-un (expr)
   (let ((op  (getf (cdr expr) :op))
+        (arg-ast (getf (cdr expr) :arg))
         (arg (lower-expr (getf (cdr expr) :arg))))
     (ecase op
       (:!  `(whistler::if ,arg 0 1))
       (:-  `(whistler::- 0 ,arg))
       (:~  `(whistler::logxor ,arg #xffffffffffffffff))
       ;; *EXPR — u64 pointer deref via bpf_probe_read_kernel into a
-      ;; stack slot; matches bpftrace's *kaddr(SYM) pattern.
+      ;; stack slot; matches bpftrace's *kaddr(SYM) pattern. When the
+      ;; pointer comes from a `T *NAME[N]' field subscript, narrow
+      ;; the read to sizeof(T).
       (:*
-       (let ((scratch (gensym "DEREF")))
-         `(let ((,scratch (whistler::struct-alloc 8)))
-            (whistler::probe-read-kernel ,scratch 8 ,arg)
-            (whistler::load ,(intern "U64" :whistler) ,scratch 0)))))))
+       (let* ((size (or (pointer-array-elt-deref-size arg-ast) 8))
+              (load-type (case size
+                           (1 (intern "U8"  :whistler))
+                           (2 (intern "U16" :whistler))
+                           (4 (intern "U32" :whistler))
+                           (t (intern "U64" :whistler))))
+              (scratch (gensym "DEREF")))
+         `(let ((,scratch (whistler::struct-alloc ,size)))
+            (whistler::probe-read-kernel ,scratch ,size ,arg)
+            (whistler::load ,load-type ,scratch 0)))))))
 
 (defun lower-tern (expr)
   `(whistler::if ,(lower-expr (getf (cdr expr) :cond))
@@ -4061,6 +4170,35 @@
                    ,(lower-ptr-index
                      `(whistler::+ ,ptr-form ,field-off)
                      idx-tmp elt-size)))))))
+        ;; `((int8[N])X)[i]' — reinterpret X as a little-endian byte
+        ;; array and read the i'th element. Implements bpftrace's
+        ;; `(int8[N])X[i]' shape: store X into a struct-alloc slot
+        ;; sized to N×sizeof(elt), then load ELT-SIZE bytes at
+        ;; OFFSET = i × ELT-SIZE.
+        ((and (consp base) (eq (first base) :int-array-cast))
+         (let* ((elt-type (getf (cdr base) :elt-type))
+                (elt-size (or (cdr (assoc (string-downcase elt-type)
+                                          '(("int8" . 1) ("int16" . 2)
+                                            ("int32" . 4) ("int64" . 8)
+                                            ("uint8" . 1) ("uint16" . 2)
+                                            ("uint32" . 4) ("uint64" . 8)
+                                            ("int" . 4) ("uint" . 4))
+                                          :test #'string=))
+                              (unsupported "(int-array cast): unknown element type ~A"
+                                           elt-type)))
+                (len (or (getf (cdr base) :len) (/ 8 elt-size)))
+                (total (* elt-size len))
+                (buf (gensym "IBUF"))
+                (load-type (case elt-size
+                             (1 (intern "U8"  :whistler))
+                             (2 (intern "U16" :whistler))
+                             (4 (intern "U32" :whistler))
+                             (t (intern "U64" :whistler)))))
+           `(let ((,buf (whistler::struct-alloc ,total)))
+              (whistler::store whistler::u64 ,buf 0
+                               ,(lower-expr (getf (cdr base) :expr)))
+              (whistler::load ,load-type ,buf
+                              (whistler::* ,(lower-expr idx) ,elt-size)))))
         (t (unsupported "array indexing outside @maps"))))))
 
 (defun array-field-dims (field-expr)
