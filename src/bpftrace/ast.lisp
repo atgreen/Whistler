@@ -450,10 +450,16 @@
     (ecase (tag-of inner)
       (:begin-spec      '(:begin))
       (:end-spec        '(:end))
-      (:kprobe-spec     (list :kprobe
-                              (text-of (first-tagged inner :glob-ident))))
-      (:kretprobe-spec  (list :kretprobe
-                              (text-of (first-tagged inner :glob-ident))))
+      (:kprobe-spec
+       ;; The last :glob-ident is the function name; any preceding
+       ;; one is the kernel module ("vmlinux", "kvm", …). Module
+       ;; routing isn't wired into the loader yet — accept the
+       ;; syntax, attach against the bare function name.
+       (list :kprobe
+             (text-of (car (last (all-tagged inner :glob-ident))))))
+      (:kretprobe-spec
+       (list :kretprobe
+             (text-of (car (last (all-tagged inner :glob-ident))))))
       ;; kfunc[:vmlinux]:funcname — last :ident is the function. The
       ;; optional "vmlinux" token is silently dropped; we only support
       ;; the vmlinux module today.

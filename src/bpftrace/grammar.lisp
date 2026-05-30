@@ -254,9 +254,14 @@
   (* bpftrace short forms for every probe type — `k:'/`kr:'/`u:'/
      `ur:'/`t:'/`f:'/`fr:'/`i:'/`p:' are accepted alongside the long
      spellings. The !ident-char anchor prevents a script that uses
-     `interval' written `interval' from being eaten as `i'-prefix. *)
-  kprobe-spec    = <('kprobe' / 'k') !ident-char> <':'> glob-ident
-  kretprobe-spec = <('kretprobe' / 'kr') !ident-char> <':'> glob-ident
+     `interval' written `interval' from being eaten as `i'-prefix.
+     The optional `MODULE:' prefix routes through bpftrace's BTF
+     module resolver (`kprobe:vmlinux:vfs_read'). The function name
+     may also carry `+OFFSET' to probe at a byte offset past the
+     symbol entry. *)
+  kprobe-spec    = <('kprobe' / 'k') !ident-char> <':'> (glob-ident <':'>)? glob-ident kprobe-offset?
+  kretprobe-spec = <('kretprobe' / 'kr') !ident-char> <':'> (glob-ident <':'>)? glob-ident
+  kprobe-offset  = <'+'> integer
   (* `fentry:'/`fexit:' are bpftrace 0.20+ aliases for `kfunc:'/
      `kretfunc:'. Both forms attach BPF_PROG_TYPE_TRACING programs
      to BTF-typed kernel functions; the codegen treats them the same. *)
