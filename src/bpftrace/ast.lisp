@@ -527,7 +527,12 @@
               (count-node (first-tagged inner :integer)))
          (list :profile
                :unit (intern (string-upcase unit-str) :keyword)
-               :count (parse-integer (text-of count-node))))))))
+               :count (parse-integer (text-of count-node)))))
+      (:self-spec
+       ;; self:signal:SIGNAME — userspace-only probe. Carry the
+       ;; signal name verbatim ("SIGUSR1" etc.); runtime resolves
+       ;; the int via SB-POSIX:SIGUSR1 / friends.
+       (list :self :signal (text-of (first-tagged inner :ident)))))))
 
 ;;; ========== Statements ==========
 

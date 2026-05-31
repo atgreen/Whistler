@@ -251,7 +251,7 @@
                    kretfunc-spec / kfunc-spec /
                    kretprobe-spec / kprobe-spec / uretprobe-spec /
                    uprobe-spec / tracepoint-spec /
-                   bench-spec / rawtracepoint-spec
+                   bench-spec / rawtracepoint-spec / self-spec
   (* `bench:NAME { … }' — bpftrace 0.22+ benchmark pseudo-probe. We
      accept the syntax so scripts parse; the body still compiles
      through the normal kernel-prog pipeline. A true `--mode bench'
@@ -262,6 +262,11 @@
      because the right BPF prog type isn't wired. Better than a
      parse error. *)
   rawtracepoint-spec = <'rawtracepoint' !ident-char> <':'> ident
+  (* `self:signal:NAME { … }' — userspace-only probe. bpftrace
+     installs a sigaction for SIG-NAME and runs the body when the
+     signal hits the bpftrace process. We surface the same grammar
+     and route through the user-probes path so print/exit work. *)
+  self-spec      = <'self' !ident-char> <':'> <'signal'> <':'> ident
   (* `BEGIN' / `END' (classic) and `begin' / `end' (bpftrace 0.22+)
      both legal — same semantics. The !ident-char anchor prevents
      `beginning' / `endpoint' style identifiers from being eaten. *)

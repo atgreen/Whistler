@@ -49,8 +49,11 @@
     ;; Compile
     (let* ((maps (reverse whistler::*maps*))
            (progs (reverse whistler::*programs*)))
-      (when (null progs)
-        (error "with-bpf-session: no bpf:prog forms found"))
+      ;; A script with only userspace probes (e.g. `self:signal:SIG{ … }')
+      ;; has zero kernel progs but still needs the loader path so its
+      ;; auto-emitted ringbuf map exists. Returning early with empty
+      ;; specs lets the bpftrace runtime install signal handlers and
+      ;; wait for events without a useless `no bpf:prog forms found' error.
       ;; Compile each program
       (let ((compiled-units
              (mapcar (lambda (prog-spec)

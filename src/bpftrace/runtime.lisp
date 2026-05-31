@@ -1169,19 +1169,77 @@
 
 ;;; ========== Userspace BEGIN/END ==========
 
-(defun run-user-probe (probe)
-  "Run a BEGIN/END/interval probe userspace-side. Phase 1 only
-   recognises (printf …) inside these blocks; everything else is
-   skipped with a notice."
-  (dolist (stmt (getf probe :body))
+(defparameter *signal-name->number*
+  '(("SIGHUP"  .  1) ("SIGINT"  .  2) ("SIGQUIT" .  3) ("SIGILL"  .  4)
+    ("SIGTRAP" .  5) ("SIGABRT" .  6) ("SIGBUS"  .  7) ("SIGFPE"  .  8)
+    ("SIGKILL" .  9) ("SIGUSR1" . 10) ("SIGSEGV" . 11) ("SIGUSR2" . 12)
+    ("SIGPIPE" . 13) ("SIGALRM" . 14) ("SIGTERM" . 15) ("SIGCHLD" . 17)
+    ("SIGCONT" . 18) ("SIGSTOP" . 19) ("SIGTSTP" . 20))
+  "Linux x86_64 / generic signal numbers. Used by self:signal:NAME
+   probes to install the right SA handler.")
+
+(defun run-user-probe-body (body)
+  "Execute one userspace probe body — the print/printf/exit subset
+   needed by BEGIN/END / self:signal probes (no kernel BPF involved).
+   Anything else in the body is currently silently skipped."
+  (dolist (stmt body)
     (when (and (consp stmt) (eq (first stmt) :expr))
       (let ((e (second stmt)))
-        (when (and (consp e) (eq (first e) :call)
-                   (string= (getf (cdr e) :name) "printf"))
-          (let ((args (getf (cdr e) :args)))
-            (when (and args (eq (first (first args)) :str))
-              (format t "~A" (second (first args)))
-              (force-output))))))))
+        (when (consp e)
+          (cond
+            ((and (eq (first e) :call)
+                  (string= (getf (cdr e) :name) "printf"))
+             (let ((args (getf (cdr e) :args)))
+               (when (and args (eq (first (first args)) :str))
+                 (format t "~A" (second (first args)))
+                 (force-output))))
+            ;; print("literal") — the runtime test suite uses this
+            ;; in self:signal:SIGUSR1 { print("signal handler"); … }.
+            ;; bpftrace appends a newline on print() but not printf().
+            ((and (eq (first e) :call)
+                  (string= (getf (cdr e) :name) "print"))
+             (let* ((args (getf (cdr e) :args))
+                    (a    (first args)))
+               (when (and a (eq (first a) :str))
+                 (format t "~A~%" (second a))
+                 (force-output))))
+            ((and (eq (first e) :call)
+                  (string= (getf (cdr e) :name) "exit"))
+             (setf *bpftrace-running* nil)
+             (let* ((args (getf (cdr e) :args))
+                    (code (cond
+                            ((null args) 0)
+                            ((and (consp (first args))
+                                  (eq (first (first args)) :int))
+                             (second (first args)))
+                            (t 0))))
+               (setf *bpftrace-exit-code* code)))))))))
+
+(defun run-user-probe (probe)
+  "Compatibility wrapper — earlier callers passed a (… :body …) plist."
+  (run-user-probe-body (getf probe :body)))
+
+(defun install-self-signal-handlers (user-probes)
+  "Walk USER-PROBES for `:self :signal NAME' entries and arrange for
+   the matching SBCL signal handler to run that probe's body. The
+   handler defers the work to the main loop by setting a pending
+   flag — running it directly in the signal context would race with
+   any I/O the body wants to do."
+  (dolist (probe user-probes)
+    (let ((spec (getf probe :spec))
+          (body (getf probe :body)))
+      (when (and (consp spec) (eq (first spec) :self)
+                 (eq (second spec) :signal))
+        (let* ((name (third spec))
+               (sig  (cdr (assoc name *signal-name->number*
+                                 :test #'string=))))
+          (when sig
+            (sb-sys:enable-interrupt
+             sig
+             (lambda (signal info context)
+               (declare (ignore signal info context))
+               (handler-case (run-user-probe-body body)
+                 (error () nil))))))))))
 
 ;;; ========== The runtime entry ==========
 
@@ -1964,11 +2022,29 @@
        (>= (length section) 13)
        (string= (subseq section 9 13) "end_")))
 
+(defun run-user-only (user-probes)
+  "Fast path for scripts that only have userspace probes (today:
+   `self:signal:NAME { … }'). Install the signal handlers, then
+   sleep-poll until something flips *bpftrace-running* off. Skips
+   the entire BPF map/prog bring-up because the kernel side has
+   nothing to do — keeps the script working under environments
+   where we don't even have CAP_BPF."
+  (install-self-signal-handlers user-probes)
+  (setf *bpftrace-running* t)
+  (handler-case
+      (loop while *bpftrace-running* do (sleep 0.1))
+    (sb-sys:interactive-interrupt ()
+      (format t "~&^C~%"))))
+
 (defun run-generated (gen)
   "Bring up GEN as a live BPF session and block until either Ctrl-C
    or a kernel-side exit() flips the bt-exit flag. BEGIN/END probes
    are kernel programs invoked via BPF_PROG_TEST_RUN; everything
    else attaches normally."
+  (when (and (null (getf gen :progs))
+             (getf gen :user-probes))
+    (return-from run-generated
+      (run-user-only (getf gen :user-probes))))
   (let ((*str-trunc-trailer*
           ;; Honor `config = { str_trunc_trailer = "…" }'. Strip the
           ;; optional surrounding quotes the user may have written —
@@ -2110,18 +2186,29 @@
                    ;; when we skip the poll loop — otherwise `begin {
                    ;; exit(69); }' falls through to a 0 exit code.
                    (exit-flag-set-p exit-info)
-                   (when (or atts *child-process*)
-                     (handler-case
-                         (loop while (and *bpftrace-running*
-                                          (not (exit-flag-set-p exit-info))
-                                          (not (and *child-process*
-                                                    (child-exited-p *child-process*))))
-                               do (if ring-consumer
-                                      (whistler/loader::ring-poll
-                                       ring-consumer :timeout-ms 100)
-                                      (sleep 0.1)))
+                   ;; Install userspace signal handlers for
+                   ;; self:signal:NAME probes. They flip
+                   ;; *bpftrace-running* / run the body via the same
+                   ;; printf+exit subset BEGIN uses.
+                   (let ((self-probes
+                           (remove-if-not
+                            (lambda (p)
+                              (let ((s (getf p :spec)))
+                                (and (consp s) (eq (first s) :self))))
+                            (getf gen :user-probes))))
+                     (install-self-signal-handlers self-probes)
+                     (when (or atts *child-process* self-probes)
+                       (handler-case
+                           (loop while (and *bpftrace-running*
+                                            (not (exit-flag-set-p exit-info))
+                                            (not (and *child-process*
+                                                      (child-exited-p *child-process*))))
+                                 do (if ring-consumer
+                                        (whistler/loader::ring-poll
+                                         ring-consumer :timeout-ms 100)
+                                        (sleep 0.1)))
                        (sb-sys:interactive-interrupt ()
-                         (format t "~&^C~%")))))
+                         (format t "~&^C~%"))))))
                (bpftrace-attach-error (e)
                  (format *error-output* "~&~A~%" e)))
           ;; END — kernel test_run, then drain final printf output,
