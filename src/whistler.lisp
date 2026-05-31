@@ -1036,7 +1036,11 @@
           (if (probe-file "/sys/kernel/btf/vmlinux") "yes" "no")))
 
 (defun bpftrace-print-help ()
-  (format t "USAGE: whistler bpftrace [OPTIONS] [SCRIPT]~%")
+  ;; Bare `USAGE:' line first so the runtime test's strict-text
+  ;; EXPECT (which line-anchors via re.M `^\s*USAGE:\s*$') matches.
+  ;; The verbose line below carries the actual signature.
+  (format t "USAGE:~%")
+  (format t "  whistler bpftrace [OPTIONS] [SCRIPT]~%")
   (format t "~%Compile and run a bpftrace script via Whistler.~%")
   (format t "~%OPTIONS:~%")
   (format t "  -e PROGRAM     Inline script text (instead of a file)~%")
@@ -1151,21 +1155,34 @@
     (when (glob-matches-p glob n)
       (format t "~A:~A:~%" prefix n))))
 
-(defun binary-symbols (path)
-  "Best-effort list of dynamic-symbol names exported by PATH via
-   `nm -D --defined-only'. Returns NIL on failure."
+(defun nm-text-symbols (path &key dynamic-only)
+  "Run `nm [-D] --defined-only PATH' and collect text (T/t/W/w) symbol
+   names. Returns NIL on failure. DYNAMIC-ONLY selects `nm -D'."
   (handler-case
-      (let ((out (make-string-output-stream)))
-        (sb-ext:run-program "/usr/bin/nm"
-                            (list "-D" "--defined-only" path)
+      (let ((out (make-string-output-stream))
+            (argv (cond
+                    (dynamic-only (list "-D" "--defined-only" path))
+                    (t            (list "--defined-only" path)))))
+        (sb-ext:run-program "/usr/bin/nm" argv
                             :output out :wait t :error nil)
         (loop for line in (split-sequence-on-newlines
                            (get-output-stream-string out))
-              for sym = (let ((sp (position #\Space line :from-end t)))
-                          (and sp (subseq line (1+ sp))))
-              when (and sym (plusp (length sym)))
+              for kind = (and (>= (length line) 18) (char line 17))
+              for sym  = (let ((sp (position #\Space line :from-end t)))
+                           (and sp (subseq line (1+ sp))))
+              when (and sym kind
+                        (plusp (length sym))
+                        (or (char= kind #\T) (char= kind #\t)
+                            (char= kind #\W) (char= kind #\w)))
                 collect sym))
     (error () nil)))
+
+(defun binary-symbols (path)
+  "Best-effort list of text-symbol names defined in PATH. Prefers
+   static symbols (covers non-exported functions uprobe-attachable by
+   bpftrace), falls back to dynamic (-D) for stripped binaries."
+  (or (nm-text-symbols path)
+      (nm-text-symbols path :dynamic-only t)))
 
 (defun split-sequence-on-newlines (s)
   (loop with i = 0
@@ -1341,6 +1358,24 @@
           (t (cl:incf i)))))
     (nreverse specs)))
 
+(defun strip-probe-spec-tail (spec)
+  "Strip the trailing freq/count from \`hardware:cache-misses:10' /
+   \`software:cpu-clock:99' / \`profile:hz:99' / \`interval:s:1' so
+   listings render the probe shape rather than the user's specific
+   tuning. bpftrace's \`-l -e' surfaces \`hardware:cache-misses:'
+   (trailing colon, no count); we match that. Probe kinds without a
+   numeric tail (kprobe, uprobe, tracepoint, …) pass through
+   unchanged."
+  (let ((colon1 (position #\: spec)))
+    (cond
+      ((null colon1) spec)
+      ((member (subseq spec 0 colon1)
+               '("hardware" "software" "profile" "interval" "iter")
+               :test #'string=)
+       (let ((colon2 (position #\: spec :start (1+ colon1))))
+         (if colon2 (subseq spec 0 (1+ colon2)) spec)))
+      (t spec))))
+
 (defun list-probes-in-script (source verbose-p)
   "Print SOURCE's referenced probes, one per line. Uses a regex-style
    scan (extract-probe-specs) so probe shapes the full parser doesn't
@@ -1348,7 +1383,7 @@
    still surface here."
   (declare (ignore verbose-p))
   (dolist (spec (extract-probe-specs source))
-    (format t "~A~%" spec)))
+    (format t "~A~%" (strip-probe-spec-tail spec))))
 
 (defun run-bpftrace-list (args)
   "Implement `whistler bpftrace -l [PATTERN]' covering the probe-
@@ -1491,7 +1526,27 @@
                       (unless s
                         (format *error-output* "Error: -p requires a PID~%")
                         (uiop:quit 1))
-                      (parse-integer s :junk-allowed nil))))
+                      ;; bpftrace's diagnostic shape is
+                      ;; `ERROR: Failed to parse pid: invalid integer: S'
+                      ;; (junk / non-numeric) or
+                      ;; `ERROR: Failed to parse pid: pid: S is out of valid pid range'
+                      ;; (1 .. PID_MAX_LIMIT, 2^22 on Linux). Match
+                      ;; both so the validation tests pass.
+                      (let ((n (handler-case
+                                   (let ((res (parse-integer s
+                                                             :junk-allowed nil)))
+                                     res)
+                                 (error () nil))))
+                        (unless n
+                          (format *error-output*
+                                  "ERROR: Failed to parse pid: invalid integer: ~A~%" s)
+                          (uiop:quit 1))
+                        (unless (and (plusp n) (< n (ash 1 22)))
+                          (format *error-output*
+                                  "ERROR: Failed to parse pid: pid: ~A is out of valid pid range [1, ~D]~%"
+                                  s (1- (ash 1 22)))
+                          (uiop:quit 1))
+                        n))))
          (cmd-arg (when c-pos
                     (or (nth (1+ c-pos) args)
                         (progn (format *error-output*

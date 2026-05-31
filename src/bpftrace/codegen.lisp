@@ -901,6 +901,14 @@
    to emit `%B' instead of `%d' so the userspace renderer prints
    `true'/`false' instead of `1'/`0'.")
 
+(defvar *unsigned-vars* nil
+  "Per-probe list of VAR-NAME strings whose value is known unsigned —
+   today that means the var was assigned a literal larger than
+   int64-max (bpftrace promotes those to uint64). The printf-arg-type
+   classifier returns the same `:int' shape for the on-record
+   payload, but lower-print-value picks `%u' so the userspace decoder
+   renders as unsigned rather than wrapping into a negative int64.")
+
 (defvar *var-array-types* nil
   "Per-probe alist VAR-NAME → (ELT-SIZE ARR-LEN DIMS) for vars
    assigned from a map whose value-array-p is set — e.g. `$x = @a[0]'
@@ -2799,10 +2807,12 @@
       ;; Scalar-map check. `@g = 2' makes @g a scalar map with no key
       ;; slot; bpftrace rejects `has_key(@g, …)' on those at type-
       ;; check time. minfo-keyed-p is NIL until something records a
-      ;; key access shape.
+      ;; key access shape. Phrasing matches bpftrace's diagnostic so
+      ;; the runtime test's `.* ERROR: call to has_key\(\) expects a
+      ;; map with explicit keys.*' regex catches it.
       (unless (minfo-keyed-p info)
         (unsupported
-         "ERROR: has_key() expects a map with keys, but @~A is a scalar map"
+         "ERROR: call to has_key() expects a map with explicit keys, but @~A is a scalar map"
          mname-string))
       ;; Argument-shape typecheck. bpftrace rejects calls whose key
       ;; arity or per-slot type *family* doesn't match the map's
@@ -3336,12 +3346,24 @@
                                                 (string #\Newline)))
                              leaves))))
       ;; Default: numeric. Covers $vars, int literals, arithmetic,
-      ;; builtins like pid/tid/cpu, etc. The runtime decoder treats
-      ;; the payload as u64.
+      ;; builtins like pid/tid/cpu, etc. Pick `%u' over `%d' when
+      ;; bpftrace would have inferred uint64 — today that's literals
+      ;; > int64-max and $vars marked in *unsigned-vars*. Default is
+      ;; still `%d' so negative literals (`-1') print as -1, not
+      ;; 18446744073709551615.
       (t
-       (lower-printf (list (list :str (concatenate 'string "%d"
-                                                   (string #\Newline)))
-                           val))))))
+       (let ((fmt (cond
+                    ((and (eq tag :int)
+                          (> (second val) #x7fffffffffffffff))
+                     "%u")
+                    ((and (eq tag :var)
+                          (member (second val) *unsigned-vars*
+                                  :test #'string=))
+                     "%u")
+                    (t "%d"))))
+         (lower-printf (list (list :str (concatenate 'string fmt
+                                                     (string #\Newline)))
+                             val)))))))
 
 (defun tuple-elem-printf-spec (elem)
   "Pick a printf %-spec for a tuple element. String-typed elements use
@@ -6237,6 +6259,30 @@
       (mapc #'walk stmts))
     acc))
 
+(defun infer-unsigned-vars (stmts)
+  "Walk STMTS for `$v = LITERAL' assignments whose integer literal is
+   too big to fit in int64 (bpftrace promotes those to uint64) and
+   return the list of VAR-NAME strings. The printer uses this to
+   pick `%u' over `%d' so big positive constants render correctly."
+  (let ((acc nil)
+        (int64-max #x7fffffffffffffff))
+    (labels ((maybe-record (lhs rhs)
+               (when (and (consp lhs) (eq (first lhs) :var)
+                          (consp rhs) (eq (first rhs) :int)
+                          (> (second rhs) int64-max))
+                 (pushnew (second lhs) acc :test #'string=)))
+             (walk (s)
+               (case (first s)
+                 (:assign (maybe-record (getf (cdr s) :lhs)
+                                        (getf (cdr s) :rhs)))
+                 (:if     (mapc #'walk (getf (cdr s) :then))
+                          (mapc #'walk (getf (cdr s) :else)))
+                 (:while  (mapc #'walk (getf (cdr s) :body)))
+                 (:for    (mapc #'walk (getf (cdr s) :body)))
+                 (:for-each (mapc #'walk (getf (cdr s) :body))))))
+      (mapc #'walk stmts))
+    acc))
+
 (defun infer-bool-vars (stmts)
   "Walk STMTS for `$v = true/false/(bool)X/COMPARISON' assignments and
    return a list of VAR-NAME strings. Used by tuple-elem-printf-spec
@@ -6976,6 +7022,7 @@
            (*var-array-types*   (infer-var-array-types body))
            (*strftime-vars*     (infer-strftime-vars body))
            (*bool-vars*         (infer-bool-vars body))
+           (*unsigned-vars*     (infer-unsigned-vars body))
            (*ntop-vars*  (infer-ntop-vars body))
            (*comm-vars*  (infer-comm-vars body))
            (*str-vars*   (infer-str-vars body))
