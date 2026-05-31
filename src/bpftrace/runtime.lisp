@@ -689,13 +689,24 @@
   "If INFO-REC is a keyed hist/lhist map, return a plist with
    :user-key-size / :key-builtin / :key-parts. NIL otherwise.
    user-key-size = map's key-size minus the trailing 4-byte bucket
-   index that gen-hist-update-keyed appends."
+   index that gen-hist-update-keyed appends. :key-parts reflects the
+   user-key only — the printer has already split off the bucket via
+   split-keyed-bucket and passes the bare user-key bytes to
+   format-key, so the compound key-parts (which would split the
+   user-key into two slots and tack a stale `, 0' bucket label onto
+   the render) is wrong here."
   (when (getf (cdr info-rec) :keyed-p)
     (let ((ks (getf (cdr info-rec) :key-size)))
       (when (and ks (> ks 4))
-        (list :user-key-size (- ks 4)
-              :key-builtin (getf (cdr info-rec) :key-builtin)
-              :key-parts (getf (cdr info-rec) :key-parts))))))
+        (let ((user-key-size (- ks 4)))
+          (list :user-key-size user-key-size
+                :key-builtin (getf (cdr info-rec) :key-builtin)
+                :key-parts (max 1 (ceiling user-key-size 8))))))))
+
+(defun map-display-prefix (label)
+  "Return bpftrace's `@'/`@NAME' prefix string. The anonymous map's
+   raw-name is `\"@\"' so we'd otherwise emit `@@'."
+  (if (or (null label) (string= label "@")) "@" (format nil "@~A" label)))
 
 (defun print-hist (label info &key keyed-info)
   "Render a log2 histogram. Non-keyed maps are a percpu-array of u64,
@@ -709,7 +720,7 @@
                            collect (lookup-percpu-sum info i)))
             (last    (or (position-if-not #'zerop buckets :from-end t) -1))
             (maxc    (or (reduce #'max buckets) 0)))
-       (format t "~%@~A:~%" label)
+       (format t "~%~A:~%" (map-display-prefix label))
        (when (minusp last)
          (format t "    (no samples)~%")
          (return-from print-hist))
@@ -753,15 +764,15 @@
          (key-parts     (or (getf keyed-info :key-parts) 1))
          (groups        (group-keyed-buckets info user-key-size 64)))
     (when (zerop (hash-table-count groups))
-      (format t "~%@~A: (no samples)~%" label)
+      (format t "~%~A: (no samples)~%" (map-display-prefix label))
       (return-from print-hist-keyed))
     (loop for uk being the hash-keys of groups
             using (hash-value buckets)
           for vector-list = (coerce buckets 'list)
           for last = (or (position-if-not #'zerop vector-list :from-end t) -1)
           for maxc = (or (reduce #'max vector-list) 0)
-          do (format t "~%@~A[~A]:~%"
-                     label
+          do (format t "~%~A[~A]:~%"
+                     (map-display-prefix label)
                      (format-key uk
                                  :parts key-parts
                                  :key-builtin key-builtin))
@@ -2121,13 +2132,15 @@
              (handler-case
                  (progn
                    ;; BEGIN — kernel test_run, before any attaches.
+                   ;; Note: we deliberately defer draining BEGIN's
+                   ;; ringbuf output until AFTER NOTIFY is emitted, so
+                   ;; the test runner's has_exact_expect mode (which
+                   ;; discards everything before NOTIFY) captures
+                   ;; print(@,…)/clear/printf output that fired here.
+                   ;; bpftrace upstream sequences the same way.
                    (dolist (b begin-progs)
                      (whistler/loader::prog-test-run
                       (whistler/loader::prog-info-fd (cdr b))))
-                   ;; Drain anything BEGIN already wrote to the ringbuf
-                   ;; so its output prints before the main loop starts.
-                   (when ring-consumer
-                     (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
                    ;; Attach all real probes. Individual attach
                    ;; failures (e.g. an alternate-target like
                    ;; `uprobe:libpthread:pthread_create' on a kernel
@@ -2169,6 +2182,11 @@
                    (when (sb-ext:posix-getenv "__BPFTRACE_NOTIFY_PROBES_ATTACHED")
                      (format t "__BPFTRACE_NOTIFY_PROBES_ATTACHED~%")
                      (force-output))
+                   ;; Drain anything BEGIN wrote to the ringbuf —
+                   ;; printf/print(@,…)/clear/etc. The test runner's
+                   ;; has_exact_expect mode reads this section.
+                   (when ring-consumer
+                     (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
                    ;; Poll-sleep until interrupted or exit() fires.
                    ;; Drain the printf ringbuf on every tick.
                    ;;
