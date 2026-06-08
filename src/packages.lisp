@@ -50,6 +50,7 @@
    #:+bpf-map-type-lpm-trie+
    #:+bpf-map-type-percpu-hash+ #:+bpf-map-type-percpu-array+
    #:+bpf-map-type-ringbuf+ #:+bpf-map-type-stack-trace+
+   #:+bpf-map-type-sockmap+ #:+bpf-map-type-sockhash+
    ;; Map flags
    #:+bpf-f-no-prealloc+
    ;; Helper function IDs

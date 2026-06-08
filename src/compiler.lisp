@@ -56,7 +56,13 @@
     ("SEND-SIGNAL"          . 109)
     ("OVERRIDE-RETURN"      . 58)
     ("JIFFIES64"            . 118)
-    ("PER-CPU-PTR"          . 153))
+    ("PER-CPU-PTR"          . 153)
+    ;; sk_lookup helpers — used by BPF_PROG_TYPE_SK_LOOKUP programs to
+    ;; redirect connection establishment to a chosen socket.
+    ("SK-LOOKUP-TCP"        . 84)
+    ("SK-LOOKUP-UDP"        . 85)
+    ("SK-RELEASE"           . 86)
+    ("SK-ASSIGN"            . 124))
   "BPF helper functions: string name → helper ID.
    Single source of truth — referenced by the SSA pipeline via lower.lisp.")
 
@@ -78,7 +84,10 @@
     ("RINGBUF-OUTPUT" . 4)
     ("GET-SOCKET-COOKIE" . 1) ("GET-CURRENT-TASK-BTF" . 0)
     ("KTIME-GET-COARSE-NS" . 0) ("KTIME-GET-BOOT-NS" . 0) ("KTIME-GET-TAI-NS" . 0)
-    ("GET-STACKID" . 3))
+    ("GET-STACKID" . 3)
+    ;; sk_lookup helpers
+    ("SK-LOOKUP-TCP" . 5) ("SK-LOOKUP-UDP" . 5)
+    ("SK-RELEASE" . 1) ("SK-ASSIGN" . 3))
   "Expected argument counts for BPF helpers that users call directly.
    BPF allows max 5 args (R1-R5). Helpers not listed here are not checked.")
 
@@ -98,7 +107,10 @@
     ("TC_ACT_OK"       . 0)
     ("TC_ACT_SHOT"     . 2)
     ("TC_ACT_STOLEN"   . 4)
-    ("TC_ACT_REDIRECT" . 7))
+    ("TC_ACT_REDIRECT" . 7)
+    ;; sk_lookup return codes
+    ("SK_DROP" . 0)
+    ("SK_PASS" . 1))
   "BPF constants: string name → integer value.")
 
 ;;; Map type name resolution
@@ -113,7 +125,9 @@
     (:lpm-trie      +bpf-map-type-lpm-trie+)
     (:percpu-array  +bpf-map-type-percpu-array+)
     (:stack-trace   +bpf-map-type-stack-trace+)
-    (:ringbuf       +bpf-map-type-ringbuf+)))
+    (:ringbuf       +bpf-map-type-ringbuf+)
+    (:sockmap       +bpf-map-type-sockmap+)
+    (:sockhash      +bpf-map-type-sockhash+)))
 
 ;;; Data structures
 
@@ -170,7 +184,8 @@
     (:cgroup-skb        . "__sk_buff")
     (:cgroup-sock-addr  . "bpf_sock_addr")
     (:cgroup-sock       . "bpf_sock_ops")
-    (:tc                . "__sk_buff")))
+    (:tc                . "__sk_buff")
+    (:sk-lookup         . "bpf_sk_lookup")))
 
 (defparameter *ctx-struct-fields*
   '(("xdp_md" .
@@ -230,7 +245,22 @@
       (local-ip6     (:array u32 4) 116)
       (remote-port   u32 132)
       (local-port    u32 136)
-      (data-meta     u32 140)))))
+      (data-meta     u32 140)))
+    ;; sk_lookup context — fields verified against this kernel's BTF
+    ;; (struct bpf_sk_lookup, size 72). remote-port is __be16 but the
+    ;; surrounding 4-byte slot is what the verifier permits the program
+    ;; to load; we expose it as u16 for the in-network-byte-order value.
+    ("bpf_sk_lookup" .
+     ((sk             :ptr 0)
+      (family         u32  8)
+      (protocol       u32  12)
+      (remote-ip4     u32  16)
+      (remote-ip6     (:array u32 4) 20)
+      (remote-port    u16  36)
+      (local-ip4      u32  40)
+      (local-ip6      (:array u32 4) 44)
+      (local-port     u32  60)
+      (ingress-ifindex u32 64)))))
 
 (defun ctx-resolve-field (prog-type field-name &optional index)
   "Resolve a context field name to (values type offset struct-name c-field-name)

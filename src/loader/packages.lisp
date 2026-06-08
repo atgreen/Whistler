@@ -24,7 +24,8 @@
    #:map-info-fd #:map-info-name
    ;; Attachment
    #:attach-kprobe #:attach-uprobe #:attach-tracepoint #:attach-xdp #:attach-tc
-   #:attach-cgroup #:attach-lsm #:attach-fentry #:attach-kprobe-multi #:detach
+   #:attach-cgroup #:attach-lsm #:attach-fentry #:attach-kprobe-multi
+   #:attach-sk-lookup #:detach
    #:attach-obj-kprobe #:attach-obj-uprobe #:attach-obj-cgroup
    #:attach-obj-xdp #:attach-obj-tc
    ;; Cgroup constants

@@ -97,6 +97,11 @@
 (defconstant +bpf-map-type-lpm-trie+      11)
 (defconstant +bpf-map-type-stack-trace+   7)
 (defconstant +bpf-map-type-ringbuf+       27)
+;; sockmap/sockhash hold struct sock * values keyed by an integer
+;; (sockmap) or arbitrary bytes (sockhash). Used by sk_lookup /
+;; sk_skb / sockops to redirect to a stashed socket.
+(defconstant +bpf-map-type-sockmap+       15)
+(defconstant +bpf-map-type-sockhash+      18)
 
 ;; Map flags
 (defconstant +bpf-f-no-prealloc+ 1)

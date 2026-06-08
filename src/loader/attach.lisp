@@ -498,6 +498,36 @@
                                   (handler-case (sb-posix:close link-fd)
                                     (error () nil)))))))
 
+;;; ========== sk_lookup attachment ==========
+
+(defun attach-sk-lookup (prog-fd &key (netns-path "/proc/self/ns/net"))
+  "Attach an SK_LOOKUP program to a network namespace via BPF_LINK_CREATE.
+
+   NETNS-PATH names the netns whose listener-lookup path the program
+   intercepts; defaults to the caller's current namespace. The program
+   must have been loaded with expected_attach_type=BPF_SK_LOOKUP — the
+   loader does this automatically when the ELF section is sk_lookup or
+   sk_lookup/<name>.
+
+   Returns an attachment whose detach closes the link and netns fds."
+  (let ((netns-fd (sb-posix:open netns-path sb-posix:o-rdonly 0)))
+    (when (< netns-fd 0)
+      (error 'bpf-error :context (format nil "open netns ~a" netns-path)
+                         :errno (sb-alien:get-errno)))
+    (handler-bind ((error (lambda (c)
+                            (declare (ignore c))
+                            (sb-posix:close netns-fd))))
+      (let ((buf (make-attr-buf 168)))
+        (put-u32 buf 0 prog-fd)
+        (put-u32 buf 4 netns-fd)
+        (put-u32 buf 8 +bpf-sk-lookup+)
+        (let ((link-fd (%bpf +bpf-link-create+ buf 168 "sk-lookup-link-create")))
+          (make-attachment
+           :type :sk-lookup :perf-fds nil :prog-fd prog-fd
+           :cleanup (lambda ()
+                      (handler-case (sb-posix:close link-fd) (error () nil))
+                      (handler-case (sb-posix:close netns-fd) (error () nil)))))))))
+
 ;;; ========== XDP attachment ==========
 
 (defun attach-xdp (prog-fd interface-name &key (mode "xdp"))

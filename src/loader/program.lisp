@@ -119,6 +119,12 @@
                 (string= rest "bind4")
                 (string= rest "bind6"))))
      +bpf-prog-type-cgroup-sock-addr+)
+    ;; sk_lookup — listener-lookup hook, prog type 30. Must be loaded
+    ;; with expected_attach_type=BPF_SK_LOOKUP and attached to a netns.
+    ((or (string= section-name "sk_lookup")
+         (and (>= (length section-name) 10)
+              (string= (subseq section-name 0 10) "sk_lookup/")))
+     +bpf-prog-type-sk-lookup+)
     (t +bpf-prog-type-socket-filter+)))
 
 (defun section-to-expected-attach-type (section-name)
@@ -151,6 +157,12 @@
          (and (>= (length section-name) 16)
               (string= (subseq section-name 0 16) "kretprobe.multi/")))
      +bpf-trace-kprobe-multi+)
+    ;; sk_lookup load REJECTS without expected_attach_type=BPF_SK_LOOKUP —
+    ;; the kernel verifies prog_type + EAT pair before reading the program.
+    ((or (string= section-name "sk_lookup")
+         (and (>= (length section-name) 10)
+              (string= (subseq section-name 0 10) "sk_lookup/")))
+     +bpf-sk-lookup+)
     (t nil)))
 
 ;;; ========== Program loading ==========

@@ -51,6 +51,8 @@
 (defconstant +bpf-map-type-lru-hash+ 9)
 (defconstant +bpf-map-type-stack-trace+ 7)
 (defconstant +bpf-map-type-ringbuf+ 27)
+(defconstant +bpf-map-type-sockmap+ 15)
+(defconstant +bpf-map-type-sockhash+ 18)
 
 ;;; ========== BPF program types ==========
 
@@ -75,6 +77,11 @@
 (defconstant +bpf-prog-type-lsm+ 29)
 (defconstant +bpf-prog-type-syscall+ 31)
 (defconstant +bpf-prog-type-raw-tracepoint+ 17)
+;; sk_lookup: program runs in TCP/UDP listener lookup path. Must be
+;; loaded with expected_attach_type = +bpf-sk-lookup+ (36) and attached
+;; via BPF_LINK_CREATE against a network-namespace fd.
+(defconstant +bpf-prog-type-sk-lookup+ 30)
+(defconstant +bpf-sk-lookup+ 36)
 (defconstant +bpf-f-sleepable+ #x10)
 
 ;;; ========== BPF commands (attach/detach) ==========
