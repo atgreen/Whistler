@@ -2,7 +2,7 @@
 
 All notable user-facing changes per release. Newest first.
 
-## Unreleased
+## 1.11.0 — 2026-08-14
 
 ### New Features
 
@@ -26,6 +26,64 @@ authoritative for per-path completeness and the per-program-type kfunc
 allowlist. Available from both the Whistler surface language and the
 bpftrace frontend (call by kernel symbol name). See
 `examples/kfunc-task.lisp` and `examples/bpftrace/kfunc-rcu.bt`.
+
+#### sk_lookup program support — compile, load, and attach
+
+Whistler can now express `BPF_PROG_TYPE_SK_LOOKUP`, the programmable
+listener-lookup hook (Linux 5.9+) that lets a single socket answer for
+any port within a network namespace. The compiler gained the sk_lookup
+program type and its `bpf_sk_lookup` context struct, the
+`bpf_sk_assign` / `bpf_sk_lookup_tcp` / `bpf_sk_lookup_udp` /
+`bpf_sk_release` helpers, and the sockmap and sockhash map types a
+catch-all redirector needs. The loader routes the section name to the
+program type and its required `expected_attach_type`, and
+`attach-sk-lookup` creates a BPF link against a network-namespace fd —
+the loader's first netns-targeted `BPF_LINK_CREATE`. See
+`examples/sk-lookup-catchall.lisp` for the canonical look-up / assign /
+release pattern. Verified end to end on Linux 7.0 through the pure-Lisp
+loader.
+
+#### bpftrace frontend: broad surface expansion
+
+The bpftrace frontend gained a large batch of language and stdlib
+coverage, closing much of the gap with upstream bpftrace:
+
+- **Tuples**: tuple-typed map values and variables, `$t.N` component
+  access, nested tuples, tuple slots as map keys/values, and
+  bool/`ntop`/`strftime`-typed elements that render correctly.
+- **Arrays**: multi-dimensional subscripts (`$a.x[i][j]`,
+  `args.FIELD[i]`), whole-array round-trips through `$vars`, array
+  compare (`==` / `!=`), and rendering `int[N]` arrays as map keys,
+  values, and tuple slots — with runtime out-of-bounds warnings.
+- **Map iteration**: `for $kv : @m { … }` iterates map keys via sidecar
+  arrays; `len(@m)` via a sidecar counter.
+- **Stdlib builtins**: `str`/`buf`/`strncmp`/`strcontains`/`strstr`/
+  `find`, `pton`/`ntop`/`macaddr`/`path`, `kptr`/`uptr`/`percpu_kaddr`,
+  `signal`/`override`/`cgroupid`/`socket_cookie`, `jiffies`/`nsecs`/
+  `strftime`, `is_str`/`is_ptr`/`is_integer`/`is_array`/`is_literal`,
+  `assert`/`static_assert`, `syscall_name`/`signal_name`, and more.
+- **Probes**: `self:signal:NAME` userspace-handler probes, kprobe
+  `MODULE:` prefix and `+OFFSET` suffix, and stricter rejection of
+  probe shapes that aren't actually supported.
+- **Output**: `-f json` output mode, `-q`, per-key `@m[k] = hist(x)` /
+  `lhist(x, …)`, `print(@m, top, div)`, config blocks
+  (`print_maps_on_exit`), and CLI/`-l` listing fixes.
+- **Control flow**: `while` loops with `break`/`continue`, `unroll(N)`,
+  compound-assignment operators beyond `+=`/`-=`, and pre/post
+  increment/decrement as expressions.
+
+### Bug Fixes
+
+- **percpu_kaddr** now emits an `ld_imm64` with `PSEUDO_BTF_ID`, so the
+  resulting `percpu_ptr` is accepted by the verifier.
+- **phi-branch-threading** repairs downstream PHI nodes on redirected
+  edges, fixing miscompiles from an SSA optimization pass.
+- **map-update** copies key and value into `r2`/`r3` in parallel,
+  avoiding a clobber when the two sources alias.
+- Immediate-to-stack stores now use `ST_MEM` directly instead of
+  borrowing `R1` as scratch.
+- for-loops extend back-edge liveness and correctly restore the
+  environment for shadowed variables.
 
 ## 1.10.0 — 2026-05-28
 
