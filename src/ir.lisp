@@ -87,7 +87,7 @@
 (defun ir-insn-side-effect-p (insn)
   "Does this instruction have side effects?"
   (member (ir-insn-op insn)
-          '(:call :tail-call :get-stackid :store :ctx-store :stack-store :atomic-add
+          '(:call :kfunc-call :tail-call :get-stackid :store :ctx-store :stack-store :atomic-add
             :map-update :map-update-ptr :map-delete :map-delete-ptr
             :struct-alloc :br :br-cond :ret
             :ringbuf-reserve :ringbuf-submit :ringbuf-discard
@@ -108,7 +108,7 @@
 
 (defun call-like-op-p (op)
   "Is OP a call-like operation that clobbers caller-saved registers?"
-  (member op '(:call :tail-call :get-stackid :map-lookup
+  (member op '(:call :kfunc-call :tail-call :get-stackid :map-lookup
                :map-update :map-update-ptr
                :map-delete :map-delete-ptr
                :map-lookup-ptr
@@ -151,6 +151,11 @@
            (otherwise
             '(:clobbers-caller-saved :invalidates-packet-ptrs
               :invalidates-map-value-ptrs)))))
+      ;; kfunc call: clobbers caller-saved like any call. The phase-1
+      ;; kfunc set (rcu lock/unlock, task/cgroup acquire/release) does
+      ;; not touch packet or map-value pointers, so no extra invalidation.
+      ((eq op :kfunc-call)
+       '(:clobbers-caller-saved))
       ;; Map-* IR ops: these lower to helper calls that clobber regs
       ;; and invalidate prior map value pointers
       ((member op '(:map-lookup

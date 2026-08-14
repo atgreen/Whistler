@@ -2297,8 +2297,17 @@
   "Per-generate() alist mapping `whistler symbol' → integer id for
    the map-id field on print-map / clear-map records.")
 
+(defun bpftrace-name->kfunc-symbol (name)
+  "If NAME (a bpftrace function name, e.g. \"bpf_task_from_pid\") is a known
+   kfunc's kernel symbol, return the Whistler kfunc symbol to call; else NIL."
+  (let ((entry (find name whistler/compiler:*builtin-kfuncs*
+                     :key (lambda (e) (getf (cdr e) :kernel))
+                     :test #'string=)))
+    (when entry (intern (car entry) '#:whistler))))
+
 (defun lower-call (expr)
-  (let ((name (getf (cdr expr) :name)))
+  (let* ((name (getf (cdr expr) :name))
+         (kfunc-sym (bpftrace-name->kfunc-symbol name)))
     (cond
       ((string= name "count") (unsupported "count() must be on the RHS of @map = …"))
       ((string= name "hist")  (unsupported "hist() must be on the RHS of @map = …"))
@@ -2580,6 +2589,10 @@
       ;; formal parameters with the actual argument expressions.
       ((find-user-function name)
        (inline-user-call name (getf (cdr expr) :args)))
+      ;; kfunc call — the name is a known kfunc's kernel symbol. Lower to a
+      ;; Whistler kfunc call; acquire/release/ret-null checks apply there.
+      (kfunc-sym
+       `(,kfunc-sym ,@(mapcar #'lower-expr (getf (cdr expr) :args))))
       (t (unsupported "function ~A" name)))))
 
 (defun inline-user-call (name args)

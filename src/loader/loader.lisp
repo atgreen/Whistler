@@ -9,6 +9,31 @@
 (defstruct bpf-object
   pathname elf maps progs attachments)
 
+;;; ========== Kfunc relocation patching ==========
+
+(defun patch-kfunc-relocations (insns rel-entries symtab)
+  "Patch kfunc call instructions (R_BPF_64_32 relocations) with the kfunc's
+   kernel BTF id. Each reloc's symbol names a kfunc; its id is resolved in
+   /sys/kernel/btf/vmlinux and written into the call insn's 32-bit imm
+   (bytes offset+4..offset+7). The insn's src_reg (BPF_PSEUDO_KFUNC_CALL)
+   and off (0 = vmlinux) are already baked in by the compiler.
+   Returns a new byte vector with patched instructions."
+  (let ((patched (copy-seq insns))
+        (cache (make-hash-table :test 'equal)))
+    (dolist (rel rel-entries)
+      (let* ((offset (elf-rel-offset rel))
+             (sym-idx (elf-rel-sym-idx rel))
+             (sym (nth sym-idx symtab))
+             (kfunc-name (elf-sym-name sym))
+             (btf-id (or (gethash kfunc-name cache)
+                         (setf (gethash kfunc-name cache)
+                               (resolve-btf-func-id kfunc-name)))))
+        (setf (aref patched (+ offset 4)) (logand btf-id #xff))
+        (setf (aref patched (+ offset 5)) (logand (ash btf-id -8) #xff))
+        (setf (aref patched (+ offset 6)) (logand (ash btf-id -16) #xff))
+        (setf (aref patched (+ offset 7)) (logand (ash btf-id -24) #xff))))
+    patched))
+
 ;;; ========== Top-level API ==========
 
 (defun open-bpf-object (pathname)
@@ -52,9 +77,17 @@
                (prog-name (if func-sym (elf-sym-name func-sym) sec-name))
                (prog-type (section-to-prog-type sec-name)))
 
-          ;; Patch map FD relocations
+          ;; Patch relocations, split by type: map fd (R_BPF_64_64) and
+          ;; kfunc call (R_BPF_64_32) may both appear in one .rel section.
           (when rels
-            (setf insns (patch-map-relocations insns rels symtab map-fds)))
+            (let ((map-rels (remove-if-not
+                             (lambda (r) (= (elf-rel-type r) +r-bpf-64-64+)) rels))
+                  (kfunc-rels (remove-if-not
+                               (lambda (r) (= (elf-rel-type r) +r-bpf-64-32+)) rels)))
+              (when map-rels
+                (setf insns (patch-map-relocations insns map-rels symtab map-fds)))
+              (when kfunc-rels
+                (setf insns (patch-kfunc-relocations insns kfunc-rels symtab)))))
 
           ;; Load program
           (let* ((eat (section-to-expected-attach-type sec-name))

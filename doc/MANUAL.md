@@ -570,6 +570,50 @@ Arguments are loaded into R1–R5 (max 5). The return value is in R0.
 | `get-current-task-btf` | 159 | Current task_struct (BTF pointer) |
 | `ktime-get-coarse-ns` | 161 | Coarse monotonic clock (faster, less precise) |
 
+### kfunc calls
+
+```lisp
+(bpf-rcu-read-lock)
+(let ((task (bpf-task-from-pid pid)))
+  (when task
+    (bpf-task-release task)))
+```
+
+kfuncs are kernel functions the program *calls* — the extensible
+replacement for the frozen helper set. Unlike helpers they have no stable
+IDs; they are resolved by BTF at load time (no libbpf). A kfunc call
+compiles to a `BPF_PSEUDO_KFUNC_CALL`, the ELF carries an `R_BPF_64_32`
+relocation against an extern BTF `FUNC`, and the loader patches in the
+kfunc's vmlinux BTF id. Call one by name in function position; the Lisp
+name maps to the kernel symbol by turning hyphens into underscores
+(`bpf-task-from-pid` → `bpf_task_from_pid`).
+
+Six kfuncs ship predeclared: `bpf-rcu-read-lock`, `bpf-rcu-read-unlock`,
+`bpf-task-from-pid`, `bpf-task-release`, `bpf-cgroup-from-id`,
+`bpf-cgroup-release`. Declare others with `defkfunc`:
+
+```lisp
+(defkfunc bpf-task-from-pid ((pid s32)) (ptr task_struct) :acquire :ret-null)
+(defkfunc bpf-task-release  ((task (ptr task_struct))) void :release)
+```
+
+Parameters are `(var type)` pairs; types are `u8`..`u64`, `s32`/`s64`,
+`void`, or `(ptr STRUCT)`. Flags drive compile-time checks:
+
+- `:acquire` — the result is a refcounted pointer that must be released
+  via its paired `:release` kfunc; leaking it is a compile error.
+- `:release` — consumes an acquired reference.
+- `:ret-null` — the result may be NULL and must be null-checked before
+  use; passing a bare maybe-null result to another kfunc is a compile
+  error.
+- `:trusted`, `:sleepable` — recorded, but enforced by the verifier.
+
+The verifier is authoritative for per-path release completeness and for
+the per-program-type kfunc allowlist (e.g. `bpf_task_from_pid` is
+tracing/syscall-only, not kprobe/xdp; `bpf_rcu_read_lock`/`unlock` work
+under most types). The same kfuncs are callable from the bpftrace
+frontend by their kernel symbol name.
+
 ### Bounded loops
 
 ```lisp

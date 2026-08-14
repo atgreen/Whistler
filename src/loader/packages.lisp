@@ -15,6 +15,7 @@
    #:with-bpf-object #:open-bpf-object #:load-bpf-object #:close-bpf-object
    ;; Accessors
    #:bpf-object-map #:bpf-object-prog #:prog-info-fd #:prog-info-name
+   #:prog-test-run
    ;; Map operations
    #:map-lookup #:map-lookup-int #:map-update #:map-update-int
    #:map-lookup-struct #:map-lookup-struct-int
