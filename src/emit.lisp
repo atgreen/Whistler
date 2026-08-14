@@ -20,6 +20,7 @@
   (next-callee 7)      ; next callee-saved register (7-9, R6 reserved for ctx)
   (stack-offset 0)     ; current stack usage
   (map-relocs '())     ; (byte-offset map-index) pairs
+  (kfunc-relocs '())   ; (kfunc-name) in call-insn order; rebuilt to (byte-offset kfunc-name)
   (ir-prog nil)        ; the IR program
   (fixups '())         ; (bpf-insn-idx target-label) pairs for jump patching
   (key-cache (make-hash-table :test 'equal)) ; canonical key → stack-offset
@@ -457,6 +458,21 @@
               do (let ((map-idx (second (pop old-relocs))))
                    (push (list (* idx 8) map-idx) new-relocs)))
 
+        ;; Rebuild kfunc relocations after peephole. Scan for BPF_CALL
+        ;; insns with src=BPF_PSEUDO_KFUNC_CALL and pair with the recorded
+        ;; names (same order of appearance as emission).
+        (let ((new-kfunc-relocs '())
+              (old-kfunc-relocs (nreverse (emit-ctx-kfunc-relocs ctx))))
+          (loop for insn in bpf-insns
+                for idx from 0
+                when (and (= (whistler/bpf:bpf-insn-code insn)
+                             (logior whistler/bpf:+bpf-jmp+ whistler/bpf:+bpf-call+))
+                          (= (whistler/bpf:bpf-insn-src insn)
+                             whistler/bpf:+bpf-pseudo-kfunc-call+))
+                do (let ((name (pop old-kfunc-relocs)))
+                     (push (list (* idx 8) name) new-kfunc-relocs)))
+          (setf new-kfunc-relocs (nreverse new-kfunc-relocs))
+
         ;; Rebuild CO-RE relocations after peephole.
         ;; Scan for eq-identical BPF insn objects recorded during emission.
         (let ((core-reloc-map (make-hash-table :test 'eq))
@@ -480,7 +496,8 @@
             (setf (whistler/compiler:cu-maps cu) (ir-program-maps prog))
             (setf (whistler/compiler:cu-map-relocs cu) (nreverse new-relocs))
             (setf (whistler/compiler:cu-core-relocs cu) (nreverse final-core-relocs))
-            cu)))))))
+            (setf (whistler/compiler:cu-kfunc-relocs cu) new-kfunc-relocs)
+            cu))))))))
 
 (defun find-ctx-vreg (prog)
   "Find the vreg assigned to %%CTX (the arg0 instruction)."
@@ -526,6 +543,7 @@
      ((eq op :store)     (emit-store-insn ctx args))
      ((eq op :atomic-add)(emit-atomic-add-insn ctx args))
      ((eq op :call)      (emit-call-insn ctx dst args))
+     ((eq op :kfunc-call)(emit-kfunc-call-insn ctx dst args))
      ((eq op :tail-call) (emit-tail-call-insn ctx dst args))
      ((eq op :get-stackid) (emit-get-stackid-insn ctx dst args))
      ((eq op :map-lookup)(emit-map-lookup-insn ctx dst args))
@@ -1438,6 +1456,34 @@
                                           (cons reg (list :stack (cadr loc)))))))))))
       (resolve-parallel-moves ctx moves))
     (ectx-emit ctx (whistler/bpf:emit-call func-id))
+    (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
+
+(defun kfunc-arg-name (arg)
+  "Extract kfunc kernel-symbol name from a (:kfunc \"name\") arg."
+  (and (consp arg) (eq (first arg) :kfunc) (second arg)))
+
+(defun emit-kfunc-call-insn (ctx dst args)
+  "Emit a kfunc call. (first args) is (:kfunc NAME); the rest are vreg
+   arguments loaded into R1-R5 exactly like a helper call. The call insn
+   is emitted with imm=0 and src=BPF_PSEUDO_KFUNC_CALL; the NAME is
+   recorded so the loader can patch imm with the kfunc's BTF id."
+  (let ((kfunc-name (kfunc-arg-name (first args)))
+        (call-args (rest args)))
+    (let ((moves (loop for vreg in call-args
+                       for reg from whistler/bpf:+bpf-reg-1+
+                       collect (let ((imm (vreg-imm-or-const ctx vreg)))
+                                 (if imm
+                                     (cons reg (list :imm imm))
+                                     (let ((loc (allocate-vreg ctx vreg)))
+                                       (ecase (car loc)
+                                         (:reg (cons reg (list :reg (cadr loc))))
+                                         (:stack
+                                          (cons reg (list :stack (cadr loc)))))))))))
+      (resolve-parallel-moves ctx moves))
+    ;; Record the kfunc name in call order; byte offset is resolved after
+    ;; peephole by scanning for kfunc call insns (mirrors map relocs).
+    (push kfunc-name (emit-ctx-kfunc-relocs ctx))
+    (ectx-emit ctx (whistler/bpf:emit-kfunc-call))
     (when dst (store-to-vreg ctx dst whistler/bpf:+bpf-reg-0+))))
 
 ;;; ========== Log2 emission ==========

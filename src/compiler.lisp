@@ -91,6 +91,62 @@
   "Expected argument counts for BPF helpers that users call directly.
    BPF allows max 5 args (R1-R5). Helpers not listed here are not checked.")
 
+;;; Known kfuncs
+;;;
+;;; kfuncs are kernel functions the BPF program *calls*, resolved by BTF
+;;; at load time (unlike helpers, which have stable integer IDs). Each
+;;; entry maps a kebab Lisp name (its SYMBOL-NAME, upcased) to a plist:
+;;;   :kernel   the exact kernel symbol string for BTF resolution
+;;;   :args     ordered list of argument type-specs
+;;;   :ret      return type-spec
+;;;   :flags    list of behaviour keywords
+;;; Type-specs: u8 u16 u32 u64 (unsigned ints), s32 s64 (signed ints),
+;;;   void (no value), or (:ptr "kernel_struct") for a kernel pointer.
+;;; Flag keywords: :acquire (result is a refcounted pointer that must be
+;;;   released), :release (consumes a refcounted pointer), :ret-null
+;;;   (result may be NULL and must be null-checked before use), :trusted
+;;;   (args must be trusted pointers — verifier-enforced), :sleepable.
+;;; Single source of truth — the defkfunc surface macro extends this table,
+;;; and both the BTF emitter and the loader consume it.
+(defparameter *builtin-kfuncs*
+  '(("BPF-RCU-READ-LOCK"
+     :kernel "bpf_rcu_read_lock"   :args ()          :ret void :flags ())
+    ("BPF-RCU-READ-UNLOCK"
+     :kernel "bpf_rcu_read_unlock" :args ()          :ret void :flags ())
+    ("BPF-TASK-FROM-PID"
+     :kernel "bpf_task_from_pid"   :args (s32)        :ret (:ptr "task_struct")
+     :flags (:acquire :ret-null))
+    ("BPF-TASK-RELEASE"
+     :kernel "bpf_task_release"    :args ((:ptr "task_struct")) :ret void
+     :flags (:release))
+    ("BPF-CGROUP-FROM-ID"
+     :kernel "bpf_cgroup_from_id"  :args (u64)        :ret (:ptr "cgroup")
+     :flags (:acquire :ret-null))
+    ("BPF-CGROUP-RELEASE"
+     :kernel "bpf_cgroup_release"  :args ((:ptr "cgroup")) :ret void
+     :flags (:release)))
+  "Known BPF kfuncs: upcased Lisp name → signature plist. See comment above.")
+
+(defun kfunc-spec (name)
+  "Look up a kfunc signature plist by Lisp NAME (symbol or string).
+   Returns NIL if NAME is not a known kfunc."
+  (cdr (assoc (string-upcase (string name)) *builtin-kfuncs* :test #'string=)))
+
+(defun builtin-kfunc-p (sym)
+  "Return the kfunc signature plist if SYM names a known kfunc, or NIL."
+  (and (symbolp sym) (kfunc-spec sym)))
+
+(defun register-kfunc (name kernel args ret flags)
+  "Add or replace a kfunc entry in *builtin-kfuncs*. NAME is the Lisp
+   name (symbol or string); the stored key is its upcased symbol-name.
+   Used by the defkfunc surface macro."
+  (let ((key (string-upcase (string name)))
+        (plist (list :kernel kernel :args args :ret ret :flags flags)))
+    (setf *builtin-kfuncs*
+          (cons (cons key plist)
+                (remove key *builtin-kfuncs* :key #'car :test #'string=)))
+    key))
+
 ;;; Known constants
 
 (defparameter *builtin-constants*
@@ -139,6 +195,7 @@
   (maps '())            ; list of bpf-map structs
   (map-relocs '())      ; list of (insn-index map-index) for relocation
   (core-relocs '())     ; list of (byte-offset struct-name field-name) for CO-RE
+  (kfunc-relocs '())    ; list of (byte-offset kfunc-name) for kfunc call patching
   (section "xdp")       ; ELF section name
   (name nil)            ; defprog name (symbol or string) for FUNC symbol
   (license "GPL"))      ; license string
@@ -354,7 +411,8 @@
          (or (member name *whistler-builtins* :test #'string=)
              (member name *alu-op-names* :test #'string=)
              (member name *jmp-op-names* :test #'string=)
-             (builtin-helper-p sym)))))
+             (builtin-helper-p sym)
+             (builtin-kfunc-p sym)))))
 
 ;;; Macro expansion
 ;;;

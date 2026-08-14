@@ -22,6 +22,7 @@
   - [Map Operations](./language/maps.md)
   - [Ring Buffers](./language/ringbuf.md)
   - [BPF Helpers](./language/helpers.md)
+  - [kfuncs](./language/kfuncs.md)
   - [Loops](./language/loops.md)
   - [Tail Calls](./language/tail-calls.md)
   - [Inline Assembly](./language/asm.md)

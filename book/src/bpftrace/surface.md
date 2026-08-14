@@ -151,6 +151,36 @@ equivalent. Currently honored:
 [Maps and aggregations](#maps-and-aggregations) table above. All of
 these must appear on the right-hand side of `@m = …`.
 
+### kfunc calls
+
+Call a BPF kfunc by its kernel symbol name, like any function:
+
+```
+kprobe:vfs_read {
+  bpf_rcu_read_lock();
+  @reads = count();
+  bpf_rcu_read_unlock();
+}
+
+fentry:vfs_read {
+  $t = bpf_task_from_pid(pid);   // acquires a refcounted task*
+  if ($t) {                      // must null-check (may be NULL)
+    @calls = count();
+    bpf_task_release($t);        // must release before returning
+  }
+}
+```
+
+kfuncs are resolved by BTF at load time, with the same acquire/release
+and null-check guarantees as the Whistler frontend — the bpftrace
+compiler lowers a kfunc call into a Whistler kfunc call. The kernel gates
+each kfunc to specific program types: `bpf_rcu_read_lock` /
+`bpf_rcu_read_unlock` work under `kprobe`; acquire/release kfuncs such as
+`bpf_task_from_pid` / `bpf_task_release` are tracing-only, so call them
+from `fentry:` / `kfunc:` probes. See the
+[kfuncs chapter](../language/kfuncs.md) for the full model and
+`defkfunc` for declaring additional kfuncs.
+
 ## Operators
 
 C-style: `+ - * / % == != < > <= >= && || ! & | ^ << >> ~`. Compound

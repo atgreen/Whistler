@@ -25,6 +25,12 @@
 (defconstant +btf-kind-datasec+   15)
 (defconstant +btf-kind-func-proto+ 13)
 (defconstant +btf-kind-func+      12)
+(defconstant +btf-kind-fwd+        7)
+
+;; BTF_KIND_FUNC linkage (stored in the info vlen field)
+(defconstant +btf-func-static+ 0)
+(defconstant +btf-func-global+ 1)
+(defconstant +btf-func-extern+ 2)
 
 ;; BTF_INT encoding bits
 (defconstant +btf-int-signed+ (ash 1 0))
@@ -73,8 +79,8 @@
   "Encode the BTF type info word: kind in bits 24-28, vlen in bits 0-15."
   (logior (ash kind 24) (logand vlen #xffff)))
 
-(defun btf-add-int (ctx name bits)
-  "Add a BTF_KIND_INT type. Returns the type ID."
+(defun btf-add-int (ctx name bits &optional signedp)
+  "Add a BTF_KIND_INT type. SIGNEDP marks the integer signed. Returns the type ID."
   (let* ((id (btf-alloc-id ctx))
          (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
          (types (btf-ctx-types ctx)))
@@ -83,11 +89,24 @@
     (btf-emit-u32 types (btf-info-field +btf-kind-int+ 0))
     (btf-emit-u32 types (/ bits 8))  ; size in bytes
     ;; INT data: encoding(8:8), offset(8:8), bits(8:8) packed in 4 bytes
-    ;; encoding = 0 (unsigned), offset = 0, bits = actual bit width
-    (btf-emit-u32 types (logior (ash 0 24)    ; encoding: unsigned
+    (btf-emit-u32 types (logior (ash (if signedp +btf-int-signed+ 0) 24)
                                 (ash 0 16)    ; offset: 0
                                 bits))        ; nr_bits
     (setf (gethash name (btf-ctx-type-cache ctx)) id)
+    id))
+
+(defun btf-add-fwd (ctx name &optional unionp)
+  "Add a BTF_KIND_FWD (forward declaration) for a struct (or union) named
+   NAME. Used as the pointee for kfunc pointer arguments whose full struct
+   layout the object does not carry. Returns the type ID."
+  (let* ((id (btf-alloc-id ctx))
+         (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
+         (types (btf-ctx-types ctx)))
+    (btf-emit-u32 types name-off)
+    ;; kind_flag (bit 31) selects union(1)/struct(0)
+    (btf-emit-u32 types (logior (btf-info-field +btf-kind-fwd+ 0)
+                                (if unionp (ash 1 31) 0)))
+    (btf-emit-u32 types 0)  ; size_or_type unused for FWD
     id))
 
 (defun btf-resolve-field-type (ctx ftype fname)
@@ -168,17 +187,57 @@
           (btf-emit-u32 types ptype-id))))
     id))
 
-(defun btf-add-func (ctx name proto-type-id)
-  "Add a BTF_KIND_FUNC type. Returns the type ID."
+(defun btf-add-func (ctx name proto-type-id &optional (linkage +btf-func-static+))
+  "Add a BTF_KIND_FUNC type. LINKAGE is BTF_FUNC_STATIC (default),
+   BTF_FUNC_GLOBAL, or BTF_FUNC_EXTERN (kfuncs); it is stored in the info
+   vlen field. Returns the type ID."
   (let* ((id (btf-alloc-id ctx))
          (name-off (btf-strtab-add (btf-ctx-strtab ctx) name))
          (types (btf-ctx-types ctx)))
     ;; FUNC: name_off(4), info(4), type(4) — type points to FUNC_PROTO
     (btf-emit-u32 types name-off)
-    ;; vlen=0 for FUNC; BTF_FUNC_STATIC=0, BTF_FUNC_GLOBAL=1
-    (btf-emit-u32 types (btf-info-field +btf-kind-func+ 0))
+    (btf-emit-u32 types (btf-info-field +btf-kind-func+ linkage))
     (btf-emit-u32 types proto-type-id)
     id))
+
+(defun btf-resolve-kfunc-type (ctx spec)
+  "Resolve a kfunc type-spec to a BTF type ID, creating types on demand.
+   SPEC is void/:void (→ type-id 0), an int name symbol (u8..u64, s32/s64),
+   or (:ptr \"struct_name\") for a pointer to a forward-declared struct."
+  (cond
+    ;; void return / no type
+    ((or (null spec) (eq spec 'void) (eq spec :void)
+         (and (symbolp spec) (string-equal (string spec) "void")))
+     0)
+    ;; pointer to a kernel struct: PTR → FWD(name)
+    ((and (consp spec) (eq (first spec) :ptr))
+     (let* ((sname (string (second spec)))
+            (fwd-key (format nil "fwd:~a" sname))
+            (fwd-id (or (gethash fwd-key (btf-ctx-type-cache ctx))
+                        (setf (gethash fwd-key (btf-ctx-type-cache ctx))
+                              (btf-add-fwd ctx sname))))
+            (ptr-key (format nil "ptr:~a" sname)))
+       (or (gethash ptr-key (btf-ctx-type-cache ctx))
+           (setf (gethash ptr-key (btf-ctx-type-cache ctx))
+                 (btf-add-ptr ctx fwd-id)))))
+    ;; scalar integer type by name
+    (t
+     (let ((tname (string-downcase (string spec))))
+       (or (gethash tname (btf-ctx-type-cache ctx))
+           (error "Unknown kfunc BTF type-spec: ~s" spec))))))
+
+(defun btf-add-kfunc (ctx kernel-name ret-spec arg-specs)
+  "Emit a FUNC_PROTO + extern BTF_KIND_FUNC for a kfunc named KERNEL-NAME
+   (the exact kernel symbol). RET-SPEC and ARG-SPECS are kfunc type-specs.
+   Parameters are named a0, a1, ... (names are not semantically meaningful
+   for kfunc resolution). Returns the FUNC type ID."
+  (let* ((ret-id (btf-resolve-kfunc-type ctx ret-spec))
+         (params (loop for spec in arg-specs
+                       for i from 0
+                       collect (list (format nil "a~d" i)
+                                     (btf-resolve-kfunc-type ctx spec))))
+         (proto-id (btf-add-func-proto ctx ret-id params)))
+    (btf-add-func ctx kernel-name proto-id +btf-func-extern+)))
 
 (defun btf-add-ptr (ctx target-type-id)
   "Add a BTF_KIND_PTR type. Returns the type ID."
@@ -321,11 +380,13 @@
                                  struct-id 1)))  ; linkage=global
         (values var-id struct-size)))))
 
-(defun build-btf-ctx (struct-defs section-names &optional map-specs prog-names)
+(defun build-btf-ctx (struct-defs section-names &optional map-specs prog-names kfunc-sigs)
   "Build a BTF context with base types, struct defs, map defs, and function info.
    SECTION-NAMES is a string or list of strings (one per program).
    MAP-SPECS is a list of (name type key-size value-size max-entries flags).
    PROG-NAMES is a list of defprog name strings (used for BTF FUNC names).
+   KFUNC-SIGS is a list of (kernel-name ret-spec arg-specs) for referenced
+   kfuncs; each becomes an extern BTF_KIND_FUNC.
    Returns (values ctx func-type-ids) where func-type-ids is a list of FUNC type IDs."
   (let ((ctx (make-btf-ctx))
         (names (if (listp section-names) section-names (list section-names))))
@@ -378,6 +439,17 @@
                              names
                              (or prog-names
                                  (make-list (length names) :initial-element nil)))))
+      ;; 6. Add extern FUNC types for referenced kfuncs. Signed base ints
+      ;; are added on demand here (only when kfuncs are present, so objects
+      ;; without kfuncs keep byte-identical BTF).
+      (when kfunc-sigs
+        (unless (gethash "s32" (btf-ctx-type-cache ctx))
+          (btf-add-int ctx "s32" 32 t))
+        (unless (gethash "s64" (btf-ctx-type-cache ctx))
+          (btf-add-int ctx "s64" 64 t))
+        (dolist (sig kfunc-sigs)
+          (destructuring-bind (kernel-name ret-spec arg-specs) sig
+            (btf-add-kfunc ctx kernel-name ret-spec arg-specs))))
       (values ctx func-ids))))
 
 (defun generate-btf (struct-defs section-names)
@@ -558,7 +630,7 @@
           out))))))
 
 (defun generate-btf-and-ext (struct-defs section-names per-section-core-relocs
-                             &optional map-specs &key prog-names)
+                             &optional map-specs &key prog-names kfunc-sigs)
   "Generate both .BTF and .BTF.ext section bytes for one or more programs.
    STRUCT-DEFS: hash table of name -> (total-size . fields).
    SECTION-NAMES: string or list of section name strings.
@@ -572,7 +644,7 @@
                                 per-section-core-relocs
                                 (list per-section-core-relocs))))
     (multiple-value-bind (ctx func-ids)
-        (build-btf-ctx struct-defs names map-specs prog-names)
+        (build-btf-ctx struct-defs names map-specs prog-names kfunc-sigs)
       ;; Add context struct BTF types referenced by CO-RE relocations
       (let ((added (make-hash-table :test 'equal)))
         (dolist (relocs relocs-per-section)

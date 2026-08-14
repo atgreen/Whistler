@@ -511,6 +511,30 @@
     `(push (list ',name :type ,type :section ,sec :license ,license :body ',wrapped-body)
            *programs*)))
 
+(defun %kfunc-type-spec (spec)
+  "Translate a defkfunc surface type into a *builtin-kfuncs* type-spec.
+   (ptr STRUCT) → (:ptr \"struct\"); scalar/void symbols pass through."
+  (cond
+    ((and (consp spec)
+          (symbolp (car spec))
+          (string-equal (symbol-name (car spec)) "PTR"))
+     (list :ptr (substitute #\_ #\- (string-downcase (symbol-name (second spec))))))
+    (t spec)))
+
+(defmacro defkfunc (name params ret &rest flags)
+  "Declare a BPF kfunc so it can be called by NAME like a helper.
+   PARAMS is a list of (var type) pairs; RET is a type; FLAGS are keywords
+   (:acquire :release :ret-null :trusted :sleepable). Types are u8..u64,
+   s32/s64, void, or (ptr STRUCT). The kernel symbol is NAME with hyphens
+   turned to underscores (e.g. bpf-task-from-pid → bpf_task_from_pid).
+   Extends *builtin-kfuncs*; both the BTF emitter and loader pick it up."
+  (let ((kernel (substitute #\_ #\- (string-downcase (symbol-name name))))
+        (arg-specs (mapcar (lambda (p) (%kfunc-type-spec (second p))) params))
+        (ret-spec (%kfunc-type-spec ret)))
+    `(eval-when (:compile-toplevel :load-toplevel :execute)
+       (whistler/compiler:register-kfunc
+        ',name ,kernel ',arg-specs ',ret-spec ',flags))))
+
 (defun wrap-implicit-return (body)
   "If the last form in BODY is not already a (return ...), wrap it."
   (if (null body)
@@ -525,6 +549,28 @@
             body))))
 
 ;;; Compilation
+
+(defun kfunc-sigs-for-units (compiled-units)
+  "Collect the kfuncs referenced across COMPILED-UNITS and return a
+   deduplicated list of (kernel-name ret-spec arg-specs) BTF signatures.
+   The reloc names are exact kernel symbols; signatures come from
+   *builtin-kfuncs* (matched by its :kernel field)."
+  (let ((seen (make-hash-table :test 'equal))
+        (sigs '()))
+    (dolist (cu compiled-units)
+      (dolist (reloc (cu-kfunc-relocs cu))
+        (let ((kernel-name (second reloc)))
+          (unless (gethash kernel-name seen)
+            (setf (gethash kernel-name seen) t)
+            (let ((spec (find kernel-name whistler/compiler:*builtin-kfuncs*
+                              :key (lambda (e) (getf (cdr e) :kernel))
+                              :test #'string=)))
+              (when spec
+                (push (list kernel-name
+                            (getf (cdr spec) :ret)
+                            (getf (cdr spec) :args))
+                      sigs)))))))
+    (nreverse sigs)))
 
 (defun compile-to-elf (output-path &key maps programs)
   "Compile maps and programs to an ELF object file.
@@ -569,15 +615,21 @@
                               (insn-bytes (cu-insns cu))
                               (reverse (cu-map-relocs cu))
                               (cu-core-relocs cu)
-                              (cu-name cu)))
+                              (cu-name cu)
+                              (cu-kfunc-relocs cu)))
                       compiled-units))
              (section-names (mapcar #'first prog-sections))
              (prog-names (mapcar #'fifth prog-sections))
-             (all-core-relocs (mapcar #'fourth prog-sections)))
+             (all-core-relocs (mapcar #'fourth prog-sections))
+             ;; Union of kfuncs referenced across all programs → BTF sigs.
+             ;; Each reloc's kfunc name is the exact kernel symbol; resolve
+             ;; its signature from *builtin-kfuncs* (matched by :kernel).
+             (kfunc-sigs (kfunc-sigs-for-units compiled-units)))
         ;; Generate BTF and BTF.ext for all programs
         (multiple-value-bind (btf btf-ext)
             (generate-btf-and-ext *struct-defs* section-names all-core-relocs
-                                  map-specs :prog-names prog-names)
+                                  map-specs :prog-names prog-names
+                                  :kfunc-sigs kfunc-sigs)
           (write-bpf-elf output-path
                          :prog-sections prog-sections
                          :maps map-specs

@@ -376,6 +376,42 @@ int synflood(struct xdp_md *ctx) {
 </td></tr>
 </table>
 
+### Calling kfuncs
+
+kfuncs are kernel functions a BPF program *calls* — the extensible
+replacement for the frozen helper set (`bpf_task_from_pid`,
+`bpf_rcu_read_lock`, `bpf_cgroup_from_id`, …). Whistler resolves them by
+BTF at load time, with no libbpf: a call compiles to a
+`BPF_PSEUDO_KFUNC_CALL`, the object carries an `R_BPF_64_32` relocation
+against an extern BTF `FUNC`, and the loader patches in the kfunc's
+vmlinux BTF id.
+
+Call a kfunc by name like a helper. Whistler models the two obligations
+kfunc pointers carry and enforces them at compile time:
+
+```lisp
+;; bpf_task_from_pid ACQUIRES a refcounted task* that may be NULL.
+(defprog task-demo (:type :kprobe :section "test_run/task_demo")
+  (let ((task (bpf-task-from-pid 1)))   ; :ret-null → must null-check
+    (when task                          ; guard the maybe-null pointer
+      (bpf-task-release task)))         ; :acquire → must release, or
+  0)                                    ;   "acquired reference is never
+                                        ;    released" at compile time
+```
+
+Six kfuncs ship predeclared; declare your own with `defkfunc`:
+
+```lisp
+(defkfunc bpf-task-from-pid ((pid s32)) (ptr task_struct) :acquire :ret-null)
+(defkfunc bpf-task-release  ((task (ptr task_struct))) void :release)
+```
+
+The same kfuncs are callable from the bpftrace frontend by their kernel
+symbol name. The kernel gates each kfunc to specific program types (e.g.
+`bpf_task_from_pid` is tracing/syscall-only), which the verifier enforces.
+See [`examples/kfunc-task.lisp`](examples/kfunc-task.lisp) and
+[`examples/bpftrace/kfunc-rcu.bt`](examples/bpftrace/kfunc-rcu.bt).
+
 ## Userspace loader
 
 `whistler/loader` is a pure Common Lisp BPF loader — no libbpf, no CFFI.
@@ -471,6 +507,10 @@ Almost everything you'd write in a typical bpftrace script:
   (compile-time stat), `signal(N)` (send to current task),
   `override(retval)` (kprobe error injection), `jiffies()`, `is_err(p)`,
   `kptr(p)` / `uptr(p)` (identity), `cpid()` / `has_cpid()` (from `-c`).
+- **kfunc calls**: call a BPF kfunc by its kernel symbol name, e.g.
+  `bpf_rcu_read_lock()` / `bpf_rcu_read_unlock()`, `bpf_task_from_pid(pid)`
+  / `bpf_task_release($t)` — resolved by BTF at load time, with the same
+  acquire/release + null-check checks as the Whistler frontend.
 - **Compile-time type predicates**: `is_str`, `is_ptr`, `is_array`,
   `is_integer`, `is_unsigned_integer`, `is_literal` — fold to 0/1 for
   `if comptime (is_str($x)) { … }` macro dispatch.

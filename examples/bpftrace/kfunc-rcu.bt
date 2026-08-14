@@ -1,0 +1,36 @@
+// kfunc-rcu.bt — calling BPF kfuncs from a bpftrace script.
+//
+//   sudo whistler bpftrace examples/bpftrace/kfunc-rcu.bt
+//
+// kfuncs are kernel functions a BPF program *calls* (the modern,
+// extensible alternative to the frozen helper set). In Whistler's
+// bpftrace frontend you call one by its kernel symbol name, and it
+// resolves via BTF at load time — no libbpf.
+//
+// This counts vfs_read() calls inside an RCU read-side critical section,
+// demonstrating the bpf_rcu_read_lock() / bpf_rcu_read_unlock() kfunc
+// pair. Press Ctrl-C to print the count.
+//
+//   Attaching kprobe:vfs_read...
+//   ^C
+//   @reads: 142905
+//
+// NOTE: the kernel gates each kfunc to specific program types. rcu
+// lock/unlock is allowed under kprobe (used here). Acquire/release
+// kfuncs like bpf_task_from_pid()/bpf_task_release() are TRACING-only,
+// so call those from fentry:/kfunc: probes, e.g.:
+//
+//   fentry:vfs_read {
+//     $t = bpf_task_from_pid(pid);   // acquires a refcounted task*
+//     if ($t) {                      // must null-check (may be NULL)
+//       @calls = count();
+//       bpf_task_release($t);        // must release before returning
+//     }
+//   }
+
+kprobe:vfs_read
+{
+  bpf_rcu_read_lock();
+  @reads = count();
+  bpf_rcu_read_unlock();
+}

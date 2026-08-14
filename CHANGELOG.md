@@ -2,6 +2,31 @@
 
 All notable user-facing changes per release. Newest first.
 
+## Unreleased
+
+### New Features
+
+#### kfunc support — calling BPF kernel functions (issue #44)
+
+BPF programs can now call kfuncs — the extensible kernel functions that
+have replaced the frozen helper set. Resolution is by BTF at load time,
+on Whistler's pure-CL toolchain (no libbpf): a call compiles to a
+`BPF_PSEUDO_KFUNC_CALL`, the ELF carries an `R_BPF_64_32` relocation
+against an extern BTF `FUNC`, and the loader patches in the kfunc's
+vmlinux BTF id. Both load paths handle it — the `.bpf.o` loader and the
+in-memory session/bpftrace-runtime path.
+
+Call a kfunc by name like a helper; six ship predeclared
+(`bpf-rcu-read-lock`/`unlock`, `bpf-task-from-pid`/`bpf-task-release`,
+`bpf-cgroup-from-id`/`bpf-cgroup-release`). Declare your own with
+`defkfunc`. Acquire/release and maybe-null pointers are modeled and
+checked at compile time (a leaked acquired reference or an unguarded
+`:ret-null` result is a compile error); the verifier remains
+authoritative for per-path completeness and the per-program-type kfunc
+allowlist. Available from both the Whistler surface language and the
+bpftrace frontend (call by kernel symbol name). See
+`examples/kfunc-task.lisp` and `examples/bpftrace/kfunc-rcu.bt`.
+
 ## 1.10.0 — 2026-05-28
 
 

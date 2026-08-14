@@ -13,6 +13,10 @@
 
 (defconstant +bpf-pseudo-map-fd+ 1)
 
+;; ELF BPF relocation types (r_info low 32 bits)
+(defconstant +r-bpf-64-64+ 1)    ; map fd on ld_imm64
+(defconstant +r-bpf-64-32+ 10)   ; kfunc btf-id on call imm
+
 (defun patch-map-relocations (insns rel-entries symtab map-fds)
   "Patch LD_IMM64 instructions with map FDs based on relocations.
    MAP-FDS is an alist of (symbol-name . fd).

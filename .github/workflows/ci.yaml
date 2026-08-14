@@ -45,7 +45,7 @@ jobs:
             name=$(basename "$f" .lisp)
             # Skip examples that drive the loader / need kernel access
             case "$name" in
-              ffi-call-tracker|fork-tracker|cgroup-skb-count|cgroup-skb-session) continue ;;
+              ffi-call-tracker|fork-tracker|cgroup-skb-count|cgroup-skb-session|kfunc-task) continue ;;
             esac
             sbcl --noinform --non-interactive \
               --eval '(require :asdf)' \

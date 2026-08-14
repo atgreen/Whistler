@@ -19,7 +19,8 @@
   (env '())           ; ((name type vreg) ...) variable bindings
   (maps '())          ; ((name . bpf-map) ...) map definitions
   (next-id 0)         ; instruction sequence counter
-  (prog-type nil))    ; program type keyword (e.g., :xdp, :cgroup-sock-addr)
+  (prog-type nil)     ; program type keyword (e.g., :xdp, :cgroup-sock-addr)
+  (pending-acquires '())) ; ((kfunc-name . vreg) ...) acquired refs not yet released
 
 (defun ctx-emit (ctx op dst args &optional type)
   "Emit an IR instruction into the current block."
@@ -114,6 +115,10 @@
   "Return the helper ID if SYM names a known BPF helper, or NIL."
   (whistler/compiler:builtin-helper-p sym))
 
+(defun ir-builtin-kfunc-p (sym)
+  "Return the kfunc signature plist if SYM names a known kfunc, or NIL."
+  (whistler/compiler:builtin-kfunc-p sym))
+
 ;;; ========== Main lowering entry point ==========
 
 (defun lower-program (section license maps body &key prog-type)
@@ -149,6 +154,20 @@
         (let ((zero (ctx-fresh-vreg ctx)))
           (ctx-emit ctx :mov zero (list '(:imm 0)) 'u64)
           (ctx-emit ctx :ret nil (list zero)))))
+
+    ;; Leak check: every acquired kfunc reference must be released. This is a
+    ;; lexical must-release-somewhere check — it catches the common leak
+    ;; (acquire, never release). The BPF verifier remains authoritative for
+    ;; per-path completeness (e.g. released on one branch but not another).
+    (when (lower-ctx-pending-acquires ctx)
+      (let ((leaked (remove-duplicates (mapcar #'car (lower-ctx-pending-acquires ctx))
+                                       :test #'equal)))
+        (whistler/compiler:whistler-error
+         :what (format nil "acquired reference from ~{~a~^, ~} is never released"
+                       leaked)
+         :where section
+         :expected "each acquired kfunc pointer released via its paired release kfunc"
+         :hint "call the matching release kfunc (e.g. bpf-task-release, bpf-cgroup-release) before the program returns")))
 
     prog))
 
@@ -430,6 +449,12 @@
              (dst (ctx-fresh-vreg ctx)))
          (ctx-emit ctx :bswap64 dst (list v) 'u64)
          dst))
+
+      ;; (kfunc-name arg1 arg2 ...) — BPF kfunc call in function position.
+      ;; Checked before helpers: the two tables are disjoint, but kfuncs
+      ;; carry acquire/release/ret-null semantics helpers don't.
+      ((ir-builtin-kfunc-p head)
+       (lower-kfunc-call ctx head args))
 
       ;; (helper-name arg1 arg2 ...) — BPF helper call in function position
       ((ir-builtin-helper-p head)
@@ -1271,6 +1296,56 @@
       (check-narrow-pointer-args ctx helper-name args arg-vregs)
       (ctx-emit ctx :call dst (cons `(:helper ,func-id) arg-vregs) 'u64)
       dst)))
+
+;;; ========== Kfunc calls ==========
+
+(defun kfunc-ret-null-form-p (form)
+  "Is FORM a bare call to a :ret-null kfunc? Used to reject direct use of
+   a maybe-null kfunc result where a non-null pointer is required."
+  (and (consp form)
+       (let ((spec (whistler/compiler:builtin-kfunc-p (car form))))
+         (and spec (member :ret-null (getf spec :flags))))))
+
+(defun lower-kfunc-call (ctx kfunc-name args)
+  "Lower a kfunc call. Emits :kfunc-call carrying the kernel symbol name;
+   tracks acquire/release for the leak check and rejects direct use of a
+   maybe-null (:ret-null) result as a kfunc argument."
+  (let ((spec (whistler/compiler:kfunc-spec kfunc-name)))
+    (let* ((kernel (getf spec :kernel))
+           (arg-specs (getf spec :args))
+           (flags (getf spec :flags)))
+      ;; Argument-count check
+      (unless (= (length args) (length arg-specs))
+        (whistler/compiler:whistler-error
+         :what (format nil "~a expects ~d argument~:p, got ~d"
+                       kfunc-name (length arg-specs) (length args))
+         :where (format nil "(~a~{ ~s~})" kfunc-name args)
+         :expected (format nil "(~a~{ ~a~})" kfunc-name arg-specs)))
+      ;; Reject a bare maybe-null kfunc result passed straight into another
+      ;; kfunc (e.g. (bpf-task-release (bpf-task-from-pid pid))). The verifier
+      ;; rejects it too; catching it here gives a clearer message.
+      (dolist (a args)
+        (when (kfunc-ret-null-form-p a)
+          (whistler/compiler:whistler-error
+           :what (format nil "maybe-null result of ~a used directly as an argument to ~a"
+                         (car a) kfunc-name)
+           :where (format nil "(~a ~s ...)" kfunc-name a)
+           :expected "a null-checked pointer (the BPF verifier requires it)"
+           :hint (format nil "bind and guard it: (let ((p ~s)) (when p (~a ...p...)))"
+                         a kfunc-name))))
+      (let ((arg-vregs (mapcar (lambda (a) (lower-expr ctx a)) args)))
+        ;; A :release consumes an acquired reference — clear it from the
+        ;; pending set so it is not reported as leaked.
+        (when (member :release flags)
+          (dolist (v arg-vregs)
+            (setf (lower-ctx-pending-acquires ctx)
+                  (remove v (lower-ctx-pending-acquires ctx) :key #'cdr))))
+        (let ((dst (ctx-fresh-vreg ctx)))
+          (ctx-emit ctx :kfunc-call dst (cons `(:kfunc ,kernel) arg-vregs) 'u64)
+          ;; An :acquire produces a refcounted pointer that must be released.
+          (when (member :acquire flags)
+            (push (cons kfunc-name dst) (lower-ctx-pending-acquires ctx)))
+          dst)))))
 
 ;;; ========== Context load ==========
 

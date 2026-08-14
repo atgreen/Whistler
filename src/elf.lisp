@@ -30,7 +30,8 @@
 (defconstant +stb-local+    0)
 (defconstant +stb-global+   1)
 (defconstant +shn-undef+    0)
-(defconstant +r-bpf-64-64+  1)   ; BPF relocation type for map fd
+(defconstant +r-bpf-64-64+  1)   ; BPF relocation type for map fd (ld_imm64)
+(defconstant +r-bpf-64-32+  10)  ; BPF relocation type for call imm (kfunc)
 
 ;;; Binary writing utilities
 
@@ -153,6 +154,20 @@
 
 ;;; Main ELF writer
 
+(defun collect-kfunc-names (prog-sections)
+  "Return the ordered, deduplicated list of kfunc names referenced across
+   PROG-SECTIONS. Each entry's 6th element is its kfunc relocations
+   ((byte-offset name) ...); order follows first appearance."
+  (let ((seen (make-hash-table :test 'equal))
+        (names '()))
+    (dolist (prog-entry prog-sections)
+      (dolist (reloc (sixth prog-entry))
+        (let ((name (second reloc)))
+          (unless (gethash name seen)
+            (setf (gethash name seen) t)
+            (push name names)))))
+    (nreverse names)))
+
 (defun write-bpf-elf (pathname &key prog-sections maps license btf-data btf-ext-data)
   "Write a BPF ELF object file with one or more programs.
    PROG-SECTIONS: list of (section-name prog-bytes relocations core-relocs) per program
@@ -170,6 +185,7 @@
              (syms '())
              (sec-index 0)
              (maps-sec-idx nil)
+             (kfunc-sym-index (make-hash-table :test 'equal))  ; kfunc name → sym idx
              (prog-sec-indices '()))  ; ((section-name . sec-idx) ...)
 
         (labels ((next-sec-idx () (incf sec-index)))
@@ -307,6 +323,23 @@
                                 sec-idx 0 (length prog-bytes))
                     syms)))
 
+          ;; Kfunc extern symbols (global, undefined). One per unique kfunc
+          ;; name referenced by any program. A call relocation targets these;
+          ;; the loader resolves each name to a kernel BTF id at load time.
+          ;; kfunc syms follow map + prog-func syms, so their base index is
+          ;; map-sym-base + n-maps + n-progs. Indices are recorded in the
+          ;; outer kfunc-sym-index table for the relocation loop below.
+          (let ((kfunc-sym-base (+ map-sym-base (length maps)
+                                   (length prog-sections))))
+            (loop for name in (collect-kfunc-names prog-sections)
+                  for i from 0
+                  for name-off = (strtab-add strtab name)
+                  do (setf (gethash name kfunc-sym-index) (+ kfunc-sym-base i))
+                     (push (encode-sym name-off
+                                       (st-info +stb-global+ +stt-notype+) 0
+                                       +shn-undef+ 0 0)
+                           syms)))
+
           ;; Finalize symbol table
           (setf syms (nreverse syms))
           (let* ((num-syms (length syms))
@@ -347,20 +380,35 @@
                           sections)
 
                     ;; -- Relocation sections (one per program with relocations) --
+                    ;; Combines map fd relocations (R_BPF_64_64 on ld_imm64,
+                    ;; sym = a map symbol) and kfunc call relocations
+                    ;; (R_BPF_64_32 on the call imm, sym = an extern kfunc).
+                    ;; A program may have kfunc relocs without any maps.
                     (dolist (prog-entry prog-sections)
                       (let* ((sec-name (first prog-entry))
-                             (relocations (third prog-entry))
+                             (map-relocations (third prog-entry))
+                             (kfunc-relocations (sixth prog-entry))
                              (sec-idx (cdr (assoc sec-name prog-sec-indices
-                                                  :test #'string=))))
-                        (when (and relocations maps)
+                                                  :test #'string=)))
+                             (rel-entries
+                              (append
+                               (when maps
+                                 (loop for (insn-off map-idx) in map-relocations
+                                       collect (encode-rel insn-off
+                                                           (+ map-sym-base map-idx)
+                                                           +r-bpf-64-64+)))
+                               (loop for (insn-off name) in kfunc-relocations
+                                     collect (encode-rel
+                                              insn-off
+                                              (gethash name kfunc-sym-index)
+                                              +r-bpf-64-32+)))))
+                        (when rel-entries
                           (let* ((rel-sec-name (format nil ".rel~a" sec-name))
                                  (rel-name-off (strtab-add shstrtab rel-sec-name))
-                                 (rel-data (make-array (* 16 (length relocations))
+                                 (rel-data (make-array (* 16 (length rel-entries))
                                                        :element-type '(unsigned-byte 8))))
-                            (loop for (insn-off map-idx) in relocations
+                            (loop for entry in rel-entries
                                   for i from 0
-                                  for sym-idx = (+ map-sym-base map-idx)
-                                  for entry = (encode-rel insn-off sym-idx +r-bpf-64-64+)
                                   do (replace rel-data entry :start1 (* i 16)))
                             (next-sec-idx)
                             (push (make-elf-section

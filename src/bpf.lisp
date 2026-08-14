@@ -86,6 +86,12 @@
 ;; register as the symbol's actual type (e.g. PERCPU_PTR_<T>) instead
 ;; of a plain scalar. Required for `bpf_per_cpu_ptr' to accept R1.
 (defconstant +bpf-pseudo-btf-id+ 3)
+;; src_reg=2 on a BPF_CALL marks the immediate as a kfunc reference.
+;; The imm holds the kfunc's BTF type-id (patched in by the loader from
+;; the target BTF), and off holds a fd_array index for module kfuncs
+;; (0 = vmlinux). The verifier resolves the call against the registered
+;; kfunc set and type-checks its arguments.
+(defconstant +bpf-pseudo-kfunc-call+ 2)
 
 ;; Map types
 (defconstant +bpf-map-type-hash+          1)
@@ -187,6 +193,13 @@
 
 (defun emit-exit ()
   (list (insn (logior +bpf-jmp+ +bpf-exit+) 0 0 0 0)))
+
+(defun emit-kfunc-call (&optional (btf-id 0) (fd-array-idx 0))
+  "Emit a kfunc call. src_reg=+BPF_PSEUDO_KFUNC_CALL+ marks the imm as a
+   kfunc BTF type-id; the loader patches BTF-ID in from the target BTF.
+   FD-ARRAY-IDX (off) selects a module BTF fd (0 = vmlinux)."
+  (list (insn (logior +bpf-jmp+ +bpf-call+) 0 +bpf-pseudo-kfunc-call+
+              fd-array-idx btf-id)))
 
 ;; Byte-swap (endian conversion) instructions
 ;; BPF_ALU | BPF_END | BPF_SRC, imm = bit width

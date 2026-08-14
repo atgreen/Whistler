@@ -64,7 +64,7 @@ Programs are defined with `defprog`, maps with `defmap`, structs with `defstruct
 
 Use `(declare (type ...))` for narrowing when inference can't determine the type (integer literals, arithmetic results).
 
-Key forms: `let` (parallel bindings, standard CL), `let*` (sequential bindings), `if`, `when`, `unless`, `when-let`, `if-let`, `return`, `load`, `store`, `logand`, `logxor`, `>>`, `ash`, `cast`, `ctx`, `map-lookup`, `map-update`, `map-delete`, `map-lookup-ptr`, `struct-alloc`, `stack-addr`, `tail-call`, `get-prandom-u32`, `sizeof`, `memset`, `memcpy`, `do-user-ptrs`, `do-user-array`, `with-ringbuf`, `fill-process-info`, `pt-regs-parm1`..`parm6`, `pt-regs-ret`, protocol accessors.
+Key forms: `let` (parallel bindings, standard CL), `let*` (sequential bindings), `if`, `when`, `unless`, `when-let`, `if-let`, `return`, `load`, `store`, `logand`, `logxor`, `>>`, `ash`, `cast`, `ctx`, `map-lookup`, `map-update`, `map-delete`, `map-lookup-ptr`, `struct-alloc`, `stack-addr`, `tail-call`, `get-prandom-u32`, `sizeof`, `memset`, `memcpy`, `do-user-ptrs`, `do-user-array`, `with-ringbuf`, `fill-process-info`, `pt-regs-parm1`..`parm6`, `pt-regs-ret`, `defkfunc` (declare a kfunc) and kfunc calls by name, protocol accessors.
 
 `setf` supports CL-style multi-pair: `(setf place1 val1 place2 val2 ...)`. `defmap` defaults `:key-size` and `:value-size` to 0 (omit for ringbuf maps).
 
@@ -75,6 +75,21 @@ Key forms: `let` (parallel bindings, standard CL), `let*` (sequential bindings),
 Context access: `(ctx field-name)` reads a field from the program's context struct, resolved by program type (e.g., `:xdp` uses `xdp_md`, `:cgroup-sock-addr` uses `bpf_sock_addr`). `(setf (ctx field-name) val)` writes. Array fields: `(ctx user-ip6 0)`. Legacy `(ctx u32 4)` with explicit type+offset still works. Field-name access emits CO-RE relocations for compile-once portability; offsets are resolved from BTF at compile time when `/sys/kernel/btf/vmlinux` is available, falling back to a static table.
 
 Memory ops: `(memset ptr off val n)` with widened stores, `(memcpy dst doff src soff n)` with wide load/store pairs. `(pt-regs-parm1)` through `(pt-regs-parm6)` and `(pt-regs-ret)` for uprobe/kprobe context access (x86-64 and aarch64; compile-time error on unsupported architectures).
+
+### kfuncs
+
+kfuncs are kernel functions a BPF program *calls* — the extensible replacement for the frozen helper set. Whistler resolves them by BTF at load time (no libbpf): a kfunc call compiles to a `BPF_PSEUDO_KFUNC_CALL`, the ELF carries an `R_BPF_64_32` relocation against an extern BTF `FUNC`, and the loader patches in the kfunc's vmlinux BTF id. Both load paths patch kfunc relocs — the ELF loader (`patch-kfunc-relocations` in `loader.lisp`) and the session/bpftrace-runtime path (`session-load-progs` in `session.lisp`).
+
+Call a kfunc by name like a helper: `(bpf-task-from-pid pid)`. Six kfuncs ship predeclared (`bpf-rcu-read-lock`/`unlock`, `bpf-task-from-pid`/`bpf-task-release`, `bpf-cgroup-from-id`/`bpf-cgroup-release`). Declare your own with `defkfunc`:
+
+```lisp
+(defkfunc bpf-task-from-pid ((pid s32)) (ptr task_struct) :acquire :ret-null)
+(defkfunc bpf-task-release  ((task (ptr task_struct))) void :release)
+```
+
+The Lisp name maps to the kernel symbol by turning hyphens into underscores. Types are `u8`..`u64`, `s32`/`s64`, `void`, or `(ptr STRUCT)`. Flags drive compile-time checks: `:acquire` (result is a refcounted pointer that must be released — leaking it is a compile error), `:release` (consumes an acquired reference), `:ret-null` (result may be NULL and must be null-checked; passing a bare maybe-null result to another kfunc is a compile error); `:trusted`/`:sleepable` are recorded but verifier-enforced. The BPF verifier remains authoritative for per-path completeness and for the per-program-type kfunc allowlist (e.g. `bpf_task_from_pid` is TRACING/syscall-only, not kprobe/xdp). The shared registry `*builtin-kfuncs*` in `compiler.lisp` is the single source of truth for both frontends and the loader. See `examples/kfunc-task.lisp` (Whistler) and `examples/bpftrace/kfunc-rcu.bt` (bpftrace).
+
+The registry (`*builtin-kfuncs*`), lowering (`lower-kfunc-call` + acquire/release leak check in `lower.lisp`), BTF extern FUNC emission (`btf-add-kfunc` in `btf.lisp`), and ELF relocs (`elf.lisp`) are shared; the bpftrace frontend recognizes a kfunc by its kernel name in `lower-call` (`codegen.lisp`) and emits the same Whistler kfunc call.
 
 ## Userspace Loader (whistler/loader)
 

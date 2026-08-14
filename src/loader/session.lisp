@@ -83,7 +83,8 @@
                                 :insns (whistler::insn-bytes
                                         (whistler/compiler:cu-insns cu))
                                 :relocs (reverse
-                                         (whistler/compiler:cu-map-relocs cu))))
+                                         (whistler/compiler:cu-map-relocs cu))
+                                :kfunc-relocs (whistler/compiler:cu-kfunc-relocs cu)))
                         compiled-units progs))))))
 
 ;;; ========== Integer key/value encoding ==========
@@ -144,10 +145,21 @@
      (lambda (spec)
        (let* ((insns (copy-seq (getf spec :insns)))
               (relocs (getf spec :relocs))
+              (kfunc-relocs (getf spec :kfunc-relocs))
               (sec-name (getf spec :section))
               (name (getf spec :name))
               (license (getf spec :license))
               (prog-type (section-to-prog-type sec-name)))
+         ;; Patch kfunc call relocations: resolve each kfunc's vmlinux BTF
+         ;; id and write it into the call insn's imm (src_reg/off already
+         ;; baked in by the compiler). Mirrors the ELF loader path.
+         (dolist (rel kfunc-relocs)
+           (let ((offset (first rel))
+                 (btf-id (resolve-btf-func-id (second rel))))
+             (setf (aref insns (+ offset 4)) (logand btf-id #xff))
+             (setf (aref insns (+ offset 5)) (logand (ash btf-id -8) #xff))
+             (setf (aref insns (+ offset 6)) (logand (ash btf-id -16) #xff))
+             (setf (aref insns (+ offset 7)) (logand (ash btf-id -24) #xff))))
          ;; Patch relocations: each reloc is (insn-byte-offset map-index)
          (dolist (rel relocs)
            (let* ((offset (first rel))

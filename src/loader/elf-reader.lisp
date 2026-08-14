@@ -28,7 +28,7 @@
   name info shndx value size)
 
 (defstruct elf-rel
-  offset sym-idx)
+  offset sym-idx type)
 
 (defstruct bpf-elf
   sections symtab strtab shstrtab license
@@ -82,11 +82,13 @@
    :size (elf-u64 bytes (+ offset 16))))
 
 (defun parse-rel-entry (bytes offset)
-  "Parse a 16-byte ELF REL entry."
+  "Parse a 16-byte ELF REL entry.
+   r_info packs sym index (high 32) and relocation type (low 32)."
   (let ((r-info (elf-u64 bytes (+ offset 8))))
     (make-elf-rel
      :offset (elf-u64 bytes offset)
-     :sym-idx (ash r-info -32))))
+     :sym-idx (ash r-info -32)
+     :type (logand r-info #xffffffff))))
 
 ;;; ========== Top-level parser ==========
 

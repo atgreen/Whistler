@@ -19,9 +19,9 @@
    #:emit-ldx-mem #:emit-stx-mem #:emit-st-mem
    #:emit-stx-atomic
    #:emit-jmp-reg #:emit-jmp-imm #:emit-jmp-a
-   #:emit-call #:emit-exit
+   #:emit-call #:emit-exit #:emit-kfunc-call
    #:emit-ld-imm64 #:emit-ld-map-fd #:emit-ld-btf-id
-   #:+bpf-pseudo-btf-id+
+   #:+bpf-pseudo-btf-id+ #:+bpf-pseudo-kfunc-call+
    ;; Constants
    #:+bpf-reg-0+ #:+bpf-reg-1+ #:+bpf-reg-2+ #:+bpf-reg-3+ #:+bpf-reg-4+
    #:+bpf-reg-5+ #:+bpf-reg-6+ #:+bpf-reg-7+ #:+bpf-reg-8+ #:+bpf-reg-9+
@@ -80,7 +80,7 @@
   (:use #:cl #:whistler/bpf)
   (:export #:whistler-error #:*helper-arg-counts*
            #:make-compilation-unit #:cu-insns #:cu-maps
-           #:cu-section #:cu-name #:cu-license #:cu-map-relocs #:cu-core-relocs
+           #:cu-section #:cu-name #:cu-license #:cu-map-relocs #:cu-core-relocs #:cu-kfunc-relocs
            #:whistler-macroexpand #:constant-fold-sexpr #:resolve-map-type
            #:bpf-map #:bpf-map-name #:bpf-map-type #:bpf-map-key-size
            #:bpf-map-value-size #:bpf-map-max-entries #:bpf-map-flags #:bpf-map-index
@@ -88,7 +88,8 @@
            #:sym= #:bpf-type-p #:bpf-type-size #:builtin-helper-p
            #:ctx-resolve-field #:*ctx-btf-resolver*
            #:*prog-type-to-ctx-struct* #:*ctx-struct-fields*
-           #:*builtin-helpers* #:*builtin-constants* #:*whistler-builtins*))
+           #:*builtin-helpers* #:*builtin-constants* #:*whistler-builtins*
+           #:*builtin-kfuncs* #:kfunc-spec #:builtin-kfunc-p #:register-kfunc))
 
 (defpackage #:whistler/ir
   (:use #:cl)
@@ -118,7 +119,7 @@
 (defpackage #:whistler
   (:use #:cl #:whistler/bpf #:whistler/compiler #:whistler/elf #:whistler/btf)
   (:shadow #:case #:defstruct #:incf #:decf)
-  (:export #:compile-file* #:defmap #:defprog #:compile-to-elf #:main
+  (:export #:compile-file* #:defmap #:defprog #:defkfunc #:compile-to-elf #:main
            #:reset-compilation-state
            ;; Surface language macros
            #:when-let #:if-let #:case
