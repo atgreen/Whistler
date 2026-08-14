@@ -78,12 +78,28 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Pull the section for this version out of CHANGELOG.md: everything
+          # between the `## VERSION …' header and the next `## ' header.
+          awk -v ver="$VERSION" '
+            $0 ~ "^## " ver "([ \t]|$)" { flag=1; next }
+            flag && /^## / { exit }
+            flag { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No CHANGELOG.md section found for ${VERSION}" >&2
+            exit 1
+          fi
+
       - name: Create GitHub release
         uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1
         with:
           tag: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
-          bodyFile: doc/release-notes/RELEASE-NOTES-${{ steps.get_version.outputs.version }}.md
+          bodyFile: release-notes.md
           artifacts: |
             artifacts/linux-package/*.tar.gz
           allowUpdates: true
