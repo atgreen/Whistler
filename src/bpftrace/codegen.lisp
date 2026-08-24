@@ -2321,6 +2321,100 @@
                      :test #'string=)))
     (when entry (intern (car entry) '#:whistler))))
 
+(defun lower-exit-call (args)
+  "`exit([code])' — encode the optional argument as (N+1) so 0 still
+   means \"exit() never fired\"; userspace subtracts 1 before quitting."
+  (let ((code (cond
+                ((null args) 1)
+                ((and (consp (first args))
+                      (eq (first (first args)) :int))
+                 (1+ (second (first args))))
+                (t `(whistler::+ ,(lower-expr (first args)) 1)))))
+    `(setf (whistler:getmap ,*exit-map-name* 0) ,code)))
+
+(defun lower-print-call (args)
+  "`print(@map[, top[, div]])' — async-map dump; `print(VAL)' for any
+   scalar/string routes through printf with an inferred format."
+  (cond
+    ;; print(@map[, top[, div]]) — original async-map path.
+    ;; Distinguished from print(@map[k]) by the absence of keys; the
+    ;; indexed form fetches a single value and prints it.
+    ((and args (consp (first args)) (eq (first (first args)) :map)
+          (null (getf (cdr (first args)) :keys)))
+     (lower-async-map +bt-tag-print-map+ args "print"))
+    ;; print(non-map) — bpftrace allows print(VAL) for any
+    ;; scalar/string. We route through printf with an inferred format,
+    ;; appending a newline (bpftrace's `print' always terminates the
+    ;; line).
+    (t (lower-print-value args))))
+
+(defun lower-nsecs-call (args)
+  "`nsecs(CLOCK)' — bpftrace 0.22+ accepts an optional clock selector.
+   Map the four clocks bpftrace recognises onto the matching BPF
+   helper; everything else (and the no-arg default) goes through
+   ktime-get-ns just like bare `nsecs'."
+  (let ((clk (and args (consp (first args))
+                  (or (and (eq (first (first args)) :constant)
+                           (second (first args)))
+                      (and (eq (first (first args)) :builtin)
+                           (let ((b (second (first args))))
+                             (and (symbolp b) (symbol-name b))))
+                      (and (eq (first (first args)) :ident)
+                           (second (first args)))))))
+    (cond
+      ((or (null clk)
+           (string-equal clk "monotonic"))
+       '(whistler::ktime-get-ns))
+      ((string-equal clk "boot")
+       '(whistler::ktime-get-boot-ns))
+      ((or (string-equal clk "tai")
+           (string-equal clk "sw_tai"))
+       '(whistler::ktime-get-tai-ns))
+      ((string-equal clk "realtime")
+       '(whistler::ktime-get-coarse-ns))
+      (t '(whistler::ktime-get-ns)))))
+
+(defun lower-getopt-call (args)
+  "`getopt(NAME, DEFAULT, HELP)' — bpftrace's CLI-flag accessor. If
+   NAME was passed via `whistler bpftrace script.bt -- --NAME[=V]' the
+   parsed value lands in *named-params* and we emit an integer literal
+   for it. Otherwise we lower DEFAULT (which the bpftrace stdlib seeds
+   as `false' / int / string). Only bool and int variants are
+   supported today; string defaults without a CLI override still flow
+   through unchanged."
+  (let* ((opt-name (and (consp (first args))
+                        (eq (first (first args)) :str)
+                        (second (first args))))
+         (default  (or (second args) '(:int 0)))
+         (provided (and opt-name *named-params*
+                        (assoc opt-name *named-params* :test #'string=))))
+    (cond
+      ((null provided)
+       (lower-expr default))
+      ;; Bool-shaped default: false/true via :constant, or :bool
+      ;; literal if the parser ever emits one. Bare `--name' → 1,
+      ;; `--name=true`/`--name=1` → 1, `--name=false`/`--name=0` → 0.
+      ((or (and (consp default) (eq (first default) :constant)
+                (or (string= (second default) "false")
+                    (string= (second default) "true")))
+           (and (consp default) (eq (first default) :bool)))
+       (let* ((raw (cdr provided))
+              (v (cond
+                   ((or (null raw) (string= raw "")) 1)
+                   ((member raw '("1" "true") :test #'string=) 1)
+                   ((member raw '("0" "false") :test #'string=) 0)
+                   (t (unsupported "getopt(~S, bool): unrecognised value ~S"
+                                   opt-name raw)))))
+         v))
+      ;; Int-shaped default.
+      ((and (consp default) (eq (first default) :int))
+       (or (parse-integer (or (cdr provided) "") :junk-allowed t)
+           (unsupported "getopt(~S, int): could not parse value ~S as integer"
+                        opt-name (cdr provided))))
+      (t
+       (unsupported "getopt(~S): CLI override only supported for bool / int defaults"
+                    opt-name)))))
+
 (defun lower-call (expr)
   (let* ((name (getf (cdr expr) :name))
          (kfunc-sym (bpftrace-name->kfunc-symbol name)))
@@ -2328,17 +2422,7 @@
       ((string= name "count") (unsupported "count() must be on the RHS of @map = …"))
       ((string= name "hist")  (unsupported "hist() must be on the RHS of @map = …"))
       ((string= name "lhist") (unsupported "lhist() must be on the RHS of @map = …"))
-      ((string= name "exit")
-       ;; Encode the optional argument as (N+1) so 0 still means
-       ;; "exit() never fired"; userspace subtracts 1 before quitting.
-       (let* ((args (getf (cdr expr) :args))
-              (code (cond
-                      ((null args) 1)
-                      ((and (consp (first args))
-                            (eq (first (first args)) :int))
-                       (1+ (second (first args))))
-                      (t `(whistler::+ ,(lower-expr (first args)) 1)))))
-         `(setf (whistler:getmap ,*exit-map-name* 0) ,code)))
+      ((string= name "exit")   (lower-exit-call (getf (cdr expr) :args)))
       ((string= name "printf") (lower-printf (getf (cdr expr) :args)))
       ;; errorf("fmt", …) — same as printf() but the userspace decoder
       ;; routes the line to *error-output* (stderr).
@@ -2357,19 +2441,7 @@
       ;; still sees a message in dev workflows.
       ((string= name "fail") (lower-fail (getf (cdr expr) :args)))
       ((string= name "print")
-       (let ((args (getf (cdr expr) :args)))
-         (cond
-           ;; print(@map[, top[, div]]) — original async-map path.
-           ;; Distinguished from print(@map[k]) by the absence of keys;
-           ;; the indexed form fetches a single value and prints it.
-           ((and args (consp (first args)) (eq (first (first args)) :map)
-                 (null (getf (cdr (first args)) :keys)))
-            (lower-async-map +bt-tag-print-map+ args "print"))
-           ;; print(non-map) — bpftrace allows print(VAL) for any
-           ;; scalar/string. We route through printf with an inferred
-           ;; format, appending a newline (bpftrace's `print' always
-           ;; terminates the line).
-           (t (lower-print-value args)))))
+       (lower-print-call (getf (cdr expr) :args)))
       ((string= name "clear")  (lower-async-map +bt-tag-clear-map+
                                                 (getf (cdr expr) :args)
                                                 "clear"))
@@ -2394,32 +2466,8 @@
                                 ,(ash 1 8)))
       ((string= name "kstack")
        `(whistler::get-stackid (whistler::ctx-ptr) ,*stacks-map-name* 0))
-      ;; `nsecs(CLOCK)' — bpftrace 0.22+ accepts an optional clock
-      ;; selector. Map the four clocks bpftrace recognises onto the
-      ;; matching BPF helper; everything else (and the no-arg
-      ;; default) goes through ktime-get-ns just like bare `nsecs'.
       ((string= name "nsecs")
-       (let* ((args (getf (cdr expr) :args))
-              (clk  (and args (consp (first args))
-                         (or (and (eq (first (first args)) :constant)
-                                  (second (first args)))
-                             (and (eq (first (first args)) :builtin)
-                                  (let ((b (second (first args))))
-                                    (and (symbolp b) (symbol-name b))))
-                             (and (eq (first (first args)) :ident)
-                                  (second (first args)))))))
-         (cond
-           ((or (null clk)
-                (string-equal clk "monotonic"))
-            '(whistler::ktime-get-ns))
-           ((string-equal clk "boot")
-            '(whistler::ktime-get-boot-ns))
-           ((or (string-equal clk "tai")
-                (string-equal clk "sw_tai"))
-            '(whistler::ktime-get-tai-ns))
-           ((string-equal clk "realtime")
-            '(whistler::ktime-get-coarse-ns))
-           (t '(whistler::ktime-get-ns)))))
+       (lower-nsecs-call (getf (cdr expr) :args)))
       ;; `strftime(FMT, TS)' outside a printf arg position — used as
       ;; a map key or value. printf-arg-type handles the printf case;
       ;; here we just yield the TS expr (a u64). The format id was
@@ -2444,47 +2492,8 @@
       ;; works for u16 values; higher bytes pass through if any are set.
       ((string= name "bswap")
        (lower-bswap (first (getf (cdr expr) :args))))
-      ;; `getopt(NAME, DEFAULT, HELP)' — bpftrace's CLI-flag accessor.
-      ;; If NAME was passed via `whistler bpftrace script.bt -- --NAME[=V]'
-      ;; the parsed value lands in whistler/bpftrace:*named-params*, and
-      ;; we emit an integer literal for it. Otherwise we lower DEFAULT
-      ;; (which the bpftrace stdlib seeds as `false' / int / string).
-      ;; Only bool and int variants are supported today; string defaults
-      ;; without a CLI override still flow through unchanged.
       ((string= name "getopt")
-       (let* ((args     (getf (cdr expr) :args))
-              (opt-name (and (consp (first args))
-                             (eq (first (first args)) :str)
-                             (second (first args))))
-              (default  (or (second args) '(:int 0)))
-              (provided (and opt-name *named-params*
-                             (assoc opt-name *named-params* :test #'string=))))
-         (cond
-           ((null provided)
-            (lower-expr default))
-           ;; Bool-shaped default: false/true via :constant, or :bool
-           ;; literal if the parser ever emits one. Bare `--name' → 1,
-           ;; `--name=true`/`--name=1` → 1, `--name=false`/`--name=0` → 0.
-           ((or (and (consp default) (eq (first default) :constant)
-                     (or (string= (second default) "false")
-                         (string= (second default) "true")))
-                (and (consp default) (eq (first default) :bool)))
-            (let* ((raw (cdr provided))
-                   (v (cond
-                        ((or (null raw) (string= raw "")) 1)
-                        ((member raw '("1" "true") :test #'string=) 1)
-                        ((member raw '("0" "false") :test #'string=) 0)
-                        (t (unsupported "getopt(~S, bool): unrecognised value ~S"
-                                        opt-name raw)))))
-              v))
-           ;; Int-shaped default.
-           ((and (consp default) (eq (first default) :int))
-            (or (parse-integer (or (cdr provided) "") :junk-allowed t)
-                (unsupported "getopt(~S, int): could not parse value ~S as integer"
-                             opt-name (cdr provided))))
-           (t
-            (unsupported "getopt(~S): CLI override only supported for bool / int defaults"
-                         opt-name)))))
+       (lower-getopt-call (getf (cdr expr) :args)))
       ;; `syscall_name(N)' — bpftrace returns a string; we instead pass
       ;; the syscall number through unchanged and let the userspace
       ;; print path map it to a name via the :syscall-name key-hint
@@ -3591,113 +3600,116 @@
      ;; register across iterations.
      `(whistler::memcpy ,rec ,off ,(lower-expr arg) 0 ,+bt-ntop-slot-size+))
     ((and (consp ty) (eq (car ty) :string))
-     (let ((size (cdr ty)))
+     (lower-printf-string-arg arg (cdr ty) rec off))))
+
+(defun lower-printf-string-map-arg (arg size rec off)
+  "@m[k] on a string-valued map — look up the entry, then copy SIZE
+   bytes from the value pointer into the record. Missing key (NULL
+   pointer) → leave the slot untouched (init was zero, so the
+   userspace decoder sees an empty string).
+
+   Scalar-key path uses the per-probe shared *shared-key-buf* via
+   map-lookup-ptr rather than a fresh `(let* ((tmpk u64 …)))' +
+   map-lookup. Reason: the OLD pattern made the emit-time key cache
+   (emit-key-to-stack) record \"this slot holds const N\" — but
+   gen-string-set's writes through the shared buffer leave a stack
+   slot that the cache later mis-routes constant-key lookups to.
+   Using map-lookup-ptr sidesteps emit-key-to-stack entirely."
+  (let* ((info (gethash (or (getf (cdr arg) :name) "@") *map-table*))
+         (mname (minfo-name info))
+         (keys  (getf (cdr arg) :keys))
+         (p     (gensym "P"))
+         (ptr-p (keys-need-ptr-ops-p keys)))
+    (cond
+      (ptr-p
+       (with-key keys
+         (lambda (k)
+           `(whistler:if-let
+                (,p (whistler::map-lookup-ptr ,mname ,k))
+              (whistler::probe-read-kernel
+               (+ ,rec ,off) ,size ,p)
+              0))))
+      ;; Empty key list (anon-map `@', or sentinel-key scalar
+      ;; maps) — `with-key' passes 0 directly; emit a plain
+      ;; map-lookup (no struct-key buffer).
+      ((null keys)
+       `(whistler:if-let
+            (,p (whistler::map-lookup ,mname 0))
+          (whistler::probe-read-kernel
+           (+ ,rec ,off) ,size ,p)
+          0))
+      (t
+       (setf *shared-key-buf-used* t)
+       `(progn
+          (whistler::store whistler::u64 ,*shared-key-buf* 0
+                           ,(lower-expr (first keys)))
+          (whistler:if-let
+              (,p (whistler::map-lookup-ptr ,mname ,*shared-key-buf*))
+            (whistler::probe-read-kernel
+             (+ ,rec ,off) ,size ,p)
+            0))))))
+
+(defun lower-printf-string-arg (arg size rec off)
+  "Fill a SIZE-byte string slot in the printf record from ARG."
+  (cond
+    ((eq (first arg) :comm)
+     `(whistler::get-current-comm (+ ,rec ,off) ,size))
+    ((eq (first arg) :pcomm)
+     (lower-pcomm-into-record rec off size))
+    ((str-call-p arg)
+     (let* ((args (getf (cdr arg) :args))
+            (first-arg (first args))
+            ;; `str($N)` where $N is a positional arg: bpftrace
+            ;; reads the raw CLI token as the string. Fold the
+            ;; literal in at compile time so we don't probe-read
+            ;; user memory at the integer parse value.
+            (positional-literal
+              (and (consp first-arg) (eq (first first-arg) :positional)
+                   (nth (1- (second first-arg))
+                        *positional-args*))))
        (cond
-         ((eq (first arg) :comm)
-          `(whistler::get-current-comm (+ ,rec ,off) ,size))
-         ((eq (first arg) :pcomm)
-          (lower-pcomm-into-record rec off size))
-         ((str-call-p arg)
-          (let* ((args (getf (cdr arg) :args))
-                 (first-arg (first args))
-                 ;; `str($N)` where $N is a positional arg: bpftrace
-                 ;; reads the raw CLI token as the string. Fold the
-                 ;; literal in at compile time so we don't probe-read
-                 ;; user memory at the integer parse value.
-                 (positional-literal
-                   (and (consp first-arg) (eq (first first-arg) :positional)
-                        (nth (1- (second first-arg))
-                             *positional-args*))))
-            (cond
-              (positional-literal
-               (lower-printf-string-literal rec off positional-literal size))
-              (t
-               (let* ((ptr  (lower-expr first-arg))
-                      (helper (intern "PROBE-READ-USER-STR" :whistler)))
-                 `(,helper (+ ,rec ,off) ,size ,ptr))))))
-         ((kstr-call-p arg)
-          (let* ((args (getf (cdr arg) :args))
-                 (ptr  (lower-expr (first args))))
-            `(,(intern "PROBE-READ-KERNEL-STR" :whistler)
-              (+ ,rec ,off) ,size ,ptr)))
-         ;; path(struct path *) — bpf_d_path(path, buf, sz) writes
-         ;; the kernel-resolved path NUL-padded into the record slot.
-         ((named-call-p arg "path")
-          (let* ((args (getf (cdr arg) :args))
-                 (ptr  (lower-expr (first args))))
-            `(,(intern "D-PATH" :whistler) ,ptr (+ ,rec ,off) ,size)))
-         ;; Literal string — emit byte-stores. Used for probe/func
-         ;; rewrites and any printf("…", "literal") form.
-         ((eq (first arg) :str)
-          (lower-printf-string-literal rec off (second arg) size))
-         ;; A \$v in *comm-vars* — copy SIZE bytes from \$v's slot
-         ;; into the record.
-         ((and (eq (first arg) :var)
-               (member (second arg) *comm-vars* :test #'string-equal))
-          ;; Unrolled byte copy (whistler::memcpy widens to u64/u32
-          ;; chunks at compile time). Avoids the regalloc snag the
-          ;; runtime-loop form hit.
-          `(whistler::memcpy ,rec ,off ,(lower-expr arg) 0 ,size))
-         ;; A \$v backed by an inline str-slot (assigned from a string
-         ;; literal). lower-expr gives us the buffer pointer; memcpy
-         ;; the bytes into the record slot.
-         ((and (eq (first arg) :var)
-               (assoc (second arg) *str-vars* :test #'string-equal))
-          `(whistler::memcpy ,rec ,off ,(lower-expr arg) 0 ,size))
-         ;; A field-chain whose leaf is a char[] / u8[] array — emit
-         ;; one probe_read_kernel of SIZE bytes from the chain's
-         ;; computed pointer.
-         ((eq (first arg) :field)
-          `(whistler::probe-read-kernel
-            (+ ,rec ,off) ,size ,(lower-chain-as-ptr arg)))
-         ;; @m[k] on a string-valued map — look up the entry, then
-         ;; copy SIZE bytes from the value pointer into the record.
-         ;; Missing key (NULL pointer) → leave the slot untouched
-         ;; (init was zero, so the userspace decoder sees an empty
-         ;; string).
-         ;;
-         ;; Scalar-key path uses the per-probe shared *shared-key-buf*
-         ;; via map-lookup-ptr rather than a fresh `(let* ((tmpk u64 …)))'
-         ;; + map-lookup. Reason: the OLD pattern made the emit-time
-         ;; key cache (emit-key-to-stack) record "this slot holds
-         ;; const N" — but gen-string-set's writes through the shared
-         ;; buffer leave a stack slot that the cache later mis-routes
-         ;; constant-key lookups to. Using map-lookup-ptr sidesteps
-         ;; emit-key-to-stack entirely.
-         ((eq (first arg) :map)
-          (let* ((info (gethash (or (getf (cdr arg) :name) "@") *map-table*))
-                 (mname (minfo-name info))
-                 (keys  (getf (cdr arg) :keys))
-                 (p     (gensym "P"))
-                 (ptr-p (keys-need-ptr-ops-p keys)))
-            (cond
-              (ptr-p
-               (with-key keys
-                 (lambda (k)
-                   `(whistler:if-let
-                        (,p (whistler::map-lookup-ptr ,mname ,k))
-                      (whistler::probe-read-kernel
-                       (+ ,rec ,off) ,size ,p)
-                      0))))
-              ;; Empty key list (anon-map `@', or sentinel-key scalar
-              ;; maps) — `with-key' passes 0 directly; emit a plain
-              ;; map-lookup (no struct-key buffer).
-              ((null keys)
-               `(whistler:if-let
-                    (,p (whistler::map-lookup ,mname 0))
-                  (whistler::probe-read-kernel
-                   (+ ,rec ,off) ,size ,p)
-                  0))
-              (t
-               (setf *shared-key-buf-used* t)
-               `(progn
-                  (whistler::store whistler::u64 ,*shared-key-buf* 0
-                                   ,(lower-expr (first keys)))
-                  (whistler:if-let
-                      (,p (whistler::map-lookup-ptr ,mname ,*shared-key-buf*))
-                    (whistler::probe-read-kernel
-                     (+ ,rec ,off) ,size ,p)
-                    0)))))))))))
+         (positional-literal
+          (lower-printf-string-literal rec off positional-literal size))
+         (t
+          (let* ((ptr  (lower-expr first-arg))
+                 (helper (intern "PROBE-READ-USER-STR" :whistler)))
+            `(,helper (+ ,rec ,off) ,size ,ptr))))))
+    ((kstr-call-p arg)
+     (let* ((args (getf (cdr arg) :args))
+            (ptr  (lower-expr (first args))))
+       `(,(intern "PROBE-READ-KERNEL-STR" :whistler)
+         (+ ,rec ,off) ,size ,ptr)))
+    ;; path(struct path *) — bpf_d_path(path, buf, sz) writes
+    ;; the kernel-resolved path NUL-padded into the record slot.
+    ((named-call-p arg "path")
+     (let* ((args (getf (cdr arg) :args))
+            (ptr  (lower-expr (first args))))
+       `(,(intern "D-PATH" :whistler) ,ptr (+ ,rec ,off) ,size)))
+    ;; Literal string — emit byte-stores. Used for probe/func
+    ;; rewrites and any printf("…", "literal") form.
+    ((eq (first arg) :str)
+     (lower-printf-string-literal rec off (second arg) size))
+    ;; A \$v in *comm-vars* — copy SIZE bytes from \$v's slot
+    ;; into the record. Unrolled byte copy (whistler::memcpy widens
+    ;; to u64/u32 chunks at compile time). Avoids the regalloc snag
+    ;; the runtime-loop form hit.
+    ((and (eq (first arg) :var)
+          (member (second arg) *comm-vars* :test #'string-equal))
+     `(whistler::memcpy ,rec ,off ,(lower-expr arg) 0 ,size))
+    ;; A \$v backed by an inline str-slot (assigned from a string
+    ;; literal). lower-expr gives us the buffer pointer; memcpy
+    ;; the bytes into the record slot.
+    ((and (eq (first arg) :var)
+          (assoc (second arg) *str-vars* :test #'string-equal))
+     `(whistler::memcpy ,rec ,off ,(lower-expr arg) 0 ,size))
+    ;; A field-chain whose leaf is a char[] / u8[] array — emit
+    ;; one probe_read_kernel of SIZE bytes from the chain's
+    ;; computed pointer.
+    ((eq (first arg) :field)
+     `(whistler::probe-read-kernel
+       (+ ,rec ,off) ,size ,(lower-chain-as-ptr arg)))
+    ((eq (first arg) :map)
+     (lower-printf-string-map-arg arg size rec off))))
 
 (defun lower-printf-string-literal (rec off text size)
   "Emit the kernel-side stores that lay TEXT (UTF-8) into the SIZE-byte
