@@ -402,419 +402,425 @@
           (first tys)
           (format nil "(~{~A~^,~})" tys)))))
 
-(declaim (special *probe-spec*))
+(declaim (special *probe-spec* *map-table* *time-format-table*))
+
+;;; Map-shape inference walks the script before lowering and records,
+;;; per map, everything the defmap emitter and the userspace printer
+;;; need. The infer-* helpers below all operate on the table that
+;;; infer-maps binds to *map-table* — binding it during the walk also
+;;; lets helpers called from infer-note-keys (composite-key-layout in
+;;; particular) look up previously-seen maps to derive cross-map shape,
+;;; e.g. the key-size of `@x[@a]' is exactly @a's value-size.
+
+(defun infer-ensure-minfo (mref)
+  "Find or create the MINFO for MREF's map in *map-table*."
+  (let* ((raw (getf (cdr mref) :name))
+         (key (or raw "@")))
+    (or (gethash key *map-table*)
+        (setf (gethash key *map-table*)
+              (make-minfo :name (w-sym (or raw "at"))
+                          :raw-name raw
+                          :kind :counter
+                          :key-size 0
+                          :value-size 8
+                          :max-entries (script-max-map-keys 1024))))))
+
+(defun infer-note-single-key (info key)
+  "Record shape/print hints that only apply to a single-key access."
+  ;; Store the hint so the printer renders comm as ASCII, pid as bare
+  ;; decimal, etc.
+  (when (null (minfo-key-builtin info))
+    (setf (minfo-key-builtin info) (key-hint key)))
+  ;; An in-script-struct array field: record the array shape so the
+  ;; printer can render the key as `[v1,v2,…]'.
+  (multiple-value-bind (_b sz _o len dims)
+      (array-field-meta key)
+    (declare (ignore _b _o))
+    (when (and sz len)
+      (setf (minfo-key-array-elt-size info) sz
+            (minfo-key-array-len info) len
+            (minfo-key-array-dims info) (or dims (list len)))))
+  ;; `@other-map' as the key — the lookup returns whatever the other
+  ;; map stored. If that was an in-script array (e.g.
+  ;; `@a = ((struct A *)e).x; @x[@a] = …'), the key here IS those
+  ;; bytes — sized and rendered the same way.
+  (when (and (consp key) (eq (first key) :map))
+    (let* ((src-raw (getf (cdr key) :name))
+           (src-info (gethash (or src-raw "@") *map-table*)))
+      (when (and src-info
+                 (minfo-value-array-p src-info)
+                 (minfo-value-array-elt-size src-info)
+                 (plusp (minfo-value-array-elt-size src-info)))
+        (let* ((sz (minfo-value-array-elt-size src-info))
+               (vs (minfo-value-size src-info))
+               (len (floor vs sz))
+               (dims (or (minfo-value-array-dims src-info)
+                         (list len))))
+          (setf (minfo-key-array-elt-size info) sz
+                (minfo-key-array-len info) len
+                (minfo-key-array-dims info) dims
+                (minfo-key-size info)
+                (max (minfo-key-size info) vs))))))
+  ;; strftime(): `@[strftime("FMT", TS)] = …' — register the format
+  ;; and stash the id on the map so the userspace key formatter
+  ;; strftime's the u64 ts at print time.
+  (when (and (consp key) (eq (first key) :call)
+             (string= (getf (cdr key) :name) "strftime"))
+    (let* ((fmt-arg (first (getf (cdr key) :args)))
+           (fmt    (and (consp fmt-arg)
+                        (eq (first fmt-arg) :str)
+                        (second fmt-arg))))
+      (when fmt
+        (let ((id (1+ (length *time-format-table*))))
+          (push (cons id fmt) *time-format-table*)
+          (setf (minfo-key-strftime-id info) id))))))
+
+(defun infer-note-keys (mref)
+  "Record key-shape facts for a (possibly keyed) access to MREF's map."
+  (let ((info (infer-ensure-minfo mref))
+        (keys (getf (cdr mref) :keys)))
+    (when keys
+      (setf (minfo-keyed-p info) t)
+      ;; A single scalar key follows with-key's scalar path — the
+      ;; lowering stores it at its natural width via map-update
+      ;; (`expr-size'). Composite or string-typed keys (comm/str/kstr)
+      ;; go through the struct-key path where every slot is u64
+      ;; (or a wider byte buffer), so use the layout total.
+      (let ((total
+              (if (and (= (length keys) 1)
+                       (not (keys-need-ptr-ops-p keys)))
+                  (expr-size (first keys))
+                  (multiple-value-bind (_layout total)
+                      (composite-key-layout keys)
+                    (declare (ignore _layout))
+                    total))))
+        (setf (minfo-key-size info)
+              (max (minfo-key-size info) total)))
+      (if (= (length keys) 1)
+          (infer-note-single-key info (first keys))
+          ;; Composite: track per-slot hints so the printer can
+          ;; dispatch on individual slots.
+          (when (null (minfo-key-types info))
+            (setf (minfo-key-types info)
+                  (mapcar #'key-hint keys))))
+      ;; Record per-slot bpftrace surface types from the first
+      ;; determinable-shape access — `has_key' uses this to diagnose
+      ;; argument-type mismatches against the declared key shape.
+      (when (null (minfo-key-bt-types info))
+        (let ((tys (mapcar #'bt-key-arg-type-string keys)))
+          (when (every #'identity tys)
+            (setf (minfo-key-bt-types info) tys)))))))
+
+(defun infer-note-strftime-value (info rhs)
+  "`@m = strftime(\"FMT\", TS)' — store the bare u64 timestamp;
+   userspace strftime's it via FMT-ID at decode time."
+  (let* ((fmt (second (first (getf (cdr rhs) :args))))
+         (id  (1+ (length *time-format-table*))))
+    (push (cons id fmt) *time-format-table*)
+    (setf (minfo-kind info) :scalar
+          (minfo-value-strftime-id info) id
+          (minfo-value-size info)
+          (max (minfo-value-size info) 8))))
+
+(defun infer-note-tuple-value (info rhs)
+  "`@m = (a, b, …)' — tuple value. Use the same per-component layout
+   as composite-key-layout (each component takes a u64 slot or a wider
+   string slot). Total bytes sized via the layout."
+  (let* ((items (getf (cdr rhs) :items)))
+    (multiple-value-bind (_layout total)
+        (composite-key-layout items)
+      (declare (ignore _layout))
+      (setf (minfo-kind info) :scalar
+            (minfo-value-tuple-p info) t
+            (minfo-value-tuple-types info)
+            (mapcar #'key-hint items)
+            (minfo-value-size info)
+            (max (minfo-value-size info) total)))))
+
+(defun infer-note-aggregation (info rhs)
+  "`@m = count()/hist()/lhist()/sum()/…' — record the aggregation kind."
+  (let ((fn (getf (cdr rhs) :name)))
+    (cond
+      ((string= fn "count")
+       (setf (minfo-kind info) :counter))
+      ((string= fn "hist")
+       ;; Don't touch key-size / max-entries — the later hist-sizing
+       ;; pass overwrites them once it knows whether the map is keyed.
+       (setf (minfo-kind info) :hist))
+      ((string= fn "lhist")
+       (let* ((args (getf (cdr rhs) :args))
+              (literal (lambda (n)
+                         (let ((a (nth n args)))
+                           (cond
+                             ((and a (eq (first a) :int)) (second a))
+                             (t (unsupported
+                                 "lhist() requires literal min/max/step (got ~S)" a)))))))
+         (setf (minfo-kind info) :lhist
+               (minfo-hist-params info)
+               (list (funcall literal 1)
+                     (funcall literal 2)
+                     (funcall literal 3)))))
+      ((string= fn "sum")
+       (setf (minfo-kind info) :sum))
+      ((string= fn "min")
+       (setf (minfo-kind info) :min
+             (minfo-value-size info) 16))
+      ((string= fn "max")
+       (setf (minfo-kind info) :max
+             (minfo-value-size info) 16))
+      ((string= fn "avg")
+       (setf (minfo-kind info) :avg
+             (minfo-value-size info) 16))
+      ((string= fn "stats")
+       (setf (minfo-kind info) :stats
+             (minfo-value-size info) 16)))))
+
+(defun infer-note-rhs (mref rhs)
+  "Record value-shape facts from an `@m[…] = RHS' assignment."
+  (let ((info (infer-ensure-minfo mref)))
+    ;; `@m = ~X' produces an unsigned value (bpftrace's bitwise NOT is
+    ;; the only common unary that flips the result to uint64). Mark so
+    ;; the userspace printer renders as u64 instead of int64 — e.g.
+    ;; `@x = ~10' → 18446744073709551605, not -11.
+    (when (and (consp rhs) (eq (first rhs) :un)
+               (eq (getf (cdr rhs) :op) :~))
+      (setf (minfo-value-unsigned-p info) t))
+    (cond
+      ;; `@m[k] = (struct X *)expr' — remember the value type so a
+      ;; later `\$v = @m[k]' can flow X into *var-types* for chained
+      ;; field access.
+      ((and (consp rhs) (eq (first rhs) :cast))
+       (setf (minfo-value-struct info)
+             (getf (cdr rhs) :type)))
+      ;; `@m[k] = (T *)expr' — value is a typed pointer. Stash
+      ;; sizeof(T) on the minfo so later `@m[k][i]' reads emit a sized
+      ;; probe-read.
+      ((and (consp rhs) (eq (first rhs) :prim-ptr-cast))
+       (let ((sz (prim-ptr-elt-size (getf (cdr rhs) :elt-type))))
+         (when sz
+           (setf (minfo-value-ptr-elt-size info) sz))))
+      ;; `@m[k] = args.FIELD' where the tracepoint format declares
+      ;; FIELD as `struct X *' — propagate X into value-struct so
+      ;; `$v = @m[k]; $v.field' works without the user writing an
+      ;; explicit cast. naptime.bt's `@rqtp[tid] = args.rqtp;
+      ;; $t.tv_sec' idiom relies on this.
+      ((and (consp rhs) (eq (first rhs) :field)
+            (consp (getf (cdr rhs) :base))
+            (eq (first (getf (cdr rhs) :base)) :args))
+       (let ((sname (tp-field-struct-pointer
+                     (getf (cdr rhs) :name))))
+         (when (and sname (null (minfo-value-struct info)))
+           (setf (minfo-value-struct info) sname))))
+      ((and (consp rhs) (eq (first rhs) :call)
+            (string= (getf (cdr rhs) :name) "strftime")
+            (let ((fmt-arg (first (getf (cdr rhs) :args))))
+              (and (consp fmt-arg) (eq (first fmt-arg) :str))))
+       (infer-note-strftime-value info rhs))
+      ((and (consp rhs) (eq (first rhs) :tuple))
+       (infer-note-tuple-value info rhs))
+      ;; `@m = args' / `@m[k] = args' — value is the raw concatenated
+      ;; param bytes (fentry/fexit: param-count × 8). Treat as a
+      ;; wide-byte value: track the size, mark needs-ptr-ops via wide
+      ;; value-size.
+      ((and (consp rhs) (eq (first rhs) :args)
+            (bare-args-byte-width))
+       (let ((w (bare-args-byte-width)))
+         (setf (minfo-kind info) :scalar
+               (minfo-value-array-p info) t
+               (minfo-value-array-elt-size info) 1
+               (minfo-value-size info)
+               (max (minfo-value-size info) w))))
+      ;; `@m[k] = (struct X *)e.arrfield' — array-field flow. Map's
+      ;; value-size becomes total array bytes, mark value-array-p so
+      ;; lower-map-assign dispatches to the probe-read-into-buffer
+      ;; path.
+      ((and (consp rhs) (eq (first rhs) :field)
+            (multiple-value-bind (_b sz _o len)
+                (array-field-meta rhs)
+              (declare (ignore _b _o))
+              (and sz len)))
+       (multiple-value-bind (_b sz _o len dims)
+           (array-field-meta rhs)
+         (declare (ignore _b _o))
+         (setf (minfo-kind info) :scalar
+               (minfo-value-array-p info) t
+               (minfo-value-array-elt-size info) sz
+               (minfo-value-array-dims info) (or dims (list len))
+               (minfo-value-size info)
+               (max (minfo-value-size info) (* sz len)))))
+      ;; `@m[k] = :str LITERAL' — direct string literal RHS. Size to
+      ;; hold the literal plus a NUL byte.
+      ((and (consp rhs) (eq (first rhs) :str))
+       (let* ((bytes (sb-ext:string-to-octets
+                      (second rhs) :external-format :utf-8))
+              (need (1+ (length bytes))))
+         (setf (minfo-kind info) :scalar
+               (minfo-value-string-p info) t
+               (minfo-value-size info)
+               (max (minfo-value-size info) need
+                    +bt-func-name-key-len+))))
+      ;; `@m[k] = func' / `= probe' — rewrite-self-refs will turn
+      ;; these into :str at lower time, but infer-maps runs first and
+      ;; needs to mark the value slot as a string so the right write
+      ;; path gets taken.
+      ((and (consp rhs)
+            (or (eq (first rhs) :func)
+                (eq (first rhs) :probe-name)))
+       (setf (minfo-kind info) :scalar
+             (minfo-value-string-p info) t
+             (minfo-value-size info)
+             (max (minfo-value-size info)
+                  +bt-func-name-key-len+)))
+      ;; `@m[k] = comm' — store the current task's TASK_COMM_LEN-byte
+      ;; name. Same string-slot machinery as the :str case.
+      ((and (consp rhs) (eq (first rhs) :comm))
+       (setf (minfo-kind info) :scalar
+             (minfo-value-string-p info) t
+             (minfo-value-size info)
+             (max (minfo-value-size info) +bt-comm-len+)))
+      ;; `@m[k] = ntop(…)' — 17-byte family+address slot. The
+      ;; value-ntop-p flag drives a special read path that surfaces in
+      ;; printf as :ipv-any.
+      ((and (consp rhs) (eq (first rhs) :call)
+            (stringp (getf (cdr rhs) :name))
+            (string= (getf (cdr rhs) :name) "ntop"))
+       (setf (minfo-kind info) :scalar
+             (minfo-value-ntop-p info) t
+             (minfo-value-size info)
+             (max (minfo-value-size info)
+                  +bt-ntop-slot-size+)))
+      ;; `@m[k] = str(ptr)' / `kstr(ptr)' — probe-read a
+      ;; NUL-terminated string into the value slot. Size from the
+      ;; optional second arg, else default len.
+      ((and (consp rhs) (eq (first rhs) :call)
+            (or (str-call-p rhs) (kstr-call-p rhs)))
+       (setf (minfo-kind info) :scalar
+             (minfo-value-string-p info) t
+             (minfo-value-size info)
+             (max (minfo-value-size info)
+                  (str-key-size rhs))))
+      ((and (consp rhs) (eq (first rhs) :call))
+       (infer-note-aggregation info rhs))
+      (t (when (eq (minfo-kind info) :counter)
+           (setf (minfo-kind info) :scalar))))))
+
+(defun infer-note-len-target (e)
+  "Walk E for any `len(@m)' call; flag every map argument so a
+   `__len_NAME' sidecar counter map gets emitted."
+  (cond
+    ((not (consp e)) nil)
+    ((and (eq (first e) :call)
+          (string= (getf (cdr e) :name) "len")
+          (let ((arg (first (getf (cdr e) :args))))
+            (and (consp arg) (eq (first arg) :map))))
+     (setf (minfo-needs-len-counter-p
+            (infer-ensure-minfo (first (getf (cdr e) :args))))
+           t))
+    (t (some #'infer-note-len-target e))))
+
+(defun infer-scan-stmt (stmt)
+  "Walk one statement, recording map shape facts for every reference."
+  (infer-note-len-target stmt)
+  (case (first stmt)
+    (:assign
+     (let ((lhs (getf (cdr stmt) :lhs))
+           (rhs (getf (cdr stmt) :rhs)))
+       (when (eq (first lhs) :map)
+         (infer-note-keys lhs)
+         (infer-note-rhs lhs rhs))))
+    (:incdec
+     (let ((lhs (getf (cdr stmt) :lhs)))
+       (when (eq (first lhs) :map)
+         (infer-note-keys lhs)
+         (setf (minfo-kind (infer-ensure-minfo lhs)) :counter))))
+    (:expr
+     (let ((e (second stmt)))
+       (when (and (consp e) (eq (first e) :call)
+                  (member (getf (cdr e) :name)
+                          '("delete" "clear" "zero")
+                          :test #'string=))
+         (let* ((args (getf (cdr e) :args))
+                (mref (first args)))
+           (when (and (consp mref) (eq (first mref) :map))
+             (cond
+               ((and (string= (getf (cdr e) :name) "delete")
+                     (>= (length args) 2))
+                (infer-note-keys
+                 (list :map :name (getf (cdr mref) :name)
+                       :keys (rest args))))
+               (t (infer-note-keys mref))))))))
+    ;; Recurse into compound statements so map references nested under
+    ;; if/while/for still get inferred.
+    (:if
+     (mapc #'infer-scan-stmt (getf (cdr stmt) :then))
+     (mapc #'infer-scan-stmt (getf (cdr stmt) :else)))
+    (:while
+     (mapc #'infer-scan-stmt (getf (cdr stmt) :body)))
+    (:for
+     (mapc #'infer-scan-stmt (getf (cdr stmt) :body)))
+    (:for-each
+     ;; Mark the iterated map so gen-defmap emits sidecars and so
+     ;; every `@m[k] = …' insert is hooked to push k onto the key
+     ;; array.
+     (let ((mref (getf (cdr stmt) :over)))
+       (when (and (consp mref) (eq (first mref) :map))
+         (setf (minfo-iterated-p (infer-ensure-minfo mref)) t)
+         (infer-note-keys mref)))
+     (mapc #'infer-scan-stmt (getf (cdr stmt) :body)))))
+
+(defun infer-size-hist-maps (table)
+  "Histogram maps: the bucket index is always a u32 slot.
+     * Non-keyed (`@m = hist(x)') uses a percpu-array keyed by bucket
+       only — key-size = 4, max-entries = 64 (log2) or N+2 (lhist).
+     * Keyed (`@m[k] = hist(x)') uses a percpu-hash whose key is the
+       user-key bytes followed by a u32 bucket — that's the
+       user-key-size we already computed + 4. max-entries scales to
+       fit many user-keys; we pick a generous default."
+  (loop for info being the hash-values of table
+        when (or (eq (minfo-kind info) :hist)
+                 (eq (minfo-kind info) :lhist))
+          do (let ((bucket-count
+                     (if (eq (minfo-kind info) :hist)
+                         64
+                         (let* ((params (minfo-hist-params info)))
+                           (+ 2 (max 1 (floor (- (second params)
+                                                 (first params))
+                                              (third params))))))))
+               (cond
+                 ((minfo-keyed-p info)
+                  ;; Compound key = user-key bytes + u32 bucket.
+                  ;; max-entries is bucket-count × an arbitrary
+                  ;; user-key cap (1024 distinct keys).
+                  (setf (minfo-key-size info)
+                        (+ (minfo-key-size info) 4)
+                        (minfo-max-entries info)
+                        (* bucket-count 1024)))
+                 (t
+                  (setf (minfo-key-size info) 4
+                        (minfo-max-entries info) bucket-count))))))
 
 (defun infer-maps (script)
   "Return a hash table RAW-NAME (or \"@\") → MINFO."
   (let* ((table (make-hash-table :test 'equal))
-         ;; Bind *map-table* during the walk so helpers called from
-         ;; note-keys (composite-key-layout in particular) can look up
-         ;; previously-seen maps to derive cross-map shape — e.g. the
-         ;; key-size of `@x[@a]' is exactly @a's value-size.
          (*map-table* table))
-    (labels ((ensure (mref)
-               (let* ((raw (getf (cdr mref) :name))
-                      (key (or raw "@")))
-                 (or (gethash key table)
-                     (setf (gethash key table)
-                           (make-minfo :name (w-sym (or raw "at"))
-                                       :raw-name raw
-                                       :kind :counter
-                                       :key-size 0
-                                       :value-size 8
-                                       :max-entries
-                                       (script-max-map-keys 1024))))))
-             (note-keys (mref)
-               (let ((info (ensure mref))
-                     (keys (getf (cdr mref) :keys)))
-                 (when keys
-                   (setf (minfo-keyed-p info) t)
-                   ;; A single scalar key follows with-key's scalar
-                   ;; path — the lowering stores it at its natural
-                   ;; width via map-update (`expr-size'). Composite
-                   ;; or string-typed keys (comm/str/kstr) go through
-                   ;; the struct-key path where every slot is u64
-                   ;; (or a wider byte buffer), so use the layout total.
-                   (let ((total
-                           (if (and (= (length keys) 1)
-                                    (not (keys-need-ptr-ops-p keys)))
-                               (expr-size (first keys))
-                               (multiple-value-bind (_layout total)
-                                   (composite-key-layout keys)
-                                 (declare (ignore _layout))
-                                 total))))
-                     (setf (minfo-key-size info)
-                           (max (minfo-key-size info) total)))
-                   ;; Single-key: store the hint so the printer renders
-                   ;; comm as ASCII, pid as bare decimal, etc.
-                   (when (and (null (minfo-key-builtin info))
-                              (= (length keys) 1))
-                     (setf (minfo-key-builtin info) (key-hint (first keys))))
-                   ;; Single-key that's an in-script-struct array
-                   ;; field: record the array shape so the printer
-                   ;; can render the key as `[v1,v2,…]'.
-                   (when (= (length keys) 1)
-                     (multiple-value-bind (_b sz _o len dims)
-                         (array-field-meta (first keys))
-                       (declare (ignore _b _o))
-                       (when (and sz len)
-                         (setf (minfo-key-array-elt-size info) sz
-                               (minfo-key-array-len info) len
-                               (minfo-key-array-dims info) (or dims (list len))))))
-                   ;; Single-key that's `@other-map' — the lookup
-                   ;; returns whatever the other map stored. If that
-                   ;; was an in-script array (e.g.
-                   ;; `@a = ((struct A *)e).x; @x[@a] = …'), the key
-                   ;; here IS those bytes — sized and rendered the
-                   ;; same way.
-                   (when (and (= (length keys) 1)
-                              (consp (first keys))
-                              (eq (first (first keys)) :map))
-                     (let* ((src-raw (getf (cdr (first keys)) :name))
-                            (src-info (gethash (or src-raw "@") table)))
-                       (when (and src-info
-                                  (minfo-value-array-p src-info)
-                                  (minfo-value-array-elt-size src-info)
-                                  (plusp (minfo-value-array-elt-size src-info)))
-                         (let* ((sz (minfo-value-array-elt-size src-info))
-                                (vs (minfo-value-size src-info))
-                                (len (floor vs sz))
-                                (dims (or (minfo-value-array-dims src-info)
-                                          (list len))))
-                           (setf (minfo-key-array-elt-size info) sz
-                                 (minfo-key-array-len info) len
-                                 (minfo-key-array-dims info) dims
-                                 (minfo-key-size info)
-                                 (max (minfo-key-size info) vs))))))
-                   ;; Single-key strftime(): `@[strftime("FMT", TS)] = …'
-                   ;; — register the format and stash the id on the
-                   ;; map so the userspace key formatter strftime's
-                   ;; the u64 ts at print time.
-                   (when (and (= (length keys) 1)
-                              (consp (first keys))
-                              (eq (first (first keys)) :call)
-                              (string= (getf (cdr (first keys)) :name)
-                                       "strftime"))
-                     (let* ((fmt-arg (first (getf (cdr (first keys)) :args)))
-                            (fmt    (and (consp fmt-arg)
-                                         (eq (first fmt-arg) :str)
-                                         (second fmt-arg))))
-                       (when fmt
-                         (let ((id (1+ (length *time-format-table*))))
-                           (push (cons id fmt) *time-format-table*)
-                           (setf (minfo-key-strftime-id info) id)))))
-                   ;; Composite: track per-slot hints so the printer
-                   ;; can dispatch on individual slots.
-                   (when (and (null (minfo-key-types info))
-                              (> (length keys) 1))
-                     (setf (minfo-key-types info)
-                           (mapcar #'key-hint keys)))
-                   ;; Record per-slot bpftrace surface types from the
-                   ;; first determinable-shape access — `has_key' uses
-                   ;; this to diagnose argument-type mismatches against
-                   ;; the declared key shape.
-                   (when (null (minfo-key-bt-types info))
-                     (let ((tys (mapcar #'bt-key-arg-type-string keys)))
-                       (when (every #'identity tys)
-                         (setf (minfo-key-bt-types info) tys)))))))
-             (note-rhs (mref rhs)
-               (let ((info (ensure mref)))
-                 ;; `@m = ~X' produces an unsigned value (bpftrace's
-                 ;; bitwise NOT is the only common unary that flips
-                 ;; the result to uint64). Mark so the userspace
-                 ;; printer renders as u64 instead of int64 — e.g.
-                 ;; `@x = ~10' → 18446744073709551605, not -11.
-                 (when (and (consp rhs) (eq (first rhs) :un)
-                            (eq (getf (cdr rhs) :op) :~))
-                   (setf (minfo-value-unsigned-p info) t))
-                 (cond
-                   ;; `@m[k] = (struct X *)expr' — remember the value
-                   ;; type so a later `\$v = @m[k]' can flow X into
-                   ;; *var-types* for chained field access.
-                   ((and (consp rhs) (eq (first rhs) :cast))
-                    (setf (minfo-value-struct info)
-                          (getf (cdr rhs) :type)))
-                   ;; `@m[k] = (T *)expr' — value is a typed pointer.
-                   ;; Stash sizeof(T) on the minfo so later
-                   ;; `@m[k][i]' reads emit a sized probe-read.
-                   ((and (consp rhs) (eq (first rhs) :prim-ptr-cast))
-                    (let ((sz (prim-ptr-elt-size (getf (cdr rhs) :elt-type))))
-                      (when sz
-                        (setf (minfo-value-ptr-elt-size info) sz))))
-                   ;; `@m[k] = args.FIELD' where the tracepoint format
-                   ;; declares FIELD as `struct X *' — propagate X
-                   ;; into value-struct so `$v = @m[k]; $v.field' works
-                   ;; without the user writing an explicit cast.
-                   ;; naptime.bt's `@rqtp[tid] = args.rqtp; $t.tv_sec'
-                   ;; idiom relies on this.
-                   ((and (consp rhs) (eq (first rhs) :field)
-                         (consp (getf (cdr rhs) :base))
-                         (eq (first (getf (cdr rhs) :base)) :args))
-                    (let ((sname (tp-field-struct-pointer
-                                  (getf (cdr rhs) :name))))
-                      (when (and sname (null (minfo-value-struct info)))
-                        (setf (minfo-value-struct info) sname))))
-                   ;; `@m = args' / `@m[k] = args' — value is the raw
-                   ;; concatenated param bytes (fentry/fexit: param-
-                   ;; count × 8). Treat as a wide-byte value: track
-                   ;; the size, mark needs-ptr-ops via wide value-size.
-                   ;; `@m = strftime("FMT", TS)' — store the bare u64
-                   ;; timestamp; userspace strftime's it via FMT-ID
-                   ;; at decode time.
-                   ((and (consp rhs) (eq (first rhs) :call)
-                         (string= (getf (cdr rhs) :name) "strftime")
-                         (let ((fmt-arg (first (getf (cdr rhs) :args))))
-                           (and (consp fmt-arg) (eq (first fmt-arg) :str))))
-                    (let* ((fmt (second (first (getf (cdr rhs) :args))))
-                           (id  (1+ (length *time-format-table*))))
-                      (push (cons id fmt) *time-format-table*)
-                      (setf (minfo-kind info) :scalar
-                            (minfo-value-strftime-id info) id
-                            (minfo-value-size info)
-                            (max (minfo-value-size info) 8))))
-                   ;; `@m = (a, b, …)' — tuple value. Use the same
-                   ;; per-component layout as composite-key-layout
-                   ;; (each component takes a u64 slot or a wider
-                   ;; string slot). Total bytes sized via the layout.
-                   ((and (consp rhs) (eq (first rhs) :tuple))
-                    (let* ((items  (getf (cdr rhs) :items)))
-                      (multiple-value-bind (_layout total)
-                          (composite-key-layout items)
-                        (declare (ignore _layout))
-                        (setf (minfo-kind info) :scalar
-                              (minfo-value-tuple-p info) t
-                              (minfo-value-tuple-types info)
-                              (mapcar #'key-hint items)
-                              (minfo-value-size info)
-                              (max (minfo-value-size info) total)))))
-                   ((and (consp rhs) (eq (first rhs) :args)
-                         (bare-args-byte-width))
-                    (let ((w (bare-args-byte-width)))
-                      (setf (minfo-kind info) :scalar
-                            (minfo-value-array-p info) t
-                            (minfo-value-array-elt-size info) 1
-                            (minfo-value-size info)
-                            (max (minfo-value-size info) w))))
-                   ;; `@m[k] = (struct X *)e.arrfield' — array-field
-                   ;; flow. Map's value-size becomes total array bytes,
-                   ;; mark value-array-p so lower-map-assign dispatches
-                   ;; to the probe-read-into-buffer path.
-                   ((and (consp rhs) (eq (first rhs) :field)
-                         (multiple-value-bind (_b sz _o len)
-                             (array-field-meta rhs)
-                           (declare (ignore _b _o))
-                           (and sz len)))
-                    (multiple-value-bind (_b sz _o len dims)
-                        (array-field-meta rhs)
-                      (declare (ignore _b _o))
-                      (setf (minfo-kind info) :scalar
-                            (minfo-value-array-p info) t
-                            (minfo-value-array-elt-size info) sz
-                            (minfo-value-array-dims info) (or dims (list len))
-                            (minfo-value-size info)
-                            (max (minfo-value-size info) (* sz len)))))
-                   ;; `@m[k] = :str LITERAL' — direct string literal
-                   ;; RHS. Size to hold the literal plus a NUL byte.
-                   ((and (consp rhs) (eq (first rhs) :str))
-                    (let* ((bytes (sb-ext:string-to-octets
-                                   (second rhs) :external-format :utf-8))
-                           (need (1+ (length bytes))))
-                      (setf (minfo-kind info) :scalar
-                            (minfo-value-string-p info) t
-                            (minfo-value-size info)
-                            (max (minfo-value-size info) need
-                                 +bt-func-name-key-len+))))
-                   ;; `@m[k] = func' / `= probe' — rewrite-self-refs
-                   ;; will turn these into :str at lower time, but
-                   ;; infer-maps runs first and needs to mark the
-                   ;; value slot as a string so the right write path
-                   ;; gets taken.
-                   ((and (consp rhs)
-                         (or (eq (first rhs) :func)
-                             (eq (first rhs) :probe-name)))
-                    (setf (minfo-kind info) :scalar
-                          (minfo-value-string-p info) t
-                          (minfo-value-size info)
-                          (max (minfo-value-size info)
-                               +bt-func-name-key-len+)))
-                   ;; `@m[k] = comm' — store the current task's
-                   ;; TASK_COMM_LEN-byte name. Same string-slot
-                   ;; machinery as the :str case.
-                   ((and (consp rhs) (eq (first rhs) :comm))
-                    (setf (minfo-kind info) :scalar
-                          (minfo-value-string-p info) t
-                          (minfo-value-size info)
-                          (max (minfo-value-size info) +bt-comm-len+)))
-                   ;; `@m[k] = ntop(…)' — 17-byte family+address slot.
-                   ;; The value-ntop-p flag drives a special read path
-                   ;; that surfaces in printf as :ipv-any.
-                   ((and (consp rhs) (eq (first rhs) :call)
-                         (stringp (getf (cdr rhs) :name))
-                         (string= (getf (cdr rhs) :name) "ntop"))
-                    (setf (minfo-kind info) :scalar
-                          (minfo-value-ntop-p info) t
-                          (minfo-value-size info)
-                          (max (minfo-value-size info)
-                               +bt-ntop-slot-size+)))
-                   ;; `@m[k] = str(ptr)' / `kstr(ptr)' — probe-read a
-                   ;; NUL-terminated string into the value slot. Size
-                   ;; from the optional second arg, else default len.
-                   ((and (consp rhs) (eq (first rhs) :call)
-                         (or (str-call-p rhs) (kstr-call-p rhs)))
-                    (setf (minfo-kind info) :scalar
-                          (minfo-value-string-p info) t
-                          (minfo-value-size info)
-                          (max (minfo-value-size info)
-                               (str-key-size rhs))))
-                   ((and (consp rhs) (eq (first rhs) :call))
-                    (let ((fn (getf (cdr rhs) :name)))
-                      (cond
-                        ((string= fn "count")
-                         (setf (minfo-kind info) :counter))
-                        ((string= fn "hist")
-                         ;; Don't touch key-size / max-entries — the
-                         ;; later hist-sizing loop overwrites them
-                         ;; once it knows whether the map is keyed.
-                         (setf (minfo-kind info) :hist))
-                        ((string= fn "lhist")
-                         (let* ((args (getf (cdr rhs) :args))
-                                (literal (lambda (n)
-                                           (let ((a (nth n args)))
-                                             (cond
-                                               ((and a (eq (first a) :int)) (second a))
-                                               (t (unsupported
-                                                   "lhist() requires literal min/max/step (got ~S)" a)))))))
-                           (setf (minfo-kind info) :lhist
-                                 (minfo-hist-params info)
-                                 (list (funcall literal 1)
-                                       (funcall literal 2)
-                                       (funcall literal 3)))))
-                        ((string= fn "sum")
-                         (setf (minfo-kind info) :sum))
-                        ((string= fn "min")
-                         (setf (minfo-kind info) :min
-                               (minfo-value-size info) 16))
-                        ((string= fn "max")
-                         (setf (minfo-kind info) :max
-                               (minfo-value-size info) 16))
-                        ((string= fn "avg")
-                         (setf (minfo-kind info) :avg
-                               (minfo-value-size info) 16))
-                        ((string= fn "stats")
-                         (setf (minfo-kind info) :stats
-                               (minfo-value-size info) 16)))))
-                   (t (when (eq (minfo-kind info) :counter)
-                        (setf (minfo-kind info) :scalar)))))))
-      (labels
-          ((note-len-target (e)
-             ;; Walk E for any `len(@m)' call; flag every map argument
-             ;; so a `__len_NAME' sidecar counter map gets emitted.
-             (cond
-               ((not (consp e)) nil)
-               ((and (eq (first e) :call)
-                     (string= (getf (cdr e) :name) "len")
-                     (let ((arg (first (getf (cdr e) :args))))
-                       (and (consp arg) (eq (first arg) :map))))
-                (setf (minfo-needs-len-counter-p
-                       (ensure (first (getf (cdr e) :args))))
-                      t))
-               (t (some #'note-len-target e))))
-           (scan-stmt (stmt)
-             (note-len-target stmt)
-             (case (first stmt)
-               (:assign
-                (let ((lhs (getf (cdr stmt) :lhs))
-                      (rhs (getf (cdr stmt) :rhs)))
-                  (when (eq (first lhs) :map)
-                    (note-keys lhs)
-                    (note-rhs lhs rhs))))
-               (:incdec
-                (let ((lhs (getf (cdr stmt) :lhs)))
-                  (when (eq (first lhs) :map)
-                    (note-keys lhs)
-                    (setf (minfo-kind (ensure lhs)) :counter))))
-               (:expr
-                (let ((e (second stmt)))
-                  (when (and (consp e) (eq (first e) :call)
-                             (member (getf (cdr e) :name)
-                                     '("delete" "clear" "zero")
-                                     :test #'string=))
-                    (let* ((args (getf (cdr e) :args))
-                           (mref (first args)))
-                      (when (and (consp mref) (eq (first mref) :map))
-                        (cond
-                          ((and (string= (getf (cdr e) :name) "delete")
-                                (>= (length args) 2))
-                           (note-keys
-                            (list :map :name (getf (cdr mref) :name)
-                                  :keys (rest args))))
-                          (t (note-keys mref))))))))
-               ;; Recurse into compound statements so map references
-               ;; nested under if/while/for still get inferred.
-               (:if
-                (mapc #'scan-stmt (getf (cdr stmt) :then))
-                (mapc #'scan-stmt (getf (cdr stmt) :else)))
-               (:while
-                (mapc #'scan-stmt (getf (cdr stmt) :body)))
-               (:for
-                (mapc #'scan-stmt (getf (cdr stmt) :body)))
-               (:for-each
-                ;; Mark the iterated map so gen-defmap emits sidecars
-                ;; and so every `@m[k] = …' insert is hooked to push k
-                ;; onto the key array.
-                (let ((mref (getf (cdr stmt) :over)))
-                  (when (and (consp mref) (eq (first mref) :map))
-                    (setf (minfo-iterated-p (ensure mref)) t)
-                    (note-keys mref)))
-                (mapc #'scan-stmt (getf (cdr stmt) :body))))))
-        (dolist (probe (script-probes script))
-          (let* ((body (getf (cdr probe) :body))
-                 (pred (getf (cdr probe) :predicate))
-                 ;; The probe's first spec determines the args layout
-                 ;; for any `args' use inside the body. Bind it as a
-                 ;; dynvar so note-rhs / note-keys can size `@m = args'
-                 ;; or `@m[args]' from BTF without re-reaching into the
-                 ;; probe shape themselves.
-                 (*probe-spec* (first (getf (cdr probe) :specs))))
-            (when pred (when (eq (first pred) :map) (note-keys pred)))
-            (mapc #'scan-stmt body)))
-        ;; Also walk macro/fn bodies so map references inside
-        ;; them (e.g. `@paths[k] = str(p)' in opensnoop's getcwd
-        ;; macro) tag the value slot — the macro inliner runs at
-        ;; lower time, after this pass.
-        (dolist (defn (script-functions script))
-          (mapc #'scan-stmt (getf (cdr defn) :body))))
-      ;; Histogram maps: the bucket index is always a u32 slot.
-      ;;   * Non-keyed (`@m = hist(x)') uses a percpu-array keyed by
-      ;;     bucket only — key-size = 4, max-entries = 64 (log2) or
-      ;;     N+2 (lhist).
-      ;;   * Keyed (`@m[k] = hist(x)') uses a percpu-hash whose key
-      ;;     is the user-key bytes followed by a u32 bucket — that's
-      ;;     the user-key-size we already computed + 4. max-entries
-      ;;     scales to fit many user-keys; we pick a generous default.
-      (loop for info being the hash-values of table
-            when (or (eq (minfo-kind info) :hist)
-                     (eq (minfo-kind info) :lhist))
-              do (let ((bucket-count
-                         (if (eq (minfo-kind info) :hist)
-                             64
-                             (let* ((params (minfo-hist-params info)))
-                               (+ 2 (max 1 (floor (- (second params)
-                                                     (first params))
-                                                  (third params))))))))
-                   (cond
-                     ((minfo-keyed-p info)
-                      ;; Compound key = user-key bytes + u32 bucket.
-                      ;; max-entries is bucket-count × an arbitrary
-                      ;; user-key cap (1024 distinct keys).
-                      (setf (minfo-key-size info)
-                            (+ (minfo-key-size info) 4)
-                            (minfo-max-entries info)
-                            (* bucket-count 1024)))
-                     (t
-                      (setf (minfo-key-size info) 4
-                            (minfo-max-entries info) bucket-count)))))
-      table)))
+    (dolist (probe (script-probes script))
+      (let* ((body (getf (cdr probe) :body))
+             (pred (getf (cdr probe) :predicate))
+             ;; The probe's first spec determines the args layout for
+             ;; any `args' use inside the body. Bind it as a dynvar so
+             ;; infer-note-rhs / infer-note-keys can size `@m = args'
+             ;; or `@m[args]' from BTF without re-reaching into the
+             ;; probe shape themselves.
+             (*probe-spec* (first (getf (cdr probe) :specs))))
+        (when pred (when (eq (first pred) :map) (infer-note-keys pred)))
+        (mapc #'infer-scan-stmt body)))
+    ;; Also walk macro/fn bodies so map references inside them (e.g.
+    ;; `@paths[k] = str(p)' in opensnoop's getcwd macro) tag the value
+    ;; slot — the macro inliner runs at lower time, after this pass.
+    (dolist (defn (script-functions script))
+      (mapc #'infer-scan-stmt (getf (cdr defn) :body)))
+    (infer-size-hist-maps table)
+    table))
 
 ;;; ========== Defmap forms ==========
 
