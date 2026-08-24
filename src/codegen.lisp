@@ -397,26 +397,3 @@
       (format out "~%")))
   (format t "~&Generated Python   → ~a~%" output-path))
 
-;;; ========== Top-level API ==========
-
-(defun generate-headers (output-base)
-  "Generate shared headers for C, Go, Rust, and Common Lisp.
-   Produces OUTPUT-BASE.h, OUTPUT-BASE_types.go, OUTPUT-BASE_types.rs,
-   OUTPUT-BASE_types.lisp."
-  (generate-c-header (format nil "~a.h" output-base))
-  (generate-go-header (format nil "~a_types.go" output-base))
-  (generate-rust-header (format nil "~a_types.rs" output-base))
-  (generate-cl-header (format nil "~a_types.lisp" output-base))
-  (generate-python-header (format nil "~a_types.py" output-base)))
-
-(defun compile-and-generate (input-path output-base)
-  "Compile a Whistler program and generate .bpf.o + shared headers.
-   Produces OUTPUT-BASE.bpf.o, OUTPUT-BASE.h, OUTPUT-BASE_types.go,
-   OUTPUT-BASE_types.rs."
-  (let ((*maps* '())
-        (*programs* '())
-        (*struct-defs* (make-hash-table :test 'equal)))
-    (load input-path)
-    (let ((*user-constants* (collect-user-constants-from-file input-path)))
-      (compile-to-elf (format nil "~a.bpf.o" output-base))
-      (generate-headers output-base))))
