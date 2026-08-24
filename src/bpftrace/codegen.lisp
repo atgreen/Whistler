@@ -4440,86 +4440,94 @@
         ((multi-dim-var-subscript-p expr)
          (lower-multi-dim-var-subscript expr))
         ;; `$a.field[i]' or `(struct X *)e.field[i]' — element access
-        ;; on an array field of an in-script struct. The struct
-        ;; pointer + field offset + i * sizeof(elt) gives the address;
-        ;; probe-read sizeof(elt) bytes there.
+        ;; on an array field of an in-script struct.
         ((and (consp base) (eq (first base) :field)
               (array-field-lookup base))
-         (multiple-value-bind (ptr-form elt-size field-off arr-len)
-             (array-field-lookup base)
-           (cond
-             ;; Literal index — compile-time bounds check; out-of-range
-             ;; is a hard error. Zero-length arrays (`T x[0]', C99
-             ;; flex-array tail) skip the check: bpftrace treats them
-             ;; as unbounded since the real size is data-driven.
-             ((and (consp idx) (eq (first idx) :int))
-              (let ((i (second idx)))
-                (when (and (plusp arr-len)
-                           (or (minusp i) (>= i arr-len)))
-                  (unsupported
-                   "ERROR: the index ~D is out of bounds for array of size ~D"
-                   i arr-len)))
-              (lower-ptr-index `(whistler::+ ,ptr-form ,field-off)
-                               (lower-expr idx) elt-size))
-             ;; Runtime index — emit a guard that warnf's once if
-             ;; (idx >= arr-len) before doing the read. bpftrace prints
-             ;; "<location>: WARNING: Array access out of bounds. This
-             ;; can lead to unexpected results.". The runtime test
-             ;; regex `.* WARNING: …' wants a non-newline char + space
-             ;; before WARNING, so we synthesise a `stdin:1:1: '
-             ;; placeholder. We bake the full prefix into the format
-             ;; string and route through :stderr (raw) so the runtime
-             ;; doesn't add a second "WARNING: ". Zero-length arrays
-             ;; (C99 flex tails) skip the guard — the real bound is
-             ;; data-driven and can't be checked statically.
-             ((zerop arr-len)
-              (lower-ptr-index `(whistler::+ ,ptr-form ,field-off)
-                               (lower-expr idx) elt-size))
-             (t
-              (let ((idx-tmp (gensym "IDX")))
-                `(whistler::let* ((,idx-tmp ,(lower-expr idx)))
-                   (whistler::when (whistler::>= ,idx-tmp ,arr-len)
-                     ,(lower-printf
-                       (list (list :str
-                                   (concatenate 'string
-                                                "stdin:1:1: WARNING: "
-                                                "Array access out of bounds. "
-                                                "This can lead to unexpected results."
-                                                (string #\Newline))))
-                       :stream :stderr :fn-name "warnf"))
-                   ,(lower-ptr-index
-                     `(whistler::+ ,ptr-form ,field-off)
-                     idx-tmp elt-size)))))))
+         (lower-array-field-index base idx))
         ;; `((int8[N])X)[i]' — reinterpret X as a little-endian byte
-        ;; array and read the i'th element. Implements bpftrace's
-        ;; `(int8[N])X[i]' shape: store X into a struct-alloc slot
-        ;; sized to N×sizeof(elt), then load ELT-SIZE bytes at
-        ;; OFFSET = i × ELT-SIZE.
+        ;; array and read the i'th element.
         ((and (consp base) (eq (first base) :int-array-cast))
-         (let* ((elt-type (getf (cdr base) :elt-type))
-                (elt-size (or (cdr (assoc (string-downcase elt-type)
-                                          '(("int8" . 1) ("int16" . 2)
-                                            ("int32" . 4) ("int64" . 8)
-                                            ("uint8" . 1) ("uint16" . 2)
-                                            ("uint32" . 4) ("uint64" . 8)
-                                            ("int" . 4) ("uint" . 4))
-                                          :test #'string=))
-                              (unsupported "(int-array cast): unknown element type ~A"
-                                           elt-type)))
-                (len (or (getf (cdr base) :len) (/ 8 elt-size)))
-                (total (* elt-size len))
-                (buf (gensym "IBUF"))
-                (load-type (case elt-size
-                             (1 (intern "U8"  :whistler))
-                             (2 (intern "U16" :whistler))
-                             (4 (intern "U32" :whistler))
-                             (t (intern "U64" :whistler)))))
-           `(let ((,buf (whistler::struct-alloc ,total)))
-              (whistler::store whistler::u64 ,buf 0
-                               ,(lower-expr (getf (cdr base) :expr)))
-              (whistler::load ,load-type ,buf
-                              (whistler::* ,(lower-expr idx) ,elt-size)))))
+         (lower-int-array-cast-index base idx))
         (t (unsupported "array indexing outside @maps"))))))
+
+(defun lower-array-field-index (base idx)
+  "Element access on an array field of an in-script struct. The struct
+   pointer + field offset + i * sizeof(elt) gives the address;
+   probe-read sizeof(elt) bytes there."
+  (multiple-value-bind (ptr-form elt-size field-off arr-len)
+      (array-field-lookup base)
+    (cond
+      ;; Literal index — compile-time bounds check; out-of-range
+      ;; is a hard error. Zero-length arrays (`T x[0]', C99
+      ;; flex-array tail) skip the check: bpftrace treats them
+      ;; as unbounded since the real size is data-driven.
+      ((and (consp idx) (eq (first idx) :int))
+       (let ((i (second idx)))
+         (when (and (plusp arr-len)
+                    (or (minusp i) (>= i arr-len)))
+           (unsupported
+            "ERROR: the index ~D is out of bounds for array of size ~D"
+            i arr-len)))
+       (lower-ptr-index `(whistler::+ ,ptr-form ,field-off)
+                        (lower-expr idx) elt-size))
+      ;; Runtime index — emit a guard that warnf's once if
+      ;; (idx >= arr-len) before doing the read. bpftrace prints
+      ;; "<location>: WARNING: Array access out of bounds. This
+      ;; can lead to unexpected results.". The runtime test
+      ;; regex `.* WARNING: …' wants a non-newline char + space
+      ;; before WARNING, so we synthesise a `stdin:1:1: '
+      ;; placeholder. We bake the full prefix into the format
+      ;; string and route through :stderr (raw) so the runtime
+      ;; doesn't add a second "WARNING: ". Zero-length arrays
+      ;; (C99 flex tails) skip the guard — the real bound is
+      ;; data-driven and can't be checked statically.
+      ((zerop arr-len)
+       (lower-ptr-index `(whistler::+ ,ptr-form ,field-off)
+                        (lower-expr idx) elt-size))
+      (t
+       (let ((idx-tmp (gensym "IDX")))
+         `(whistler::let* ((,idx-tmp ,(lower-expr idx)))
+            (whistler::when (whistler::>= ,idx-tmp ,arr-len)
+              ,(lower-printf
+                (list (list :str
+                            (concatenate 'string
+                                         "stdin:1:1: WARNING: "
+                                         "Array access out of bounds. "
+                                         "This can lead to unexpected results."
+                                         (string #\Newline))))
+                :stream :stderr :fn-name "warnf"))
+            ,(lower-ptr-index
+              `(whistler::+ ,ptr-form ,field-off)
+              idx-tmp elt-size)))))))
+
+(defun lower-int-array-cast-index (base idx)
+  "`((int8[N])X)[i]' — reinterpret X as a little-endian byte array and
+   read the i'th element. Implements bpftrace's `(int8[N])X[i]' shape:
+   store X into a struct-alloc slot sized to N×sizeof(elt), then load
+   ELT-SIZE bytes at OFFSET = i × ELT-SIZE."
+  (let* ((elt-type (getf (cdr base) :elt-type))
+         (elt-size (or (cdr (assoc (string-downcase elt-type)
+                                   '(("int8" . 1) ("int16" . 2)
+                                     ("int32" . 4) ("int64" . 8)
+                                     ("uint8" . 1) ("uint16" . 2)
+                                     ("uint32" . 4) ("uint64" . 8)
+                                     ("int" . 4) ("uint" . 4))
+                                   :test #'string=))
+                       (unsupported "(int-array cast): unknown element type ~A"
+                                    elt-type)))
+         (len (or (getf (cdr base) :len) (/ 8 elt-size)))
+         (total (* elt-size len))
+         (buf (gensym "IBUF"))
+         (load-type (case elt-size
+                      (1 (intern "U8"  :whistler))
+                      (2 (intern "U16" :whistler))
+                      (4 (intern "U32" :whistler))
+                      (t (intern "U64" :whistler)))))
+    `(let ((,buf (whistler::struct-alloc ,total)))
+       (whistler::store whistler::u64 ,buf 0
+                        ,(lower-expr (getf (cdr base) :expr)))
+       (whistler::load ,load-type ,buf
+                       (whistler::* ,(lower-expr idx) ,elt-size)))))
 
 (defun array-field-dims (field-expr)
   "Return the parsed dim-list (e.g. (2 2) for `int y[2][2]') of an
@@ -7352,6 +7360,86 @@
     (some (lambda (probe) (walk (getf (cdr probe) :body)))
           (script-probes script))))
 
+(defun gen-len-counter-map-forms (map-table)
+  "For every @m that `len(@m)' touches, emit a single-entry
+   percpu-array sidecar named `__len_<map>'. The kernel-side
+   update/delete sites incf/decf this counter; len(@m) reads it."
+  (loop for info being the hash-values of map-table
+        when (minfo-needs-len-counter-p info)
+          collect `(whistler:defmap ,(len-counter-sym info)
+                     :type :percpu-array
+                     :key-size 4 :value-size 8
+                     :max-entries 1)))
+
+(defun gen-iter-map-forms (map-table)
+  "For every @m that `for $kv : @m { … }' iterates, emit a three-map
+   sidecar set: an array of keys, a 1-entry counter for the
+   next-insert index, and a hash for dedup. The key size matches the
+   user map's; the value of __bt_keys is 8 bytes for scalar keys (only
+   shape we support for now)."
+  (loop for info being the hash-values of map-table
+        when (minfo-iterated-p info)
+          ;; Restrict to scalar (≤8B) keys for now — composite /
+          ;; struct keys need pointer-arg map ops that this first cut
+          ;; doesn't wire up.
+          when (and (minfo-key-size info)
+                    (<= (minfo-key-size info) 8))
+            append (list
+                    `(whistler:defmap ,(iter-keys-sym info)
+                       :type :array
+                       :key-size 4
+                       :value-size 8
+                       :max-entries
+                       ,(or (minfo-max-entries info) 1024))
+                    `(whistler:defmap ,(iter-count-sym info)
+                       :type :array
+                       :key-size 4
+                       :value-size 4
+                       :max-entries 1)
+                    `(whistler:defmap ,(iter-seen-sym info)
+                       :type :hash
+                       :key-size 8
+                       :value-size 1
+                       :max-entries
+                       ,(or (minfo-max-entries info) 1024)))))
+
+(defun minfo-info-plist (raw info)
+  "One entry of generate's :info list — everything the userspace
+   decoder/printer needs to know about a map."
+  (list (or raw "@")
+        :name (minfo-name info)
+        :kind (minfo-kind info)
+        :key-builtin (minfo-key-builtin info)
+        :key-types (minfo-key-types info)
+        :key-size (minfo-key-size info)
+        :key-parts (if (> (minfo-key-size info) 8)
+                       (/ (minfo-key-size info) 8)
+                       1)
+        :key-array-elt-size (minfo-key-array-elt-size info)
+        :key-array-len (minfo-key-array-len info)
+        :key-array-dims (minfo-key-array-dims info)
+        :value-array-elt-size
+        (and (minfo-value-array-p info)
+             (minfo-value-array-elt-size info))
+        :value-array-len
+        (and (minfo-value-array-p info)
+             (minfo-value-array-elt-size info)
+             (plusp (minfo-value-array-elt-size info))
+             (/ (minfo-value-size info)
+                (minfo-value-array-elt-size info)))
+        :value-array-dims
+        (and (minfo-value-array-p info)
+             (minfo-value-array-dims info))
+        :keyed-p (minfo-keyed-p info)
+        :value-unsigned-p (minfo-value-unsigned-p info)
+        :value-tuple-p (minfo-value-tuple-p info)
+        :value-tuple-types (minfo-value-tuple-types info)
+        :value-strftime-id (minfo-value-strftime-id info)
+        :key-strftime-id (minfo-key-strftime-id info)
+        :value-size (minfo-value-size info)
+        :max-entries (minfo-max-entries info)
+        :hist-params (minfo-hist-params info)))
+
 (defun generate (script)
   "Translate normalised SCRIPT to a plist:
      :maps          (defmap forms)
@@ -7417,48 +7505,8 @@
            (when uses-exit
              `(whistler:defmap ,*exit-map-name*
                 :type :array :key-size 4 :value-size 4 :max-entries 1)))
-         ;; For every @m that `len(@m)' touches, emit a single-entry
-         ;; percpu-array sidecar named `__len_<map>'. The kernel-side
-         ;; update/delete sites incf/decf this counter; len(@m) reads
-         ;; it.
-         (len-counter-map-forms
-           (loop for info being the hash-values of map-table
-                 when (minfo-needs-len-counter-p info)
-                   collect `(whistler:defmap ,(len-counter-sym info)
-                              :type :percpu-array
-                              :key-size 4 :value-size 8
-                              :max-entries 1)))
-         ;; For every @m that `for $kv : @m { … }' iterates, emit a
-         ;; three-map sidecar set: an array of keys, a 1-entry counter
-         ;; for the next-insert index, and a hash for dedup. The key
-         ;; size matches the user map's; the value of __bt_keys is 8
-         ;; bytes for scalar keys (only shape we support for now).
-         (iter-map-forms
-           (loop for info being the hash-values of map-table
-                 when (minfo-iterated-p info)
-                   ;; Restrict to scalar (≤8B) keys for now — composite
-                   ;; / struct keys need pointer-arg map ops that this
-                   ;; first cut doesn't wire up.
-                   when (and (minfo-key-size info)
-                             (<= (minfo-key-size info) 8))
-                     append (list
-                             `(whistler:defmap ,(iter-keys-sym info)
-                                :type :array
-                                :key-size 4
-                                :value-size 8
-                                :max-entries
-                                ,(or (minfo-max-entries info) 1024))
-                             `(whistler:defmap ,(iter-count-sym info)
-                                :type :array
-                                :key-size 4
-                                :value-size 4
-                                :max-entries 1)
-                             `(whistler:defmap ,(iter-seen-sym info)
-                                :type :hash
-                                :key-size 8
-                                :value-size 1
-                                :max-entries
-                                ,(or (minfo-max-entries info) 1024)))))
+         (len-counter-map-forms (gen-len-counter-map-forms map-table))
+         (iter-map-forms        (gen-iter-map-forms map-table))
          (print-map-form
            (when uses-printf
              `(whistler:defmap ,*print-map-name*
@@ -7517,36 +7565,4 @@
           :map-id-table (reverse *map-id-table*)
           :info (loop for raw being the hash-keys of map-table
                       using (hash-value info)
-                      collect (list (or raw "@")
-                                    :name (minfo-name info)
-                                    :kind (minfo-kind info)
-                                    :key-builtin (minfo-key-builtin info)
-                                    :key-types (minfo-key-types info)
-                                    :key-size (minfo-key-size info)
-                                    :key-parts (if (> (minfo-key-size info) 8)
-                                                   (/ (minfo-key-size info) 8)
-                                                   1)
-                                    :key-array-elt-size (minfo-key-array-elt-size info)
-                                    :key-array-len (minfo-key-array-len info)
-                                    :key-array-dims (minfo-key-array-dims info)
-                                    :value-array-elt-size
-                                    (and (minfo-value-array-p info)
-                                         (minfo-value-array-elt-size info))
-                                    :value-array-len
-                                    (and (minfo-value-array-p info)
-                                         (minfo-value-array-elt-size info)
-                                         (plusp (minfo-value-array-elt-size info))
-                                         (/ (minfo-value-size info)
-                                            (minfo-value-array-elt-size info)))
-                                    :value-array-dims
-                                    (and (minfo-value-array-p info)
-                                         (minfo-value-array-dims info))
-                                    :keyed-p (minfo-keyed-p info)
-                                    :value-unsigned-p (minfo-value-unsigned-p info)
-                                    :value-tuple-p (minfo-value-tuple-p info)
-                                    :value-tuple-types (minfo-value-tuple-types info)
-                                    :value-strftime-id (minfo-value-strftime-id info)
-                                    :key-strftime-id (minfo-key-strftime-id info)
-                                    :value-size (minfo-value-size info)
-                                    :max-entries (minfo-max-entries info)
-                                    :hist-params (minfo-hist-params info)))))))
+                      collect (minfo-info-plist raw info))))))
