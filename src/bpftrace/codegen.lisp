@@ -1041,57 +1041,139 @@
   "1 byte family + 16 bytes address — covers both AF_INET and AF_INET6.")
 (defvar *map-table* nil)
 
+(defun lower-offsetof (expr)
+  "`offsetof(struct S, field)' — resolved from in-script struct decls
+   first, then vmlinux BTF."
+  (let* ((struct-name (getf (cdr expr) :struct))
+         (field-name  (getf (cdr expr) :field))
+         (user-entry  (assoc struct-name *script-struct-decls*
+                             :test #'string=)))
+    (cond
+      (user-entry
+       (let ((cell (find field-name (cddr user-entry)
+                         :test #'string= :key #'first)))
+         (unless cell
+           (unsupported "offsetof(struct ~A, ~A): no such field in in-script decl"
+                        struct-name field-name))
+         (third cell)))
+      (t
+       (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+              (tid (whistler:btf-find-struct vmbtf struct-name))
+              (fields (and tid (whistler:btf-struct-fields vmbtf tid)))
+              (cell (find field-name fields :test #'string= :key #'first)))
+         (unless cell
+           (unsupported "offsetof(struct ~A, ~A): no such field"
+                        struct-name field-name))
+         (third cell))))))
+
+(defun lower-sizeof (expr)
+  "`sizeof(struct S)' / `sizeof(TYPE)' — struct sizes from in-script
+   decls or vmlinux BTF, primitive sizes from a fixed table."
+  (let* ((name      (getf (cdr expr) :name))
+         (struct-p  (getf (cdr expr) :struct-p)))
+    (cond
+      (struct-p
+       (let ((user-entry (assoc name *script-struct-decls*
+                                :test #'string=)))
+         (cond
+           (user-entry (second user-entry))
+           (t (let* ((vmbtf (whistler:ensure-vmlinux-btf))
+                     (tid (whistler:btf-find-struct vmbtf name)))
+                (unless tid
+                  (unsupported "sizeof(struct ~A): not in vmlinux BTF" name))
+                (whistler:btf-struct-size vmbtf tid))))))
+      (t
+       (or (cdr (assoc (string-downcase name)
+                       '(("u8"  . 1) ("u16" . 2) ("u32" . 4) ("u64" . 8)
+                         ("int8" . 1) ("int16" . 2) ("int32" . 4)
+                         ("int64" . 8)
+                         ("int"   . 4) ("uint"   . 4)
+                         ("long"  . 8) ("ulong"  . 8)
+                         ("char"  . 1) ("uchar"  . 1)
+                         ("short" . 2) ("ushort" . 2))
+                       :test #'string=))
+           (unsupported "sizeof(~A): unrecognised primitive type" name))))))
+
+(defun lower-int-cast (expr)
+  "Plain `(int8)x' / `(uint32)x' integer cast. The IR is all u64, so
+   normally we just lower the inner expression — width-aware ops like
+   bswap peek at this node before reaching here. Special-cases
+   `(intN)((struct *)e).field' when FIELD is a byte-array of size ≤
+   sizeof(intN), and `(intN)pton(\"ip\")' where pton returns the
+   network-order bytes — both fold to a single integer load matching
+   the target width."
+  (let* ((target-type (getf (cdr expr) :type))
+         (target-size (cdr (assoc (string-downcase target-type)
+                                  '(("int8" . 1) ("int16" . 2)
+                                    ("int32" . 4) ("int64" . 8)
+                                    ("uint8" . 1) ("uint16" . 2)
+                                    ("uint32" . 4) ("uint64" . 8)
+                                    ("int" . 4) ("uint" . 4))
+                                  :test #'string=)))
+         (inner (getf (cdr expr) :expr)))
+    (cond
+      ;; (intN)((struct *)e).field where field is `T x[K]' and
+      ;; K * sizeof(T) ≤ N: probe-read the whole array bytes into
+      ;; a scratch slot and load as the target int width.
+      ((and target-size
+            (multiple-value-bind (b sz _o len) (array-field-meta inner)
+              (declare (ignore _o))
+              (and b sz len (<= (* sz len) target-size))))
+       (multiple-value-bind (base-ast sz off len) (array-field-meta inner)
+         (let* ((total (* sz len))
+                (load-type (case target-size
+                             (1 (intern "U8"  :whistler))
+                             (2 (intern "U16" :whistler))
+                             (4 (intern "U32" :whistler))
+                             (t (intern "U64" :whistler))))
+                (buf (gensym "IBUF")))
+           `(let ((,buf (whistler::struct-alloc ,total)))
+              (,(pick-probe-read-fn) ,buf ,total
+               (whistler::+ ,(lower-expr base-ast) ,off))
+              (whistler::load ,load-type ,buf 0)))))
+      ;; (intN) pton("LITERAL") — fold the IP bytes into a single
+      ;; little-endian-loaded integer matching the target width.
+      ((and target-size
+            (consp inner) (eq (first inner) :call)
+            (string= (getf (cdr inner) :name) "pton")
+            (let ((a (first (getf (cdr inner) :args))))
+              (and (consp a) (eq (first a) :str))))
+       (let* ((text (second (first (getf (cdr inner) :args))))
+              (v4 (parse-ipv4 text))
+              (v6 (unless v4 (parse-ipv6 text))))
+         (unless (or v4 v6)
+           (unsupported "pton(): could not parse ~S" text))
+         (let ((bytes (subseq (or v4 v6) 0
+                              (min target-size (length (or v4 v6))))))
+           ;; Compose little-endian-loaded integer (matches how the
+           ;; downstream load would see the bytes when stored at the
+           ;; pton() buffer's address-zero).
+           (loop for b in bytes
+                 for i from 0
+                 sum (ash b (* i 8))))))
+      (t (lower-expr inner)))))
+
+(defun lower-constant-ident (name)
+  "A bare identifier in expression position: a resolvable constant, a
+   zero-arg user macro/fn called bare (`sysname' means `sysname()'),
+   or the `usermode' builtin (1 in uprobe/uretprobe/USDT probes,
+   0 otherwise — resolved at compile time from the active probe spec)."
+  (or (resolve-constant name)
+      (and (find-user-function name)
+           (inline-user-call name nil))
+      (and (string= name "usermode")
+           (if (member (first *probe-spec*)
+                       '(:uprobe :uretprobe :usdt))
+               1 0))
+      (unsupported "unknown identifier `~A' — not in BTF enums or curated #define table"
+                   name)))
+
 (defun lower-expr (expr)
   (ecase (first expr)
     (:int        (second expr))
     (:str        (second expr))
-    (:offsetof
-     (let* ((struct-name (getf (cdr expr) :struct))
-            (field-name  (getf (cdr expr) :field))
-            (user-entry  (assoc struct-name *script-struct-decls*
-                                :test #'string=)))
-       (cond
-         (user-entry
-          (let ((cell (find field-name (cddr user-entry)
-                            :test #'string= :key #'first)))
-            (unless cell
-              (unsupported "offsetof(struct ~A, ~A): no such field in in-script decl"
-                           struct-name field-name))
-            (third cell)))
-         (t
-          (let* ((vmbtf (whistler:ensure-vmlinux-btf))
-                 (tid (whistler:btf-find-struct vmbtf struct-name))
-                 (fields (and tid (whistler:btf-struct-fields vmbtf tid)))
-                 (cell (find field-name fields :test #'string= :key #'first)))
-            (unless cell
-              (unsupported "offsetof(struct ~A, ~A): no such field"
-                           struct-name field-name))
-            (third cell))))))
-    (:sizeof
-     (let* ((name      (getf (cdr expr) :name))
-            (struct-p  (getf (cdr expr) :struct-p)))
-       (cond
-         (struct-p
-          (let ((user-entry (assoc name *script-struct-decls*
-                                   :test #'string=)))
-            (cond
-              (user-entry (second user-entry))
-              (t (let* ((vmbtf (whistler:ensure-vmlinux-btf))
-                        (tid (whistler:btf-find-struct vmbtf name)))
-                   (unless tid
-                     (unsupported "sizeof(struct ~A): not in vmlinux BTF" name))
-                   (whistler:btf-struct-size vmbtf tid))))))
-         (t
-          (or (cdr (assoc (string-downcase name)
-                          '(("u8"  . 1) ("u16" . 2) ("u32" . 4) ("u64" . 8)
-                            ("int8" . 1) ("int16" . 2) ("int32" . 4)
-                            ("int64" . 8)
-                            ("int"   . 4) ("uint"   . 4)
-                            ("long"  . 8) ("ulong"  . 8)
-                            ("char"  . 1) ("uchar"  . 1)
-                            ("short" . 2) ("ushort" . 2))
-                          :test #'string=))
-              (unsupported "sizeof(~A): unrecognised primitive type" name))))))
+    (:offsetof   (lower-offsetof expr))
+    (:sizeof     (lower-sizeof expr))
     (:var        (var-sym (second expr)))
     (:builtin
      ;; bpftrace allows a zero-arg `macro' to be referenced bare —
@@ -1113,64 +1195,8 @@
     ;; sites (lower-index); here the result is just the underlying
     ;; pointer value, which we hand back as a u64.
     (:prim-ptr-cast (lower-expr (getf (cdr expr) :expr)))
-    ;; Plain `(int8)x' / `(uint32)x' integer cast. The IR is all u64,
-    ;; so we just lower the inner expression. Width-aware ops like
-    ;; bswap peek at this node before reaching here. Also special-
-    ;; cases `(intN)((struct *)e).field' when FIELD is a byte-array
-    ;; of size ≤ sizeof(intN), and `(intN)pton("ip")' where pton
-    ;; returns the network-order bytes — both fold to a single
-    ;; integer load matching the target width.
-    (:int-cast
-     (let* ((target-type (getf (cdr expr) :type))
-            (target-size (cdr (assoc (string-downcase target-type)
-                                     '(("int8" . 1) ("int16" . 2)
-                                       ("int32" . 4) ("int64" . 8)
-                                       ("uint8" . 1) ("uint16" . 2)
-                                       ("uint32" . 4) ("uint64" . 8)
-                                       ("int" . 4) ("uint" . 4))
-                                     :test #'string=)))
-            (inner (getf (cdr expr) :expr)))
-       (cond
-         ;; (intN)((struct *)e).field where field is `T x[K]' and
-         ;; K * sizeof(T) ≤ N: probe-read the whole array bytes into
-         ;; a scratch slot and load as the target int width.
-         ((and target-size
-               (multiple-value-bind (b sz _o len) (array-field-meta inner)
-                 (declare (ignore _o))
-                 (and b sz len (<= (* sz len) target-size))))
-          (multiple-value-bind (base-ast sz off len) (array-field-meta inner)
-            (let* ((total (* sz len))
-                   (load-type (case target-size
-                                (1 (intern "U8"  :whistler))
-                                (2 (intern "U16" :whistler))
-                                (4 (intern "U32" :whistler))
-                                (t (intern "U64" :whistler))))
-                   (buf (gensym "IBUF")))
-              `(let ((,buf (whistler::struct-alloc ,total)))
-                 (,(pick-probe-read-fn) ,buf ,total
-                  (whistler::+ ,(lower-expr base-ast) ,off))
-                 (whistler::load ,load-type ,buf 0)))))
-         ;; (intN) pton("LITERAL") — fold the IP bytes into a single
-         ;; little-endian-loaded integer matching the target width.
-         ((and target-size
-               (consp inner) (eq (first inner) :call)
-               (string= (getf (cdr inner) :name) "pton")
-               (let ((a (first (getf (cdr inner) :args))))
-                 (and (consp a) (eq (first a) :str))))
-          (let* ((text (second (first (getf (cdr inner) :args))))
-                 (v4 (parse-ipv4 text))
-                 (v6 (unless v4 (parse-ipv6 text))))
-            (unless (or v4 v6)
-              (unsupported "pton(): could not parse ~S" text))
-            (let ((bytes (subseq (or v4 v6) 0
-                                 (min target-size (length (or v4 v6))))))
-              ;; Compose little-endian-loaded integer (matches how the
-              ;; downstream load would see the bytes when stored at the
-              ;; pton() buffer's address-zero).
-              (loop for b in bytes
-                    for i from 0
-                    sum (ash b (* i 8))))))
-         (t (lower-expr inner)))))
+    ;; Plain `(int8)x' / `(uint32)x' integer cast — see lower-int-cast.
+    (:int-cast   (lower-int-cast expr))
     ;; `(enum NAME)EXPR' — value cast. The printf-arg-type path
     ;; recognises the wrapper and emits an :enum slot; in a non-
     ;; printf position we just lower the underlying value.
@@ -1199,23 +1225,7 @@
        `(progn
           ,@(mapcar #'lower-stmt stmts)
           ,(lower-expr final))))
-    (:constant   (or (resolve-constant (second expr))
-                     ;; bpftrace allows zero-arg `macro' to be called
-                     ;; bare — `sysname' (no parens) means `sysname()'.
-                     ;; A bare lowercase ident that didn't resolve to
-                     ;; a constant may still be a registered macro.
-                     (and (find-user-function (second expr))
-                          (inline-user-call (second expr) nil))
-                     ;; `usermode' — bpftrace builtin returning 1 in
-                     ;; user-context probes (uprobe/uretprobe/USDT),
-                     ;; 0 otherwise. Resolved at compile time from the
-                     ;; active probe spec.
-                     (and (string= (second expr) "usermode")
-                          (if (member (first *probe-spec*)
-                                      '(:uprobe :uretprobe :usdt))
-                              1 0))
-                     (unsupported "unknown identifier `~A' — not in BTF enums or curated #define table"
-                                  (second expr))))
+    (:constant   (lower-constant-ident (second expr)))
     (:arg        (lower-arg (second expr)))
     (:retval     (lower-retval))
     (:comm       (unsupported "comm only usable as printf arg or @map[comm] key"))
