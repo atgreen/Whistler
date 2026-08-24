@@ -912,6 +912,115 @@
                ((:pid :tid) (unless pid-idx (setf pid-idx i)))))
     (when stack-idx (values stack-idx pid-idx user-p))))
 
+(defun scalar-map-pairs (info kind &key value-tuple-p value-tuple-types
+                                         top div)
+  "Collect a scalar map's entries as (KEY . VALUE) pairs, sorted
+   ascending by value. KIND controls value decoding. When TOP is
+   set, only the largest TOP entries are kept (we sorted ascending,
+   so trim from the front). When DIV is set, each value is scaled
+   by DIV before rendering — :stats values keep their tagged shape;
+   div only applies to plain integers. Matches bpftrace's
+   `print(@m, top, div)' contract."
+  (let* ((keys (map-keys info))
+         (pairs (sort (mapcar
+                       (lambda (k)
+                         (cons k (cond
+                                   ((and value-tuple-p value-tuple-types)
+                                    (lookup-tuple-value info k value-tuple-types))
+                                   (t (case kind
+                                        (:sum (reduce-sum info k))
+                                        (:avg (multiple-value-bind (c s)
+                                                  (reduce-avg info k)
+                                                (if (zerop c) 0 (floor s c))))
+                                        ;; stats() pre-computes a
+                                        ;; tagged sentinel that the
+                                        ;; line formatter pretty-prints
+                                        ;; in the caller.
+                                        (:stats (multiple-value-bind (c s)
+                                                    (reduce-avg info k)
+                                                  (list :stats c s)))
+                                        ((:min) (reduce-min/max info k :min))
+                                        ((:max) (reduce-min/max info k :max))
+                                        (t     (lookup-int info k)))))))
+                       keys)
+                      #'<
+                      :key (lambda (kv)
+                             (let ((v (cdr kv)))
+                               (if (and (consp v) (eq (car v) :stats))
+                                   (third v)  ; sort by total
+                                   v)))))
+         (pairs (if (and top (> (length pairs) top))
+                    (nthcdr (- (length pairs) top) pairs)
+                    pairs)))
+    (if div
+        (mapcar (lambda (kv)
+                  (let ((v (cdr kv)))
+                    (cons (car kv)
+                          (if (integerp v) (floor v div) v))))
+                pairs)
+        pairs)))
+
+(defun print-stack-map-entries (prefix pairs &key stack-idx pid-idx user-p
+                                                   stacks-info stack-depth
+                                                   symbolizer)
+  "Print PAIRS whose key carries a stack id. When STACK-IDX is set
+   the key is a composite and the stack id (plus the pid from
+   PID-IDX's slot, if any) is pulled out of it; otherwise the key
+   itself is the stack id."
+  (dolist (kv pairs)
+    (let* ((k (car kv))
+           (stack-id (if stack-idx (composite-slot k stack-idx) k))
+           (pid      (and pid-idx (composite-slot k pid-idx))))
+      (format t "~A[~%~A~%]: ~D~%"
+              prefix
+              (format-stack stack-id stacks-info
+                            (or stack-depth 32)
+                            :user-p user-p
+                            :pid pid
+                            :symbolizer symbolizer)
+              (cdr kv)))))
+
+(defun render-map-key (k &key key-strftime-id time-format-table
+                              key-parts key-builtin
+                              key-array-elt-size key-array-len
+                              key-array-dims key-types)
+  "Render a map key for text output: strftime-formatted when
+   KEY-STRFTIME-ID tags it as a time value, otherwise via
+   FORMAT-KEY."
+  (cond
+    (key-strftime-id
+     (strftime-light
+      (or (cdr (assoc key-strftime-id time-format-table
+                      :test #'=))
+          "?")
+      k))
+    (t (format-key k
+                   :parts key-parts
+                   :key-builtin key-builtin
+                   :array-elt-size key-array-elt-size
+                   :array-len key-array-len
+                   :array-dims key-array-dims
+                   :key-types key-types))))
+
+(defun render-map-value (v &key value-strftime-id time-format-table
+                                value-array-elt-size value-array-len
+                                value-array-dims value-unsigned-p)
+  "Render a map value for text output: strftime-formatted when
+   VALUE-STRFTIME-ID tags it as a time value, otherwise via
+   FORMAT-SCALAR-VALUE."
+  (cond
+    (value-strftime-id
+     (strftime-light
+      (or (cdr (assoc value-strftime-id time-format-table
+                      :test #'=))
+          "?")
+      v))
+    (t (format-scalar-value v
+                            :array-elt-size value-array-elt-size
+                            :array-len value-array-len
+                            :array-dims value-array-dims
+                            :unsigned-p value-unsigned-p))))
+
 (defun print-scalar-map (label info &key (key-parts 1) keyed-p
                                           (kind :counter) key-builtin
                                           key-types
@@ -933,75 +1042,30 @@
    entries by value are shown. When DIV is set (a positive integer),
    each value is divided by DIV before printing — matches bpftrace's
    `print(@m, top, div)' contract. SYMBOLIZER resolves ustack IPs."
-  (let* ((keys (map-keys info))
-         (pairs (sort (mapcar
-                       (lambda (k)
-                         (cons k (cond
-                                   ((and value-tuple-p value-tuple-types)
-                                    (lookup-tuple-value info k value-tuple-types))
-                                   (t (case kind
-                                        (:sum (reduce-sum info k))
-                                        (:avg (multiple-value-bind (c s)
-                                                  (reduce-avg info k)
-                                                (if (zerop c) 0 (floor s c))))
-                                        ;; stats() pre-computes a
-                                        ;; tagged sentinel that the
-                                        ;; line formatter pretty-prints
-                                        ;; below.
-                                        (:stats (multiple-value-bind (c s)
-                                                    (reduce-avg info k)
-                                                  (list :stats c s)))
-                                        ((:min) (reduce-min/max info k :min))
-                                        ((:max) (reduce-min/max info k :max))
-                                        (t     (lookup-int info k)))))))
-                       keys)
-                      #'<
-                      :key (lambda (kv)
-                             (let ((v (cdr kv)))
-                               (if (and (consp v) (eq (car v) :stats))
-                                   (third v)  ; sort by total
-                                   v)))))
-         ;; print(@m, top, div): keep only the largest TOP entries
-         ;; (we sorted ascending, so trim from the front) and scale
-         ;; each value by DIV before rendering. :stats values keep
-         ;; their tagged shape; div only applies to plain integers.
-         (pairs (if (and top (> (length pairs) top))
-                    (nthcdr (- (length pairs) top) pairs)
-                    pairs))
-         (pairs (if div
-                    (mapcar (lambda (kv)
-                              (let ((v (cdr kv)))
-                                (cons (car kv)
-                                      (if (integerp v) (floor v div) v))))
-                            pairs)
-                    pairs))
-         (prefix (if (or (null label) (string= label "@")) "@" (format nil "@~A" label))))
+  (let ((pairs (scalar-map-pairs info kind
+                                 :value-tuple-p value-tuple-p
+                                 :value-tuple-types value-tuple-types
+                                 :top top :div div))
+        (prefix (if (or (null label) (string= label "@")) "@" (format nil "@~A" label))))
     (multiple-value-bind (stack-idx pid-idx user-p)
         (when key-types (composite-stack-info key-types))
       (cond
         ;; Composite key with a stack slot (kstack or ustack).
         (stack-idx
-         (dolist (kv pairs)
-           (let* ((k (car kv))
-                  (stack-id (composite-slot k stack-idx))
-                  (pid      (and pid-idx (composite-slot k pid-idx))))
-             (format t "~A[~%~A~%]: ~D~%"
-                     prefix
-                     (format-stack stack-id stacks-info
-                                   (or stack-depth 32)
-                                   :user-p user-p
-                                   :pid pid
-                                   :symbolizer symbolizer)
-                     (cdr kv)))))
+         (print-stack-map-entries prefix pairs
+                                  :stack-idx stack-idx
+                                  :pid-idx pid-idx
+                                  :user-p user-p
+                                  :stacks-info stacks-info
+                                  :stack-depth stack-depth
+                                  :symbolizer symbolizer))
         ;; Single-slot stack key (e.g. profile:hz:99 { @[kstack]++ }).
         ((or (eq key-builtin :kstack) (eq key-builtin :ustack))
-         (dolist (kv pairs)
-           (format t "~A[~%~A~%]: ~D~%"
-                   prefix
-                   (format-stack (car kv) stacks-info (or stack-depth 32)
-                                 :user-p (eq key-builtin :ustack)
-                                 :symbolizer symbolizer)
-                   (cdr kv))))
+         (print-stack-map-entries prefix pairs
+                                  :user-p (eq key-builtin :ustack)
+                                  :stacks-info stacks-info
+                                  :stack-depth stack-depth
+                                  :symbolizer symbolizer))
         ;; JSON modes: one `{"type":"map", "data":{…}}' object per
         ;; whole-map dump. Keyed maps nest a {KEY: VALUE} object;
         ;; scalar maps put the bare value inline.
@@ -1033,48 +1097,33 @@
          (dolist (kv pairs)
            (format t "~A[~A]: ~A~%"
                    prefix
-                   (cond
-                     (key-strftime-id
-                      (strftime-light
-                       (or (cdr (assoc key-strftime-id time-format-table
-                                       :test #'=))
-                           "?")
-                       (car kv)))
-                     (t (format-key (car kv)
-                                    :parts key-parts
-                                    :key-builtin key-builtin
-                                    :array-elt-size key-array-elt-size
-                                    :array-len key-array-len
-                                    :array-dims key-array-dims
-                                    :key-types key-types)))
-                   (cond
-                     (value-strftime-id
-                      (strftime-light
-                       (or (cdr (assoc value-strftime-id time-format-table
-                                       :test #'=))
-                           "?")
-                       (cdr kv)))
-                     (t (format-scalar-value (cdr kv)
-                                              :array-elt-size value-array-elt-size
-                                              :array-len value-array-len
-                                              :array-dims value-array-dims
-                                              :unsigned-p value-unsigned-p))))))
+                   (render-map-key (car kv)
+                                   :key-strftime-id key-strftime-id
+                                   :time-format-table time-format-table
+                                   :key-parts key-parts
+                                   :key-builtin key-builtin
+                                   :key-array-elt-size key-array-elt-size
+                                   :key-array-len key-array-len
+                                   :key-array-dims key-array-dims
+                                   :key-types key-types)
+                   (render-map-value (cdr kv)
+                                     :value-strftime-id value-strftime-id
+                                     :time-format-table time-format-table
+                                     :value-array-elt-size value-array-elt-size
+                                     :value-array-len value-array-len
+                                     :value-array-dims value-array-dims
+                                     :value-unsigned-p value-unsigned-p))))
         (t
          (dolist (kv pairs)
            (format t "~A: ~A~%"
                    prefix
-                   (cond
-                     (value-strftime-id
-                      (strftime-light
-                       (or (cdr (assoc value-strftime-id time-format-table
-                                       :test #'=))
-                           "?")
-                       (cdr kv)))
-                     (t (format-scalar-value (cdr kv)
-                                              :array-elt-size value-array-elt-size
-                                              :array-len value-array-len
-                                              :array-dims value-array-dims
-                                              :unsigned-p value-unsigned-p))))))))))
+                   (render-map-value (cdr kv)
+                                     :value-strftime-id value-strftime-id
+                                     :time-format-table time-format-table
+                                     :value-array-elt-size value-array-elt-size
+                                     :value-array-len value-array-len
+                                     :value-array-dims value-array-dims
+                                     :value-unsigned-p value-unsigned-p))))))))
 
 (defun json-format-scalar-value (v)
   "JSON-encode a scalar map value cell. Integers go bare; strings
@@ -2047,6 +2096,161 @@
     (sb-sys:interactive-interrupt ()
       (format t "~&^C~%"))))
 
+(defun config-str-trunc-trailer (gen)
+  "Honor `config = { str_trunc_trailer = \"…\" }'. Strip the
+   optional surrounding quotes the user may have written — bpftrace
+   tolerates either form."
+  (let* ((pair (assoc "str_trunc_trailer" (getf gen :config)
+                      :test #'string=))
+         (raw  (and pair (string-trim '(#\Space #\Tab) (cdr pair)))))
+    (cond
+      ((null raw) "")
+      ((and (>= (length raw) 2)
+            (char= (char raw 0) #\")
+            (char= (char raw (1- (length raw))) #\"))
+       (subseq raw 1 (1- (length raw))))
+      (t raw))))
+
+(defun partition-session-progs (prog-alist)
+  "Split PROG-ALIST into (values BEGIN-PROGS END-PROGS ATTACH-PROGS).
+   BEGIN/END are our synthetic test_run sections; everything else
+   attaches normally."
+  (values
+   (remove-if-not
+    (lambda (entry)
+      (begin-section-p
+       (whistler/loader::prog-info-section-name (cdr entry))))
+    prog-alist)
+   (remove-if-not
+    (lambda (entry)
+      (end-section-p
+       (whistler/loader::prog-info-section-name (cdr entry))))
+    prog-alist)
+   (remove-if
+    (lambda (entry)
+      (test-run-section-p
+       (whistler/loader::prog-info-section-name (cdr entry))))
+    prog-alist)))
+
+(defun open-session-ring-consumer (gen print-info map-alist info-list
+                                   stacks-info stack-depth)
+  "Open the ringbuf consumer that services printf/print/clear/…
+   records, or NIL when the script has no ringbuf map."
+  (when print-info
+    (whistler/loader::open-ring-consumer
+     print-info
+     (make-ring-callback (getf gen :printf-table)
+                         (getf gen :map-id-table)
+                         map-alist info-list
+                         :stacks-info stacks-info
+                         :stack-depth stack-depth
+                         :time-format-table (getf gen :time-format-table)
+                         :cat-paths-table (getf gen :cat-paths-table)
+                         :system-cmds-table (getf gen :system-cmds-table)))))
+
+(defun attach-session-probes (gen attach-progs register)
+  "Attach all real probes, calling REGISTER with each attachment.
+   Individual attach failures (e.g. an alternate-target like
+   `uprobe:libpthread:pthread_create' on a kernel where the symbol
+   moved into libc) are logged and skipped by default; we keep
+   going so the surviving targets in a comma-separated probe list
+   still attach. `config = { missing_probes = … }' selects the
+   policy."
+  (let ((missing-mode (config-enum gen "missing_probes" :warn
+                                   :warn :ignore :error)))
+    (dolist (entry attach-progs)
+      (handler-case
+          (funcall register (attach-probe (cdr entry)))
+        (error (e)
+          (ecase missing-mode
+            (:warn
+             (format *error-output* "~A~%" e)
+             (force-output *error-output*))
+            (:ignore
+             ;; silent — matches bpftrace's
+             ;; `config = { missing_probes = ignore }'
+             nil)
+            (:error
+             ;; Re-raise; tearing down what we already
+             ;; attached happens in the caller's unwind.
+             (error e))))))))
+
+(defun notify-probes-attached ()
+  "bpftrace's runtime test engine waits for this exact line on
+   stdout before launching the AFTER testprog. The harness signals
+   it wants the line via the __BPFTRACE_NOTIFY_PROBES_ATTACHED env
+   var (matches bpftrace.cpp:844). Without the env gate normal
+   `whistler bpftrace …' invocations would print a noisy diagnostic
+   line on every run."
+  (when (sb-ext:posix-getenv "__BPFTRACE_NOTIFY_PROBES_ATTACHED")
+    (format t "__BPFTRACE_NOTIFY_PROBES_ATTACHED~%")
+    (force-output)))
+
+(defun run-session-poll-loop (gen exit-info ring-consumer atts)
+  "Poll-sleep until interrupted or exit() fires. Drain the printf
+   ringbuf on every tick.
+
+   Skip the loop entirely when there's nothing to wait for — no
+   live kernel attachments AND no -c child. Begin-only scripts
+   (`begin { @x = ~10; }') would otherwise hang forever after the
+   BEGIN probe finishes, matching the test-suite TIMEOUTs on
+   basic.bitwise_not / basic.increment-decrement /
+   has_key-error-scalar. bpftrace upstream also exits in this shape
+   — there are no probes to service."
+  (setf *bpftrace-running* t)
+  ;; Capture an exit() that fired during BEGIN even
+  ;; when we skip the poll loop — otherwise `begin {
+  ;; exit(69); }' falls through to a 0 exit code.
+  (exit-flag-set-p exit-info)
+  ;; Install userspace signal handlers for
+  ;; self:signal:NAME probes. They flip
+  ;; *bpftrace-running* / run the body via the same
+  ;; printf+exit subset BEGIN uses.
+  (let ((self-probes
+          (remove-if-not
+           (lambda (p)
+             (let ((s (getf p :spec)))
+               (and (consp s) (eq (first s) :self))))
+           (getf gen :user-probes))))
+    (install-self-signal-handlers self-probes)
+    (when (or atts *child-process* self-probes)
+      (handler-case
+          (loop while (and *bpftrace-running*
+                           (not (exit-flag-set-p exit-info))
+                           (not (and *child-process*
+                                     (child-exited-p *child-process*))))
+                do (if ring-consumer
+                       (whistler/loader::ring-poll
+                        ring-consumer :timeout-ms 100)
+                       (sleep 0.1)))
+        (sb-sys:interactive-interrupt ()
+          (format t "~&^C~%"))))))
+
+(defun run-session-end-progs (end-progs ring-consumer)
+  "END — kernel test_run each END program, then drain the final
+   printf output it produced. Failures are swallowed; teardown
+   must keep going."
+  (dolist (e end-progs)
+    (handler-case
+        (whistler/loader::prog-test-run
+         (whistler/loader::prog-info-fd (cdr e)))
+      (error () nil)))
+  (when ring-consumer
+    (whistler/loader::ring-poll ring-consumer :timeout-ms 0)))
+
+(defun close-session-resources (atts prog-alist map-alist)
+  "Detach every attachment and close every program and map fd,
+   swallowing individual errors."
+  (dolist (a atts) (handler-case (whistler/loader::detach a) (error () nil)))
+  (dolist (e prog-alist)
+    (let ((fd (whistler/loader::prog-info-fd (cdr e))))
+      (when (plusp fd)
+        (handler-case (sb-posix:close fd) (error () nil)))))
+  (dolist (e map-alist)
+    (let ((fd (whistler/loader::map-info-fd (cdr e))))
+      (when (plusp fd)
+        (handler-case (sb-posix:close fd) (error () nil))))))
+
 (defun run-generated (gen)
   "Bring up GEN as a live BPF session and block until either Ctrl-C
    or a kernel-side exit() flips the bt-exit flag. BEGIN/END probes
@@ -2056,20 +2260,7 @@
              (getf gen :user-probes))
     (return-from run-generated
       (run-user-only (getf gen :user-probes))))
-  (let ((*str-trunc-trailer*
-          ;; Honor `config = { str_trunc_trailer = "…" }'. Strip the
-          ;; optional surrounding quotes the user may have written —
-          ;; bpftrace tolerates either form.
-          (let* ((pair (assoc "str_trunc_trailer" (getf gen :config)
-                              :test #'string=))
-                 (raw  (and pair (string-trim '(#\Space #\Tab) (cdr pair)))))
-            (cond
-              ((null raw) "")
-              ((and (>= (length raw) 2)
-                    (char= (char raw 0) #\")
-                    (char= (char raw (1- (length raw))) #\"))
-               (subseq raw 1 (1- (length raw))))
-              (t raw))))
+  (let ((*str-trunc-trailer* (config-str-trunc-trailer gen))
         (*stack-mode*
           ;; `config = { stack_mode = perf|bpftrace|raw }'. Anything
           ;; else falls back to :bpftrace.
@@ -2094,163 +2285,51 @@
            ;; targets in attach-probe so short-lived processes still
            ;; resolve after they exit.
            (symbolizer (whistler/symbolize:open-symbolizer))
-           (printf-table (getf gen :printf-table))
            (*enum-values* (getf gen :enum-values))
            (time-format-table (getf gen :time-format-table))
-           (cat-paths-table (getf gen :cat-paths-table))
-           (system-cmds-table (getf gen :system-cmds-table))
-           (map-id-table (getf gen :map-id-table))
-           (info-list-cached info-list)
-           (ring-consumer
-             (when print-info
-               (whistler/loader::open-ring-consumer
-                print-info
-                (make-ring-callback printf-table map-id-table
-                                    map-alist info-list-cached
-                                    :stacks-info stacks-info
-                                    :stack-depth stack-depth
-                                    :time-format-table time-format-table
-                                    :cat-paths-table cat-paths-table
-                                    :system-cmds-table system-cmds-table))))
-           (begin-progs (remove-if-not
-                         (lambda (entry)
-                           (begin-section-p
-                            (whistler/loader::prog-info-section-name (cdr entry))))
-                         prog-alist))
-           (end-progs   (remove-if-not
-                         (lambda (entry)
-                           (end-section-p
-                            (whistler/loader::prog-info-section-name (cdr entry))))
-                         prog-alist))
-           (attach-progs (remove-if
-                          (lambda (entry)
-                            (test-run-section-p
-                             (whistler/loader::prog-info-section-name (cdr entry))))
-                          prog-alist)))
-      (let ((*session-symbolizer* symbolizer))
-        (unwind-protect
-             (handler-case
-                 (progn
-                   ;; BEGIN — kernel test_run, before any attaches.
-                   ;; Note: we deliberately defer draining BEGIN's
-                   ;; ringbuf output until AFTER NOTIFY is emitted, so
-                   ;; the test runner's has_exact_expect mode (which
-                   ;; discards everything before NOTIFY) captures
-                   ;; print(@,…)/clear/printf output that fired here.
-                   ;; bpftrace upstream sequences the same way.
-                   (dolist (b begin-progs)
-                     (whistler/loader::prog-test-run
-                      (whistler/loader::prog-info-fd (cdr b))))
-                   ;; Attach all real probes. Individual attach
-                   ;; failures (e.g. an alternate-target like
-                   ;; `uprobe:libpthread:pthread_create' on a kernel
-                   ;; where the symbol moved into libc) are logged
-                   ;; and skipped; we keep going so the surviving
-                   ;; targets in a comma-separated probe list still
-                   ;; attach.
-                   (let ((missing-mode (config-enum gen "missing_probes" :warn
-                                                    :warn :ignore :error)))
-                     (dolist (entry attach-progs)
-                       (handler-case
-                           (push (attach-probe (cdr entry)) atts)
-                         (error (e)
-                           (ecase missing-mode
-                             (:warn
-                              (format *error-output* "~A~%" e)
-                              (force-output *error-output*))
-                             (:ignore
-                              ;; silent — matches bpftrace's
-                              ;; `config = { missing_probes = ignore }'
-                              nil)
-                             (:error
-                              ;; Re-raise; tearing down what we already
-                              ;; attached happens in the outer unwind.
-                              (error e)))))))
-                   ;; Probes are live — let any waiting external code
-                   ;; (e.g. the CLI's pipe-blocked -c child) proceed.
-                   (when *post-attach-hook*
-                     (handler-case (funcall *post-attach-hook*)
-                       (error () nil)))
-                   ;; bpftrace's runtime test engine waits for this
-                   ;; exact line on stdout before launching the AFTER
-                   ;; testprog. The harness signals it wants the line
-                   ;; via the __BPFTRACE_NOTIFY_PROBES_ATTACHED env
-                   ;; var (matches bpftrace.cpp:844). Without the env
-                   ;; gate normal `whistler bpftrace …' invocations
-                   ;; would print a noisy diagnostic line on every
-                   ;; run.
-                   (when (sb-ext:posix-getenv "__BPFTRACE_NOTIFY_PROBES_ATTACHED")
-                     (format t "__BPFTRACE_NOTIFY_PROBES_ATTACHED~%")
-                     (force-output))
-                   ;; Drain anything BEGIN wrote to the ringbuf —
-                   ;; printf/print(@,…)/clear/etc. The test runner's
-                   ;; has_exact_expect mode reads this section.
-                   (when ring-consumer
-                     (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
-                   ;; Poll-sleep until interrupted or exit() fires.
-                   ;; Drain the printf ringbuf on every tick.
-                   ;;
-                   ;; Skip the loop entirely when there's nothing to
-                   ;; wait for — no live kernel attachments AND no -c
-                   ;; child. Begin-only scripts (`begin { @x = ~10; }')
-                   ;; would otherwise hang forever after the BEGIN
-                   ;; probe finishes, matching the test-suite TIMEOUTs
-                   ;; on basic.bitwise_not / basic.increment-decrement
-                   ;; / has_key-error-scalar. bpftrace upstream also
-                   ;; exits in this shape — there are no probes to
-                   ;; service.
-                   (setf *bpftrace-running* t)
-                   ;; Capture an exit() that fired during BEGIN even
-                   ;; when we skip the poll loop — otherwise `begin {
-                   ;; exit(69); }' falls through to a 0 exit code.
-                   (exit-flag-set-p exit-info)
-                   ;; Install userspace signal handlers for
-                   ;; self:signal:NAME probes. They flip
-                   ;; *bpftrace-running* / run the body via the same
-                   ;; printf+exit subset BEGIN uses.
-                   (let ((self-probes
-                           (remove-if-not
-                            (lambda (p)
-                              (let ((s (getf p :spec)))
-                                (and (consp s) (eq (first s) :self))))
-                            (getf gen :user-probes))))
-                     (install-self-signal-handlers self-probes)
-                     (when (or atts *child-process* self-probes)
-                       (handler-case
-                           (loop while (and *bpftrace-running*
-                                            (not (exit-flag-set-p exit-info))
-                                            (not (and *child-process*
-                                                      (child-exited-p *child-process*))))
-                                 do (if ring-consumer
-                                        (whistler/loader::ring-poll
-                                         ring-consumer :timeout-ms 100)
-                                        (sleep 0.1)))
-                       (sb-sys:interactive-interrupt ()
-                         (format t "~&^C~%"))))))
-               (bpftrace-attach-error (e)
-                 (format *error-output* "~&~A~%" e)))
-          ;; END — kernel test_run, then drain final printf output,
-          ;; then dump maps.
-          (dolist (e end-progs)
-            (handler-case
-                (whistler/loader::prog-test-run
-                 (whistler/loader::prog-info-fd (cdr e)))
-              (error () nil)))
-          (when ring-consumer
-            (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
-          (when (config-bool gen "print_maps_on_exit" t)
-            (print-all-maps info-list map-alist
-                            :stacks-info stacks-info
-                            :stack-depth stack-depth
-                            :symbolizer symbolizer
-                            :time-format-table time-format-table))
-          (whistler/symbolize:close-symbolizer symbolizer)
-          (dolist (a atts) (handler-case (whistler/loader::detach a) (error () nil)))
-          (dolist (e prog-alist)
-            (let ((fd (whistler/loader::prog-info-fd (cdr e))))
-              (when (plusp fd)
-                (handler-case (sb-posix:close fd) (error () nil)))))
-          (dolist (e map-alist)
-            (let ((fd (whistler/loader::map-info-fd (cdr e))))
-              (when (plusp fd)
-                (handler-case (sb-posix:close fd) (error () nil)))))))))))
+           (ring-consumer (open-session-ring-consumer
+                           gen print-info map-alist info-list
+                           stacks-info stack-depth)))
+      (multiple-value-bind (begin-progs end-progs attach-progs)
+          (partition-session-progs prog-alist)
+        (let ((*session-symbolizer* symbolizer))
+          (unwind-protect
+               (handler-case
+                   (progn
+                     ;; BEGIN — kernel test_run, before any attaches.
+                     ;; Note: we deliberately defer draining BEGIN's
+                     ;; ringbuf output until AFTER NOTIFY is emitted, so
+                     ;; the test runner's has_exact_expect mode (which
+                     ;; discards everything before NOTIFY) captures
+                     ;; print(@,…)/clear/printf output that fired here.
+                     ;; bpftrace upstream sequences the same way.
+                     (dolist (b begin-progs)
+                       (whistler/loader::prog-test-run
+                        (whistler/loader::prog-info-fd (cdr b))))
+                     (attach-session-probes gen attach-progs
+                                            (lambda (att) (push att atts)))
+                     ;; Probes are live — let any waiting external code
+                     ;; (e.g. the CLI's pipe-blocked -c child) proceed.
+                     (when *post-attach-hook*
+                       (handler-case (funcall *post-attach-hook*)
+                         (error () nil)))
+                     (notify-probes-attached)
+                     ;; Drain anything BEGIN wrote to the ringbuf —
+                     ;; printf/print(@,…)/clear/etc. The test runner's
+                     ;; has_exact_expect mode reads this section.
+                     (when ring-consumer
+                       (whistler/loader::ring-poll ring-consumer :timeout-ms 0))
+                     (run-session-poll-loop gen exit-info ring-consumer atts))
+                 (bpftrace-attach-error (e)
+                   (format *error-output* "~&~A~%" e)))
+            ;; END — kernel test_run, drain final printf output,
+            ;; dump maps, then release everything.
+            (run-session-end-progs end-progs ring-consumer)
+            (when (config-bool gen "print_maps_on_exit" t)
+              (print-all-maps info-list map-alist
+                              :stacks-info stacks-info
+                              :stack-depth stack-depth
+                              :symbolizer symbolizer
+                              :time-format-table time-format-table))
+            (whistler/symbolize:close-symbolizer symbolizer)
+            (close-session-resources atts prog-alist map-alist))))))))
