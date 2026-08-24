@@ -129,6 +129,300 @@
             (push name names)))))
     (nreverse names)))
 
+;;; Builder state shared by the write-bpf-elf phases
+
+(defstruct (elf-builder (:constructor make-elf-builder ()))
+  (shstrtab (make-strtab))  ; section-name string table
+  (strtab (make-strtab))    ; symbol-name string table
+  (sections '())            ; elf-sections, in reverse order until layout
+  (sec-index 0))            ; last assigned section header index
+
+(defun builder-add-section (builder name &key type flags data
+                                           (link 0) (info 0)
+                                           (addralign 1) (entsize 0))
+  "Add a section to BUILDER, interning NAME in its shstrtab.
+   Returns the new section's header index."
+  (let ((name-off (strtab-add (elf-builder-shstrtab builder) name)))
+    (push (make-elf-section
+           :name name
+           :name-offset name-off
+           :type type
+           :flags flags
+           :data data
+           :link link :info info
+           :addralign addralign
+           :entsize entsize)
+          (elf-builder-sections builder))
+    (incf (elf-builder-sec-index builder))))
+
+;;; Section-building phases
+
+(defun add-prog-sections (builder prog-sections)
+  "Add one executable section per program.
+   Returns ((section-name . sec-idx) ...) in program order."
+  (loop for prog-entry in prog-sections
+        for sec-name = (first prog-entry)
+        collect (cons sec-name
+                      (builder-add-section
+                       builder sec-name
+                       :type +sht-progbits+
+                       :flags (logior +shf-alloc+ +shf-execinstr+)
+                       :data (second prog-entry)
+                       :addralign 8))))
+
+(defun add-maps-section (builder maps)
+  "Add the .maps section, one 32-byte map def per map.
+   Returns its section index, or NIL when there are no maps."
+  (when maps
+    (let ((map-data (make-array (* 32 (length maps))
+                                :element-type '(unsigned-byte 8))))
+      (loop for map-entry in maps
+            for i from 0
+            for mtype = (second map-entry)
+            for ksize = (third map-entry)
+            for vsize = (fourth map-entry)
+            for maxent = (fifth map-entry)
+            for mflags = (or (sixth map-entry) 0)
+            for entry = (encode-map-def mtype ksize vsize maxent mflags)
+            do (replace map-data entry :start1 (* i 32)))
+      (builder-add-section builder ".maps"
+                           :type +sht-progbits+
+                           :flags +shf-alloc+
+                           :data map-data
+                           :addralign 4))))
+
+(defun add-license-section (builder license)
+  "Add the license section (NUL-terminated string, defaulting to \"GPL\")."
+  (let* ((lic-str (or license "GPL"))
+         (lic-bytes (let ((v (make-array (1+ (length lic-str))
+                                         :element-type '(unsigned-byte 8))))
+                      (loop for i below (length lic-str)
+                            do (setf (aref v i) (char-code (char lic-str i))))
+                      (setf (aref v (length lic-str)) 0)
+                      v)))
+    (builder-add-section builder "license"
+                         :type +sht-progbits+
+                         :flags +shf-alloc+
+                         :data lic-bytes
+                         :addralign 1)))
+
+(defun add-btf-sections (builder btf-data btf-ext-data)
+  "Add the .BTF and .BTF.ext sections when their data is present."
+  (when btf-data
+    (builder-add-section builder ".BTF"
+                         :type +sht-progbits+
+                         :flags 0
+                         :data btf-data
+                         :addralign 4))
+  (when btf-ext-data
+    (builder-add-section builder ".BTF.ext"
+                         :type +sht-progbits+
+                         :flags 0
+                         :data btf-ext-data
+                         :addralign 4)))
+
+(defun build-symtab (builder prog-sections maps maps-sec-idx prog-sec-indices
+                     kfunc-sym-index)
+  "Build the symbol table: a null symbol, one local section symbol per
+   program section, then global map, program function, and extern kfunc
+   symbols. Names are interned in BUILDER's strtab; each kfunc's symbol
+   index is recorded in KFUNC-SYM-INDEX for the relocation phase.
+   Returns (values symtab-data first-global-sym map-sym-base)."
+  (let ((strtab (elf-builder-strtab builder))
+        (syms '()))
+    ;; Symbol 0: null
+    (push (encode-sym 0 0 0 0 0 0) syms)
+
+    ;; Section symbols for each program section (local)
+    (dolist (entry prog-sec-indices)
+      (push (encode-sym 0 (st-info +stb-local+ +stt-section+) 0
+                        (cdr entry) 0 0)
+            syms))
+
+    ;; Map symbols (global)
+    (let ((first-global-sym (length syms))
+          ;; Map sym index base: null + N section syms
+          (map-sym-base (1+ (length prog-sec-indices))))
+      (when maps
+        (loop for (name . rest) in maps
+              for i from 0
+              for name-off = (strtab-add strtab
+                              (substitute #\_ #\- (string-downcase (string name))))
+              do (push (encode-sym name-off
+                                   (st-info +stb-global+ +stt-object+) 0
+                                   maps-sec-idx (* i 32) 32)
+                       syms)))
+
+      ;; Program function symbols (global, one per program)
+      (dolist (prog-entry prog-sections)
+        (let* ((sec-name (first prog-entry))
+               (prog-bytes (second prog-entry))
+               (prog-name (or (fifth prog-entry) sec-name))
+               (sec-idx (cdr (assoc sec-name prog-sec-indices :test #'string=)))
+               (func-name-off (strtab-add strtab prog-name)))
+          (push (encode-sym func-name-off
+                            (st-info +stb-global+ +stt-func+) 0
+                            sec-idx 0 (length prog-bytes))
+                syms)))
+
+      ;; Kfunc extern symbols (global, undefined). One per unique kfunc
+      ;; name referenced by any program. A call relocation targets these;
+      ;; the loader resolves each name to a kernel BTF id at load time.
+      ;; kfunc syms follow map + prog-func syms, so their base index is
+      ;; map-sym-base + n-maps + n-progs. Indices are recorded in the
+      ;; kfunc-sym-index table for the relocation phase.
+      (let ((kfunc-sym-base (+ map-sym-base (length maps)
+                               (length prog-sections))))
+        (loop for name in (collect-kfunc-names prog-sections)
+              for i from 0
+              for name-off = (strtab-add strtab name)
+              do (setf (gethash name kfunc-sym-index) (+ kfunc-sym-base i))
+                 (push (encode-sym name-off
+                                   (st-info +stb-global+ +stt-notype+) 0
+                                   +shn-undef+ 0 0)
+                       syms)))
+
+      ;; Finalize symbol table
+      (setf syms (nreverse syms))
+      (let* ((num-syms (length syms))
+             (symtab-data (make-array (* num-syms 24)
+                                      :element-type '(unsigned-byte 8))))
+        (loop for sym in syms for i from 0
+              do (replace symtab-data sym :start1 (* i 24)))
+        (values symtab-data first-global-sym map-sym-base)))))
+
+(defun add-rel-sections (builder prog-sections maps prog-sec-indices
+                         symtab-sec-idx map-sym-base kfunc-sym-index)
+  "Add one .rel<section> per program with relocations. Combines map fd
+   relocations (R_BPF_64_64 on ld_imm64, sym = a map symbol) and kfunc
+   call relocations (R_BPF_64_32 on the call imm, sym = an extern kfunc).
+   A program may have kfunc relocs without any maps."
+  (dolist (prog-entry prog-sections)
+    (let* ((sec-name (first prog-entry))
+           (map-relocations (third prog-entry))
+           (kfunc-relocations (sixth prog-entry))
+           (sec-idx (cdr (assoc sec-name prog-sec-indices
+                                :test #'string=)))
+           (rel-entries
+            (append
+             (when maps
+               (loop for (insn-off map-idx) in map-relocations
+                     collect (encode-rel insn-off
+                                         (+ map-sym-base map-idx)
+                                         +r-bpf-64-64+)))
+             (loop for (insn-off name) in kfunc-relocations
+                   collect (encode-rel
+                            insn-off
+                            (gethash name kfunc-sym-index)
+                            +r-bpf-64-32+)))))
+      (when rel-entries
+        (let ((rel-data (make-array (* 16 (length rel-entries))
+                                    :element-type '(unsigned-byte 8))))
+          (loop for entry in rel-entries
+                for i from 0
+                do (replace rel-data entry :start1 (* i 16)))
+          (builder-add-section builder (format nil ".rel~a" sec-name)
+                               :type +sht-rel+
+                               :flags 0
+                               :data rel-data
+                               :link symtab-sec-idx
+                               :info sec-idx
+                               :addralign 8
+                               :entsize 16))))))
+
+(defun add-shstrtab-section (builder)
+  "Add the .shstrtab section (must be last). Its own name is interned
+   before the table is snapshotted so it appears in its own data.
+   Returns its section index."
+  (let ((name-off (strtab-add (elf-builder-shstrtab builder) ".shstrtab")))
+    (push (make-elf-section
+           :name ".shstrtab"
+           :name-offset name-off
+           :type +sht-strtab+
+           :flags 0
+           :data (copy-seq (elf-builder-shstrtab builder))
+           :link 0 :info 0
+           :addralign 1
+           :entsize 0)
+          (elf-builder-sections builder))
+    (incf (elf-builder-sec-index builder))))
+
+;;; Layout and file writing
+
+(defun layout-sections (sections)
+  "Assign each section's file offset: the ELF header is 64 bytes, section
+   data follows (aligned per section), then the section header table
+   (aligned to 8). Returns the section header table offset."
+  (let ((pos 64))
+    ;; Align and assign offsets
+    (dolist (sec sections)
+      (let ((align (max 1 (elf-section-addralign sec))))
+        (setf pos (let ((rem (mod pos align)))
+                    (if (zerop rem) pos (+ pos (- align rem)))))
+        (setf (elf-section-file-offset sec) pos)
+        (incf pos (length (elf-section-data sec)))))
+    ;; Section header table offset (align to 8)
+    (let ((rem (mod pos 8)))
+      (unless (zerop rem) (setf pos (+ pos (- 8 rem)))))
+    pos))
+
+(defun write-elf-header (out shoff num-sections shstrtab-sec-idx)
+  "Write the 64-byte ELF header."
+  (write-bytes out #(#x7f #x45 #x4c #x46)) ; magic
+  (write-u8 out +elfclass64+)
+  (write-u8 out +elfdata2lsb+)
+  (write-u8 out +ev-current+)
+  (write-u8 out +elfosabi-none+)
+  (dotimes (i 8) (write-u8 out 0))  ; padding
+  (write-u16le out +et-rel+)         ; e_type
+  (write-u16le out +em-bpf+)         ; e_machine
+  (write-u32le out +ev-current+)     ; e_version
+  (write-u64le out 0)                ; e_entry
+  (write-u64le out 0)                ; e_phoff
+  (write-u64le out shoff)            ; e_shoff
+  (write-u32le out 0)                ; e_flags
+  (write-u16le out 64)               ; e_ehsize
+  (write-u16le out 0)                ; e_phentsize
+  (write-u16le out 0)                ; e_phnum
+  (write-u16le out 64)               ; e_shentsize
+  (write-u16le out num-sections)     ; e_shnum
+  (write-u16le out shstrtab-sec-idx)) ; e_shstrndx
+
+(defun write-section-data (out sections shoff)
+  "Write each section's data at its laid-out offset, padding between
+   sections and up to the section header table at SHOFF."
+  (let ((cur-pos 64))
+    (dolist (sec sections)
+      ;; Write padding
+      (let ((target (elf-section-file-offset sec)))
+        (dotimes (i (- target cur-pos))
+          (write-u8 out 0))
+        (setf cur-pos target))
+      ;; Write data
+      (write-sequence (elf-section-data sec) out)
+      (incf cur-pos (length (elf-section-data sec))))
+    ;; Pad to section header table
+    (dotimes (i (- shoff cur-pos))
+      (write-u8 out 0))))
+
+(defun write-section-headers (out sections)
+  "Write the section header table: a null entry, then one 64-byte header
+   per section."
+  ;; Entry 0: null
+  (dotimes (i 64) (write-u8 out 0))
+  ;; Remaining entries
+  (dolist (sec sections)
+    (write-u32le out (elf-section-name-offset sec)) ; sh_name
+    (write-u32le out (elf-section-type sec))        ; sh_type
+    (write-u64le out (elf-section-flags sec))       ; sh_flags
+    (write-u64le out 0)                             ; sh_addr
+    (write-u64le out (elf-section-file-offset sec)) ; sh_offset
+    (write-u64le out (length (elf-section-data sec))) ; sh_size
+    (write-u32le out (elf-section-link sec))        ; sh_link
+    (write-u32le out (elf-section-info sec))        ; sh_info
+    (write-u64le out (elf-section-addralign sec))   ; sh_addralign
+    (write-u64le out (elf-section-entsize sec))))   ; sh_entsize
+
 (defun write-bpf-elf (pathname &key prog-sections maps license btf-data btf-ext-data)
   "Write a BPF ELF object file with one or more programs.
    PROG-SECTIONS: list of (section-name prog-bytes relocations core-relocs) per program
@@ -136,343 +430,47 @@
    LICENSE: string like \"GPL\"
    BTF-DATA: byte vector for .BTF section (or nil)
    BTF-EXT-DATA: byte vector for .BTF.ext section (or nil)"
-  (let ((prog-sections prog-sections))
-    (with-open-file (out pathname :direction :output
+  (with-open-file (out pathname :direction :output
                                 :element-type '(unsigned-byte 8)
                                 :if-exists :supersede)
-      (let* ((shstrtab (make-strtab))
-             (strtab (make-strtab))
-             (sections '())
-             (syms '())
-             (sec-index 0)
-             (maps-sec-idx nil)
-             (kfunc-sym-index (make-hash-table :test 'equal))  ; kfunc name → sym idx
-             (prog-sec-indices '()))  ; ((section-name . sec-idx) ...)
+    (let* ((builder (make-elf-builder))
+           (kfunc-sym-index (make-hash-table :test 'equal))  ; kfunc name → sym idx
+           ;; -- Sections: programs, maps, license, BTF --
+           (prog-sec-indices (add-prog-sections builder prog-sections))
+           (maps-sec-idx (add-maps-section builder maps)))
+      (add-license-section builder license)
+      (add-btf-sections builder btf-data btf-ext-data)
 
-        (labels ((next-sec-idx () (incf sec-index)))
+      ;; -- Symbol table, then .strtab/.symtab sections --
+      (multiple-value-bind (symtab-data first-global-sym map-sym-base)
+          (build-symtab builder prog-sections maps maps-sec-idx
+                        prog-sec-indices kfunc-sym-index)
+        (let* ((strtab-sec-idx
+                (builder-add-section builder ".strtab"
+                                     :type +sht-strtab+
+                                     :flags 0
+                                     :data (copy-seq (elf-builder-strtab builder))
+                                     :addralign 1))
+               (symtab-sec-idx
+                (builder-add-section builder ".symtab"
+                                     :type +sht-symtab+
+                                     :flags 0
+                                     :data symtab-data
+                                     :link strtab-sec-idx
+                                     :info first-global-sym
+                                     :addralign 8
+                                     :entsize 24)))
 
-        ;; -- Program sections (one per program) --
-        (dolist (prog-entry prog-sections)
-          (let* ((sec-name (first prog-entry))
-                 (prog-bytes (second prog-entry))
-                 (name-off (strtab-add shstrtab sec-name)))
-            (next-sec-idx)
-            (push (cons sec-name sec-index) prog-sec-indices)
-            (push (make-elf-section
-                   :name sec-name
-                   :name-offset name-off
-                   :type +sht-progbits+
-                   :flags (logior +shf-alloc+ +shf-execinstr+)
-                   :data prog-bytes
-                   :link 0 :info 0
-                   :addralign 8
-                   :entsize 0)
-                  sections)))
-        (setf prog-sec-indices (nreverse prog-sec-indices))
+          ;; -- Relocation sections (one per program with relocations) --
+          (add-rel-sections builder prog-sections maps prog-sec-indices
+                            symtab-sec-idx map-sym-base kfunc-sym-index)
 
-        ;; -- Maps section (if any maps) --
-        (when maps
-          (let* ((name-off (strtab-add shstrtab ".maps"))
-                 (map-data (make-array (* 32 (length maps))
-                                       :element-type '(unsigned-byte 8))))
-            (next-sec-idx)
-            (setf maps-sec-idx sec-index)
-            (loop for map-entry in maps
-                  for i from 0
-                  for mtype = (second map-entry)
-                  for ksize = (third map-entry)
-                  for vsize = (fourth map-entry)
-                  for maxent = (fifth map-entry)
-                  for mflags = (or (sixth map-entry) 0)
-                  for entry = (encode-map-def mtype ksize vsize maxent mflags)
-                  do (replace map-data entry :start1 (* i 32)))
-            (push (make-elf-section
-                   :name ".maps"
-                   :name-offset name-off
-                   :type +sht-progbits+
-                   :flags +shf-alloc+
-                   :data map-data
-                   :link 0 :info 0
-                   :addralign 4
-                   :entsize 0)
-                  sections)))
-
-        ;; -- License section --
-        (let* ((lic-str (or license "GPL"))
-               (lic-bytes (let ((v (make-array (1+ (length lic-str))
-                                               :element-type '(unsigned-byte 8))))
-                            (loop for i below (length lic-str)
-                                  do (setf (aref v i) (char-code (char lic-str i))))
-                            (setf (aref v (length lic-str)) 0)
-                            v))
-               (name-off (strtab-add shstrtab "license")))
-          (next-sec-idx)
-          (push (make-elf-section
-                 :name "license"
-                 :name-offset name-off
-                 :type +sht-progbits+
-                 :flags +shf-alloc+
-                 :data lic-bytes
-                 :link 0 :info 0
-                 :addralign 1
-                 :entsize 0)
-                sections))
-
-        ;; -- BTF section --
-        (when btf-data
-          (let ((name-off (strtab-add shstrtab ".BTF")))
-            (next-sec-idx)
-            (push (make-elf-section
-                   :name ".BTF"
-                   :name-offset name-off
-                   :type +sht-progbits+
-                   :flags 0
-                   :data btf-data
-                   :link 0 :info 0
-                   :addralign 4
-                   :entsize 0)
-                  sections)))
-
-        ;; -- BTF.ext section --
-        (when btf-ext-data
-          (let ((name-off (strtab-add shstrtab ".BTF.ext")))
-            (next-sec-idx)
-            (push (make-elf-section
-                   :name ".BTF.ext"
-                   :name-offset name-off
-                   :type +sht-progbits+
-                   :flags 0
-                   :data btf-ext-data
-                   :link 0 :info 0
-                   :addralign 4
-                   :entsize 0)
-                  sections)))
-
-        ;; -- Build symbol table --
-        ;; Symbol 0: null
-        (push (encode-sym 0 0 0 0 0 0) syms)
-
-        ;; Section symbols for each program section (local)
-        (dolist (entry prog-sec-indices)
-          (push (encode-sym 0 (st-info +stb-local+ +stt-section+) 0
-                            (cdr entry) 0 0)
-                syms))
-
-        ;; Map symbols (global)
-        (let ((first-global-sym (length syms))
-              ;; Map sym index base: null + N section syms
-              (map-sym-base (1+ (length prog-sec-indices))))
-          (when maps
-            (loop for (name . rest) in maps
-                  for i from 0
-                  for name-off = (strtab-add strtab
-                                  (substitute #\_ #\- (string-downcase (string name))))
-                  do (push (encode-sym name-off
-                                       (st-info +stb-global+ +stt-object+) 0
-                                       maps-sec-idx (* i 32) 32)
-                           syms)))
-
-          ;; Program function symbols (global, one per program)
-          (dolist (prog-entry prog-sections)
-            (let* ((sec-name (first prog-entry))
-                   (prog-bytes (second prog-entry))
-                   (prog-name (or (fifth prog-entry) sec-name))
-                   (sec-idx (cdr (assoc sec-name prog-sec-indices :test #'string=)))
-                   (func-name-off (strtab-add strtab prog-name)))
-              (push (encode-sym func-name-off
-                                (st-info +stb-global+ +stt-func+) 0
-                                sec-idx 0 (length prog-bytes))
-                    syms)))
-
-          ;; Kfunc extern symbols (global, undefined). One per unique kfunc
-          ;; name referenced by any program. A call relocation targets these;
-          ;; the loader resolves each name to a kernel BTF id at load time.
-          ;; kfunc syms follow map + prog-func syms, so their base index is
-          ;; map-sym-base + n-maps + n-progs. Indices are recorded in the
-          ;; outer kfunc-sym-index table for the relocation loop below.
-          (let ((kfunc-sym-base (+ map-sym-base (length maps)
-                                   (length prog-sections))))
-            (loop for name in (collect-kfunc-names prog-sections)
-                  for i from 0
-                  for name-off = (strtab-add strtab name)
-                  do (setf (gethash name kfunc-sym-index) (+ kfunc-sym-base i))
-                     (push (encode-sym name-off
-                                       (st-info +stb-global+ +stt-notype+) 0
-                                       +shn-undef+ 0 0)
-                           syms)))
-
-          ;; Finalize symbol table
-          (setf syms (nreverse syms))
-          (let* ((num-syms (length syms))
-                 (symtab-data (make-array (* num-syms 24)
-                                          :element-type '(unsigned-byte 8))))
-            (loop for sym in syms for i from 0
-                  do (replace symtab-data sym :start1 (* i 24)))
-
-            ;; -- Strtab section --
-            (let ((strtab-name-off (strtab-add shstrtab ".strtab")))
-              (next-sec-idx)
-              (let ((strtab-sec-idx sec-index))
-                (push (make-elf-section
-                       :name ".strtab"
-                       :name-offset strtab-name-off
-                       :type +sht-strtab+
-                       :flags 0
-                       :data (copy-seq strtab)
-                       :link 0 :info 0
-                       :addralign 1
-                       :entsize 0)
-                      sections)
-
-                ;; -- Symtab section --
-                (let ((symtab-name-off (strtab-add shstrtab ".symtab")))
-                  (next-sec-idx)
-                  (let ((symtab-sec-idx sec-index))
-                    (push (make-elf-section
-                           :name ".symtab"
-                           :name-offset symtab-name-off
-                           :type +sht-symtab+
-                           :flags 0
-                           :data symtab-data
-                           :link strtab-sec-idx
-                           :info first-global-sym
-                           :addralign 8
-                           :entsize 24)
-                          sections)
-
-                    ;; -- Relocation sections (one per program with relocations) --
-                    ;; Combines map fd relocations (R_BPF_64_64 on ld_imm64,
-                    ;; sym = a map symbol) and kfunc call relocations
-                    ;; (R_BPF_64_32 on the call imm, sym = an extern kfunc).
-                    ;; A program may have kfunc relocs without any maps.
-                    (dolist (prog-entry prog-sections)
-                      (let* ((sec-name (first prog-entry))
-                             (map-relocations (third prog-entry))
-                             (kfunc-relocations (sixth prog-entry))
-                             (sec-idx (cdr (assoc sec-name prog-sec-indices
-                                                  :test #'string=)))
-                             (rel-entries
-                              (append
-                               (when maps
-                                 (loop for (insn-off map-idx) in map-relocations
-                                       collect (encode-rel insn-off
-                                                           (+ map-sym-base map-idx)
-                                                           +r-bpf-64-64+)))
-                               (loop for (insn-off name) in kfunc-relocations
-                                     collect (encode-rel
-                                              insn-off
-                                              (gethash name kfunc-sym-index)
-                                              +r-bpf-64-32+)))))
-                        (when rel-entries
-                          (let* ((rel-sec-name (format nil ".rel~a" sec-name))
-                                 (rel-name-off (strtab-add shstrtab rel-sec-name))
-                                 (rel-data (make-array (* 16 (length rel-entries))
-                                                       :element-type '(unsigned-byte 8))))
-                            (loop for entry in rel-entries
-                                  for i from 0
-                                  do (replace rel-data entry :start1 (* i 16)))
-                            (next-sec-idx)
-                            (push (make-elf-section
-                                   :name rel-sec-name
-                                   :name-offset rel-name-off
-                                   :type +sht-rel+
-                                   :flags 0
-                                   :data rel-data
-                                   :link symtab-sec-idx
-                                   :info sec-idx
-                                   :addralign 8
-                                   :entsize 16)
-                                  sections)))))
-
-                    ;; -- Shstrtab section (must be last) --
-                    (let ((shstrtab-name-off (strtab-add shstrtab ".shstrtab")))
-                      (next-sec-idx)
-                      (let ((shstrtab-sec-idx sec-index))
-                        (push (make-elf-section
-                               :name ".shstrtab"
-                               :name-offset shstrtab-name-off
-                               :type +sht-strtab+
-                               :flags 0
-                               :data (copy-seq shstrtab)
-                               :link 0 :info 0
-                               :addralign 1
-                               :entsize 0)
-                              sections)
-
-                        ;; Reverse sections to correct order
-                        (setf sections (nreverse sections))
-
-                        ;; -- Layout: compute file offsets --
-                        ;; ELF header = 64 bytes
-                        ;; Sections follow, then section header table
-                        (let ((pos 64))
-                          ;; Align and assign offsets
-                          (dolist (sec sections)
-                            (let ((align (max 1 (elf-section-addralign sec))))
-                              (setf pos (let ((rem (mod pos align)))
-                                          (if (zerop rem) pos (+ pos (- align rem)))))
-                              (setf (elf-section-file-offset sec) pos)
-                              (incf pos (length (elf-section-data sec)))))
-
-                          ;; Section header table offset (align to 8)
-                          (let ((rem (mod pos 8)))
-                            (unless (zerop rem) (setf pos (+ pos (- 8 rem)))))
-                          (let ((shoff pos)
-                                (num-sections (1+ (length sections)))) ; +1 for null
-
-                            ;; === Write the file ===
-
-                            ;; ELF header (64 bytes)
-                            (write-bytes out #(#x7f #x45 #x4c #x46)) ; magic
-                            (write-u8 out +elfclass64+)
-                            (write-u8 out +elfdata2lsb+)
-                            (write-u8 out +ev-current+)
-                            (write-u8 out +elfosabi-none+)
-                            (dotimes (i 8) (write-u8 out 0))  ; padding
-                            (write-u16le out +et-rel+)         ; e_type
-                            (write-u16le out +em-bpf+)         ; e_machine
-                            (write-u32le out +ev-current+)     ; e_version
-                            (write-u64le out 0)                ; e_entry
-                            (write-u64le out 0)                ; e_phoff
-                            (write-u64le out shoff)            ; e_shoff
-                            (write-u32le out 0)                ; e_flags
-                            (write-u16le out 64)               ; e_ehsize
-                            (write-u16le out 0)                ; e_phentsize
-                            (write-u16le out 0)                ; e_phnum
-                            (write-u16le out 64)               ; e_shentsize
-                            (write-u16le out num-sections)     ; e_shnum
-                            (write-u16le out shstrtab-sec-idx) ; e_shstrndx
-
-                            ;; Section data
-                            (let ((cur-pos 64))
-                              (dolist (sec sections)
-                                ;; Write padding
-                                (let ((target (elf-section-file-offset sec)))
-                                  (dotimes (i (- target cur-pos))
-                                    (write-u8 out 0))
-                                  (setf cur-pos target))
-                                ;; Write data
-                                (write-sequence (elf-section-data sec) out)
-                                (incf cur-pos (length (elf-section-data sec))))
-
-                              ;; Pad to section header table
-                              (dotimes (i (- shoff cur-pos))
-                                (write-u8 out 0)))
-
-                            ;; Section header table
-                            ;; Entry 0: null
-                            (dotimes (i 64) (write-u8 out 0))
-
-                            ;; Remaining entries
-                            (dolist (sec sections)
-                              (write-u32le out (elf-section-name-offset sec)) ; sh_name
-                              (write-u32le out (elf-section-type sec))        ; sh_type
-                              (write-u64le out (elf-section-flags sec))       ; sh_flags
-                              (write-u64le out 0)                             ; sh_addr
-                              (write-u64le out (elf-section-file-offset sec)) ; sh_offset
-                              (write-u64le out (length (elf-section-data sec))) ; sh_size
-                              (write-u32le out (elf-section-link sec))        ; sh_link
-                              (write-u32le out (elf-section-info sec))        ; sh_info
-                              (write-u64le out (elf-section-addralign sec))   ; sh_addralign
-                              (write-u64le out (elf-section-entsize sec)))))))))))))))))) ; sh_entsize
+          ;; -- Shstrtab section (must be last), then layout and write --
+          (let* ((shstrtab-sec-idx (add-shstrtab-section builder))
+                 (sections (nreverse (elf-builder-sections builder)))
+                 (shoff (layout-sections sections))
+                 (num-sections (1+ (length sections)))) ; +1 for null
+            (write-elf-header out shoff num-sections shstrtab-sec-idx)
+            (write-section-data out sections shoff)
+            (write-section-headers out sections)))))))
 
