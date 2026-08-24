@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "whistler",
+  "project_id": "dfce8d43-d402-4669-b814-7ca22de21015"
+}

@@ -33,3 +33,10 @@ GAP.md
 # Temp/log files
 *.log
 .codex
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
