@@ -124,4 +124,6 @@ repl-loader:
 clean:
 	rm -f whistler
 	rm -f examples/*.bpf.o
-	rm -f *.fasl
+	rm -f *.bpf.o
+	rm -f *.fasl src/*.fasl src/loader/*.fasl src/bpftrace/*.fasl src/symbolize/*.fasl tests/*.fasl
+	rm -f *.log

@@ -18,35 +18,40 @@ sbcl --noinform --non-interactive \
 
 `compile-file*` and `with-bpf-session` automatically isolate compilation state. When using `compile-to-elf` directly in the REPL, call `(reset-compilation-state)` between separate compilations to clear accumulated maps/programs/structs.
 
-No test suite. Verify correctness by checking instruction counts and comparing disassembly output.
+Run the test suite with `make test` (FiveAM, ASDF system `whistler/tests`, sources in `tests/`). `make test-torture` additionally loads compiled programs into the kernel (needs CAP_BPF). For codegen changes, also compare instruction counts and disassembly output.
 
 ## Architecture
 
-Pipeline: **source** → macro expansion → **lowering** (lower.lisp) → SSA IR → **optimization** (ssa-opt.lisp) → **register allocation** (regalloc.lisp) → **BPF emission** (emit.lisp) → **peephole** (peephole.lisp) → **ELF output** (elf.lisp)
+Pipeline: **source** → macro expansion → **lowering** (src/lower.lisp) → SSA IR → **optimization** (src/ssa-opt.lisp, src/sccp.lisp) → **register allocation** (src/regalloc.lisp) → **BPF emission** (src/emit.lisp) → **peephole** (src/peephole.lisp) → **ELF output** (src/elf.lisp)
 
 ### Key files
 
 | File | Purpose |
 |------|---------|
-| `packages.lisp` | Package definitions and exports |
-| `bpf.lisp` | BPF instruction encoding, constants, opcodes |
-| `compiler.lisp` | Legacy direct compiler, macro expansion (`whistler-macroexpand`), constant folding, **shared definitions** (helpers, constants, builtins, context struct layouts, BTF resolver hook -- single source of truth for both pipelines) |
-| `ir.lisp` | SSA IR data structures (`ir-insn`, `basic-block`, `ir-program`) |
-| `lower.lisp` | Lowering from surface language to SSA IR |
-| `ssa-opt.lisp` | SSA optimizations (copy prop, DCE, constant folding, phi threading) |
-| `regalloc.lisp` | Linear-scan register allocator with spilling |
-| `emit.lisp` | IR → BPF instruction emission, stack allocation, map operations, tail calls |
-| `peephole.lisp` | Post-regalloc BPF peephole optimizer (15+ passes) |
-| `btf.lisp` | BTF type encoding and BTF.ext (CO-RE relocations, func_info) |
-| `elf.lisp` | ELF object file writer (multi-program support) |
-| `protocols.lisp` | Protocol header macros (Ethernet, IPv4, TCP, UDP), map/struct surface macros |
-| `vmlinux.lisp` | BTF reader, `import-kernel-struct`, context struct BTF lookup, CO-RE resolver |
-| `whistler.lisp` | Top-level interface: `defmap`, `defprog`, `defstruct`, `compile-to-elf` |
+| `src/packages.lisp` | Package definitions and exports |
+| `src/bpf.lisp` | BPF instruction encoding, constants, opcodes |
+| `src/compiler.lisp` | Macro expansion (`whistler-macroexpand`), constant folding, **shared definitions** (helpers, constants, builtins, kfunc registry, context struct layouts, BTF resolver hook — single source of truth for both frontends and the loader) |
+| `src/ir.lisp` | SSA IR data structures (`ir-insn`, `basic-block`, `ir-program`) |
+| `src/lower.lisp` | Lowering from surface language to SSA IR |
+| `src/ssa-opt.lisp` | SSA optimizations (copy prop, DCE, constant folding, phi threading) |
+| `src/sccp.lisp` | Sparse conditional constant propagation pass |
+| `src/regalloc.lisp` | Linear-scan register allocator with spilling |
+| `src/emit.lisp` | IR → BPF instruction emission, stack allocation, map operations, tail calls |
+| `src/peephole.lisp` | Post-regalloc BPF peephole optimizer (15+ passes) |
+| `src/btf.lisp` | BTF type encoding and BTF.ext (CO-RE relocations, func_info) |
+| `src/elf.lisp` | ELF object file writer (multi-program support) |
+| `src/protocols.lisp` | Protocol header macros (Ethernet, IPv4, TCP, UDP), map/struct surface macros |
+| `src/vmlinux.lisp` | BTF reader, `import-kernel-struct`, context struct BTF lookup, CO-RE resolver |
+| `src/codegen.lisp` | Shared-header generation for userland (C/Go/Rust/Python/CL), used by `compile ... --gen <lang>` |
+| `src/whistler.lisp` | Top-level interface: `defmap`, `defprog`, `defstruct`, `compile-to-elf`, CLI dispatch |
+| `src/loader/` | Pure CL userspace loader (ASDF system `whistler/loader`) — see "Userspace Loader" below |
+| `src/bpftrace/` | bpftrace frontend (ASDF system `whistler/bpftrace`) — parses bpftrace scripts, compiles via Whistler |
+| `src/symbolize/` | Standalone `/proc/<pid>/maps` + ELF/DWARF symbolizer for user-stack resolution (ASDF system `whistler/symbolize`) |
 
 ### Packages
 
 - `whistler/bpf` — BPF constants and instruction constructors
-- `whistler/compiler` — Legacy compiler, macro expansion, **shared definitions** (`*builtin-helpers*`, `*builtin-constants*`, `*whistler-builtins*`, `sym=`, `bpf-type-p`)
+- `whistler/compiler` — Macro expansion, **shared definitions** (`*builtin-helpers*`, `*builtin-constants*`, `*builtin-kfuncs*`, `*whistler-builtins*`, `sym=`, `bpf-type-p`)
 - `whistler/ir` — IR, lowering, optimization, regalloc, emission, peephole
 - `whistler/elf` — ELF output
 - `whistler/btf` — BTF and BTF.ext encoding
@@ -78,7 +83,7 @@ Memory ops: `(memset ptr off val n)` with widened stores, `(memcpy dst doff src 
 
 ### kfuncs
 
-kfuncs are kernel functions a BPF program *calls* — the extensible replacement for the frozen helper set. Whistler resolves them by BTF at load time (no libbpf): a kfunc call compiles to a `BPF_PSEUDO_KFUNC_CALL`, the ELF carries an `R_BPF_64_32` relocation against an extern BTF `FUNC`, and the loader patches in the kfunc's vmlinux BTF id. Both load paths patch kfunc relocs — the ELF loader (`patch-kfunc-relocations` in `loader.lisp`) and the session/bpftrace-runtime path (`session-load-progs` in `session.lisp`).
+kfuncs are kernel functions a BPF program *calls* — the extensible replacement for the frozen helper set. Whistler resolves them by BTF at load time (no libbpf): a kfunc call compiles to a `BPF_PSEUDO_KFUNC_CALL`, the ELF carries an `R_BPF_64_32` relocation against an extern BTF `FUNC`, and the loader patches in the kfunc's vmlinux BTF id. Both load paths patch kfunc relocs — the ELF loader (`patch-kfunc-relocations` in `src/loader/loader.lisp`) and the session/bpftrace-runtime path (`session-load-progs` in `src/loader/session.lisp`).
 
 Call a kfunc by name like a helper: `(bpf-task-from-pid pid)`. Six kfuncs ship predeclared (`bpf-rcu-read-lock`/`unlock`, `bpf-task-from-pid`/`bpf-task-release`, `bpf-cgroup-from-id`/`bpf-cgroup-release`). Declare your own with `defkfunc`:
 
@@ -89,7 +94,7 @@ Call a kfunc by name like a helper: `(bpf-task-from-pid pid)`. Six kfuncs ship p
 
 The Lisp name maps to the kernel symbol by turning hyphens into underscores. Types are `u8`..`u64`, `s32`/`s64`, `void`, or `(ptr STRUCT)`. Flags drive compile-time checks: `:acquire` (result is a refcounted pointer that must be released — leaking it is a compile error), `:release` (consumes an acquired reference), `:ret-null` (result may be NULL and must be null-checked; passing a bare maybe-null result to another kfunc is a compile error); `:trusted`/`:sleepable` are recorded but verifier-enforced. The BPF verifier remains authoritative for per-path completeness and for the per-program-type kfunc allowlist (e.g. `bpf_task_from_pid` is TRACING/syscall-only, not kprobe/xdp). The shared registry `*builtin-kfuncs*` in `compiler.lisp` is the single source of truth for both frontends and the loader. See `examples/kfunc-task.lisp` (Whistler) and `examples/bpftrace/kfunc-rcu.bt` (bpftrace).
 
-The registry (`*builtin-kfuncs*`), lowering (`lower-kfunc-call` + acquire/release leak check in `lower.lisp`), BTF extern FUNC emission (`btf-add-kfunc` in `btf.lisp`), and ELF relocs (`elf.lisp`) are shared; the bpftrace frontend recognizes a kfunc by its kernel name in `lower-call` (`codegen.lisp`) and emits the same Whistler kfunc call.
+The registry (`*builtin-kfuncs*`), lowering (`lower-kfunc-call` + acquire/release leak check in `lower.lisp`), BTF extern FUNC emission (`btf-add-kfunc` in `btf.lisp`), and ELF relocs (`elf.lisp`) are shared; the bpftrace frontend recognizes a kfunc by its kernel name in `lower-call` (`src/bpftrace/codegen.lisp`) and emits the same Whistler kfunc call.
 
 ## Userspace Loader (whistler/loader)
 
