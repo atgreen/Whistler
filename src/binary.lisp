@@ -16,6 +16,8 @@
    #:u8 #:u16 #:u32 #:u64
    ;; Little-endian stream writers
    #:write-u8 #:write-u16le #:write-u32le #:write-u64le
+   ;; ELF64 record decoders
+   #:elf64-shdr-table #:elf64-shdr-fields #:elf64-sym-fields
    ;; ELF identification / header
    #:+elf-magic+ #:+elfclass64+ #:+elfdata2lsb+ #:+ev-current+
    #:+elfosabi-none+ #:+et-rel+ #:+et-exec+ #:+et-dyn+ #:+em-bpf+
@@ -118,6 +120,41 @@
 
 (defun u64 (buf off)
   (logior (u32 buf off) (ash (u32 buf (+ off 4)) 32)))
+
+;;; ========== ELF64 record decoders ==========
+;;;
+;;; The field-offset knowledge for the ELF64 records that both the
+;;; loader (whistler/loader) and the symbolizer (whistler/symbolize)
+;;; walk. Each reader keeps its own result structs; only the raw
+;;; offset arithmetic lives here.
+
+(defun elf64-shdr-table (buf)
+  "Decode the section-header-table geometry from an ELF64 header.
+   Returns (values sh-off sh-entsize sh-num sh-strndx)."
+  (values (u64 buf 40)    ; e_shoff
+          (u16 buf 58)    ; e_shentsize
+          (u16 buf 60)    ; e_shnum
+          (u16 buf 62)))  ; e_shstrndx
+
+(defun elf64-shdr-fields (buf off)
+  "Decode a 64-byte Elf64_Shdr at OFF. Returns (values name-off type
+   flags offset size link info)."
+  (values (u32 buf off)          ; sh_name (offset into shstrtab)
+          (u32 buf (+ off 4))    ; sh_type
+          (u64 buf (+ off 8))    ; sh_flags
+          (u64 buf (+ off 24))   ; sh_offset
+          (u64 buf (+ off 32))   ; sh_size
+          (u32 buf (+ off 40))   ; sh_link
+          (u32 buf (+ off 44)))) ; sh_info
+
+(defun elf64-sym-fields (buf off)
+  "Decode a 24-byte Elf64_Sym at OFF. Returns (values name-off info
+   shndx value size)."
+  (values (u32 buf off)          ; st_name (offset into strtab)
+          (u8  buf (+ off 4))    ; st_info (low nybble TYPE, high BIND)
+          (u16 buf (+ off 6))    ; st_shndx
+          (u64 buf (+ off 8))    ; st_value
+          (u64 buf (+ off 16)))) ; st_size
 
 ;;; ========== Little-endian stream writers ==========
 

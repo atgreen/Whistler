@@ -39,23 +39,19 @@
 
 (defun parse-section-header (bytes offset)
   "Parse a 64-byte ELF section header."
-  (make-elf-section
-   :name (u32 bytes offset)             ; sh_name (index into shstrtab)
-   :type (u32 bytes (+ offset 4))       ; sh_type
-   :flags (u64 bytes (+ offset 8))      ; sh_flags
-   :offset (u64 bytes (+ offset 24))    ; sh_offset
-   :size (u64 bytes (+ offset 32))      ; sh_size
-   :link (u32 bytes (+ offset 40))      ; sh_link
-   :info (u32 bytes (+ offset 44))))    ; sh_info
+  (multiple-value-bind (name type flags sec-off size link info)
+      (elf64-shdr-fields bytes offset)
+    (make-elf-section
+     :name name :type type :flags flags
+     :offset sec-off :size size :link link :info info)))
 
 (defun parse-symtab-entry (bytes offset strtab)
   "Parse a 24-byte ELF symbol table entry."
-  (make-elf-sym
-   :name (elf-string strtab (u32 bytes offset))
-   :info (aref bytes (+ offset 4))
-   :shndx (u16 bytes (+ offset 6))
-   :value (u64 bytes (+ offset 8))
-   :size (u64 bytes (+ offset 16))))
+  (multiple-value-bind (name-off info shndx value size)
+      (elf64-sym-fields bytes offset)
+    (make-elf-sym
+     :name (elf-string strtab name-off)
+     :info info :shndx shndx :value value :size size)))
 
 (defun parse-rel-entry (bytes offset)
   "Parse a 16-byte ELF REL entry.
@@ -82,11 +78,9 @@
       (error "Not a 64-bit LE BPF ELF: class=~d data=~d machine=~d"
              class data machine))
 
-    (let* ((e-shoff (u64 bytes 40))
-           (e-shentsize (u16 bytes 58))
-           (e-shnum (u16 bytes 60))
-           (e-shstrndx (u16 bytes 62))
-           ;; Parse all section headers
+    (multiple-value-bind (e-shoff e-shentsize e-shnum e-shstrndx)
+        (elf64-shdr-table bytes)
+      (let* (;; Parse all section headers
            (sections (loop for i below e-shnum
                            collect (parse-section-header
                                     bytes (+ e-shoff (* i e-shentsize)))))
@@ -160,4 +154,4 @@
          :license license
          :prog-sections (nreverse prog-sections)
          :map-section map-section
-         :rel-sections rel-sections)))))
+         :rel-sections rel-sections))))))
