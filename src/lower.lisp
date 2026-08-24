@@ -230,225 +230,84 @@
   (let ((head (car form))
         (args (cdr form)))
     (cond
+      ;; Sequencing and control flow
       ((sym= head 'progn)
        (let ((result nil))
          (dolist (expr args) (setf result (lower-expr ctx expr)))
          result))
+      ((sym= head 'let)       (lower-let ctx (first args) (rest args)))
+      ((sym= head 'let*)      (lower-let* ctx (first args) (rest args)))
+      ((sym= head 'if)        (lower-if ctx (first args) (second args) (third args)))
+      ((sym= head 'when)      (lower-if ctx (first args) (cons 'progn (rest args)) nil))
+      ((sym= head 'unless)    (lower-if ctx (first args) nil (cons 'progn (rest args))))
+      ((sym= head 'cond)      (lower-cond ctx args))
+      ((sym= head 'and)       (lower-and ctx args))
+      ((sym= head 'or)        (lower-or ctx args))
+      ((sym= head 'not)       (lower-not ctx (first args)))
+      ((sym= head 'dotimes)   (lower-dotimes ctx (first args) (rest args)))
+      ((sym= head 'return)    (lower-return ctx args))
 
-      ((sym= head 'let)
-       (lower-let ctx (first args) (rest args)))
+      ;; Arithmetic, comparison, casts
+      ((sym= head 'ash)       (lower-ash ctx args))
+      ((ir-alu-op head)       (lower-alu ctx head args))
+      ((ir-jmp-op head)       (lower-cmp ctx head (first args) (second args)))
+      ((sym= head 'log2)      (lower-log2 ctx (first args)))
+      ((sym= head 'cast)      (lower-cast ctx (first args) (second args)))
+      ((or (sym= head 'ntohs)  (sym= head 'htons))
+       (lower-byteswap ctx :bswap16 'u16 (first args)))
+      ((or (sym= head 'ntohl)  (sym= head 'htonl))
+       (lower-byteswap ctx :bswap32 'u32 (first args)))
+      ((or (sym= head 'ntohll) (sym= head 'htonll))
+       (lower-byteswap ctx :bswap64 'u64 (first args)))
 
-      ((sym= head 'let*)
-       (lower-let* ctx (first args) (rest args)))
+      ;; Memory access
+      ((sym= head 'load)       (lower-load ctx args))
+      ((sym= head 'core-load)  (lower-core-load ctx args))
+      ((sym= head 'store)      (lower-store ctx args))
+      ((sym= head 'core-store) (lower-core-store ctx args))
+      ((sym= head 'atomic-add) (lower-atomic-add ctx args))
+      ((sym= head 'stack-addr) (lower-stack-addr ctx (first args)))
+      ((sym= head 'struct-alloc) (lower-struct-alloc ctx (first args)))
+      ((sym= head 'ld-btf-id)  (lower-ld-btf-id ctx args))
 
-      ((sym= head 'if)
-       (lower-if ctx (first args) (second args) (third args)))
-
-      ((sym= head 'return)
-       (let ((val (if args (lower-expr ctx (first args))
-                      (let ((v (ctx-fresh-vreg ctx)))
-                        (ctx-emit ctx :mov v (list '(:imm 0)) 'u64)
-                        v))))
-         (ctx-emit ctx :ret nil (list val))
-         nil))
-
-      ;; (ld-btf-id BTF-ID) — emit ld_imm64 with src_reg=BPF_PSEUDO_BTF_ID.
-      ;; The kernel resolves BTF-ID at load time and the verifier types
-      ;; the destination as the symbol's actual percpu_ptr_<T> rather
-      ;; than a scalar. Used by lower-percpu-kaddr-call so
-      ;; bpf_per_cpu_ptr accepts R1.
-      ((sym= head 'ld-btf-id)
-       (unless (and args (integerp (first args)))
-         (whistler/compiler:whistler-error
-          :what "ld-btf-id requires a constant BTF type id"
-          :where (format nil "(ld-btf-id ~s)" (first args))
-          :expected "(ld-btf-id INTEGER-CONSTANT)"))
-       (let ((v (ctx-fresh-vreg ctx)))
-         (ctx-emit ctx :mov v (list `(:btf-id ,(first args))) 'u64)
-         v))
-
-      ;; CL ash: (ash value count) — left shift if count > 0, right if < 0
-      ((sym= head 'ash)
-       (let ((count (second args)))
-         (unless (integerp count)
-           (whistler/compiler:whistler-error
-            :what (format nil "non-constant shift count: ~a" count)
-            :where (format nil "(ash ~a ~a)" (first args) count)
-            :expected "a compile-time constant integer"
-            :hint "BPF requires constant shift amounts. Use (<< val N) or (>> val N) with a literal."))
-         (cond
-           ((>= count 0)
-            (lower-alu ctx '<< (list (first args) count)))
-           (t
-            (lower-alu ctx '>> (list (first args) (- count)))))))
-
-      ((ir-alu-op head)
-       (lower-alu ctx head args))
-
-      ((ir-jmp-op head)
-       (lower-cmp ctx head (first args) (second args)))
-
-      ((sym= head 'load)
-       (lower-load ctx args))
-
-      ((sym= head 'core-load)
-       (lower-core-load ctx args))
-
-      ((sym= head 'store)
-       (lower-store ctx args))
-
-      ((sym= head 'core-store)
-       (lower-core-store ctx args))
-
-      ((sym= head 'atomic-add)
-       (lower-atomic-add ctx args))
-
-      ((sym= head 'map-lookup)
-       (lower-map-lookup ctx (first args) (second args)))
-
-      ((sym= head 'map-lookup-ptr)
-       (lower-map-lookup-ptr ctx (first args) (second args)))
-
+      ;; Map operations
+      ((sym= head 'map-lookup)     (lower-map-lookup ctx (first args) (second args)))
+      ((sym= head 'map-lookup-ptr) (lower-map-lookup-ptr ctx (first args) (second args)))
       ((sym= head 'map-update)
        (lower-map-update ctx (first args) (second args) (third args)
                          (or (fourth args) 0)))
-
-      ((sym= head 'map-delete)
-       (lower-map-delete ctx (first args) (second args)))
-
+      ((sym= head 'map-delete)     (lower-map-delete ctx (first args) (second args)))
       ((sym= head 'map-update-ptr)
        (lower-map-update-ptr ctx (first args) (second args) (third args)
                              (or (fourth args) 0)))
-
-      ((sym= head 'map-delete-ptr)
-       (lower-map-delete-ptr ctx (first args) (second args)))
+      ((sym= head 'map-delete-ptr) (lower-map-delete-ptr ctx (first args) (second args)))
 
       ;; Ring buffer operations (first arg is map name)
       ((sym= head 'ringbuf-output)
        (lower-ringbuf-output ctx (first args) (second args) (third args) (fourth args)))
-
       ((sym= head 'ringbuf-reserve)
        (lower-ringbuf-reserve ctx (first args) (second args) (third args)))
+      ((sym= head 'ringbuf-submit)  (lower-ringbuf-submit ctx (first args) (second args)))
+      ((sym= head 'ringbuf-discard) (lower-ringbuf-discard ctx (first args) (second args)))
 
-      ((sym= head 'ringbuf-submit)
-       (lower-ringbuf-submit ctx (first args) (second args)))
-
-      ((sym= head 'ringbuf-discard)
-       (lower-ringbuf-discard ctx (first args) (second args)))
-
-      ((sym= head 'ctx)
-       (if (whistler/compiler:bpf-type-p (first args))
-           ;; Legacy: (ctx TYPE OFFSET)
-           (lower-ctx-load ctx (first args) (second args))
-           ;; Field name: (ctx field-name) or (ctx field-name index)
-           ;; Emit with CO-RE metadata for relocatable access
-           (multiple-value-bind (type offset struct-name c-field)
-               (whistler/compiler:ctx-resolve-field (lower-ctx-prog-type ctx)
-                                           (first args) (second args))
-             (lower-core-ctx-load ctx (list type offset struct-name c-field)))))
-
+      ;; Context access
+      ((sym= head 'ctx)           (lower-ctx-form ctx args))
+      ((sym= head '%ctx-set)      (lower-ctx-set ctx args))
+      ((sym= head 'core-ctx-load) (lower-core-ctx-load ctx args))
       ((sym= head 'ctx-load)
        (warn "ctx-load is deprecated; use (ctx TYPE OFFSET) instead")
        (lower-ctx-load ctx (first args) (second args)))
-
-      ((sym= head 'tail-call)
-       (lower-tail-call ctx (first args) (second args)))
-
-      ((sym= head 'get-stackid)
-       (lower-get-stackid ctx (first args) (second args) (third args)))
-
-      ((sym= head 'core-ctx-load)
-       (lower-core-ctx-load ctx args))
-
-      ((sym= head '%ctx-set)
-       ;; Internal form emitted by (setf (ctx ...) ...) expansion
-       ;; Shapes: (%ctx-set TYPE OFFSET VAL) or (%ctx-set FIELD VAL)
-       ;;         or (%ctx-set FIELD INDEX VAL)
-       (if (whistler/compiler:bpf-type-p (first args))
-           ;; Legacy: (%ctx-set TYPE OFFSET VAL)
-           (lower-ctx-store ctx (first args) (second args) (third args))
-           ;; Field name: last arg is always the value
-           ;; Emit with CO-RE metadata for relocatable access
-           (let ((value-form (car (last args)))
-                 (field-args (butlast (cdr args))))
-             (multiple-value-bind (type offset struct-name c-field)
-                 (whistler/compiler:ctx-resolve-field (lower-ctx-prog-type ctx)
-                                            (first args) (first field-args))
-               (lower-core-ctx-store ctx type offset value-form
-                                     struct-name c-field)))))
-
       ((sym= head 'ctx-store)
        (warn "ctx-store is deprecated; use (setf (ctx TYPE OFFSET) VALUE) instead")
        (lower-ctx-store ctx (first args) (second args) (third args)))
-
       ((sym= head 'ctx-ptr)
        ;; Return the raw context pointer (R1) for passing to helpers
        (cdr (ctx-lookup-var ctx (intern "%%CTX" (find-package '#:whistler/ir)))))
 
-      ((sym= head 'setf)
-       ;; CL-style multi-pair setf: (setf place1 val1 place2 val2 ...)
-       (let ((pairs args)
-             (result nil))
-         (loop while pairs do
-           (unless (cdr pairs)
-             (whistler/compiler:whistler-error
-              :what "odd number of arguments to setf"
-              :where (format nil "(setf ~{~s~^ ~})" args)
-              :expected "(setf place value ...) with paired arguments"))
-           (setf result (lower-setf ctx (first pairs) (second pairs)))
-           (setf pairs (cddr pairs)))
-         result))
-
-      ((sym= head 'stack-addr)
-       (lower-stack-addr ctx (first args)))
-
-      ((sym= head 'struct-alloc)
-       (lower-struct-alloc ctx (first args)))
-
-      ((sym= head 'when)
-       (lower-if ctx (first args) (cons 'progn (rest args)) nil))
-
-      ((sym= head 'unless)
-       (lower-if ctx (first args) nil (cons 'progn (rest args))))
-
-      ((sym= head 'cond)
-       (lower-cond ctx args))
-
-      ((sym= head 'and)
-       (lower-and ctx args))
-
-      ((sym= head 'or)
-       (lower-or ctx args))
-
-      ((sym= head 'not)
-       (lower-not ctx (first args)))
-
-      ((sym= head 'log2)
-       (lower-log2 ctx (first args)))
-
-      ((sym= head 'dotimes)
-       (lower-dotimes ctx (first args) (rest args)))
-
-      ((sym= head 'cast)
-       (lower-cast ctx (first args) (second args)))
-
-      ((or (sym= head 'ntohs) (sym= head 'htons))
-       (let ((v (lower-expr ctx (first args)))
-             (dst (ctx-fresh-vreg ctx)))
-         (ctx-emit ctx :bswap16 dst (list v) 'u16)
-         dst))
-
-      ((or (sym= head 'ntohl) (sym= head 'htonl))
-       (let ((v (lower-expr ctx (first args)))
-             (dst (ctx-fresh-vreg ctx)))
-         (ctx-emit ctx :bswap32 dst (list v) 'u32)
-         dst))
-
-      ((or (sym= head 'ntohll) (sym= head 'htonll))
-       (let ((v (lower-expr ctx (first args)))
-             (dst (ctx-fresh-vreg ctx)))
-         (ctx-emit ctx :bswap64 dst (list v) 'u64)
-         dst))
+      ;; Assignment, tail calls, stack traces
+      ((sym= head 'setf)        (lower-setf-pairs ctx args))
+      ((sym= head 'tail-call)   (lower-tail-call ctx (first args) (second args)))
+      ((sym= head 'get-stackid) (lower-get-stackid ctx (first args) (second args) (third args)))
 
       ;; (kfunc-name arg1 arg2 ...) — BPF kfunc call in function position.
       ;; Checked before helpers: the two tables are disjoint, but kfuncs
@@ -460,16 +319,109 @@
       ((ir-builtin-helper-p head)
        (lower-helper-call ctx head args))
 
-      (t (whistler/compiler:whistler-error
-          :what (format nil "unknown form: ~a" head)
-          :where (format nil "(~a ...)" head)
-          :expected "a Whistler builtin (let, if, when, dotimes, ...), arithmetic op (+, -, *, ...), comparison (=, >, <, ...), or BPF helper (probe-read-user, ktime-get-ns, ...)"
-          :hint (if (member (symbol-name head)
-                            '("FORMAT" "PRINT" "LOOP" "MAPCAR" "FUNCALL" "APPLY"
-                              "CONCATENATE" "STRING" "LIST" "CONS" "MAKE-ARRAY")
-                            :test #'string=)
-                    (format nil "CL function ~a is not available in BPF programs" head)
-                    (format nil "check spelling, or ensure the macro/form is defined before compilation")))))))
+      (t (lower-unknown-form head)))))
+
+(defun lower-return (ctx args)
+  "Lower (return [VALUE]) — a missing value returns 0."
+  (let ((val (if args (lower-expr ctx (first args))
+                 (let ((v (ctx-fresh-vreg ctx)))
+                   (ctx-emit ctx :mov v (list '(:imm 0)) 'u64)
+                   v))))
+    (ctx-emit ctx :ret nil (list val))
+    nil))
+
+;; (ld-btf-id BTF-ID) — emit ld_imm64 with src_reg=BPF_PSEUDO_BTF_ID.
+;; The kernel resolves BTF-ID at load time and the verifier types
+;; the destination as the symbol's actual percpu_ptr_<T> rather
+;; than a scalar. Used by lower-percpu-kaddr-call so
+;; bpf_per_cpu_ptr accepts R1.
+(defun lower-ld-btf-id (ctx args)
+  (unless (and args (integerp (first args)))
+    (whistler/compiler:whistler-error
+     :what "ld-btf-id requires a constant BTF type id"
+     :where (format nil "(ld-btf-id ~s)" (first args))
+     :expected "(ld-btf-id INTEGER-CONSTANT)"))
+  (let ((v (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx :mov v (list `(:btf-id ,(first args))) 'u64)
+    v))
+
+;; CL ash: (ash value count) — left shift if count > 0, right if < 0
+(defun lower-ash (ctx args)
+  (let ((count (second args)))
+    (unless (integerp count)
+      (whistler/compiler:whistler-error
+       :what (format nil "non-constant shift count: ~a" count)
+       :where (format nil "(ash ~a ~a)" (first args) count)
+       :expected "a compile-time constant integer"
+       :hint "BPF requires constant shift amounts. Use (<< val N) or (>> val N) with a literal."))
+    (cond
+      ((>= count 0)
+       (lower-alu ctx '<< (list (first args) count)))
+      (t
+       (lower-alu ctx '>> (list (first args) (- count)))))))
+
+(defun lower-byteswap (ctx op type expr)
+  "Lower ntohs/htons/ntohl/htonl/ntohll/htonll to a byte-swap insn."
+  (let ((v (lower-expr ctx expr))
+        (dst (ctx-fresh-vreg ctx)))
+    (ctx-emit ctx op dst (list v) type)
+    dst))
+
+(defun lower-ctx-form (ctx args)
+  "Lower (ctx ...) context reads."
+  (if (whistler/compiler:bpf-type-p (first args))
+      ;; Legacy: (ctx TYPE OFFSET)
+      (lower-ctx-load ctx (first args) (second args))
+      ;; Field name: (ctx field-name) or (ctx field-name index)
+      ;; Emit with CO-RE metadata for relocatable access
+      (multiple-value-bind (type offset struct-name c-field)
+          (whistler/compiler:ctx-resolve-field (lower-ctx-prog-type ctx)
+                                      (first args) (second args))
+        (lower-core-ctx-load ctx (list type offset struct-name c-field)))))
+
+(defun lower-ctx-set (ctx args)
+  "Lower %ctx-set, the internal form emitted by (setf (ctx ...) ...) expansion.
+   Shapes: (%ctx-set TYPE OFFSET VAL) or (%ctx-set FIELD VAL)
+           or (%ctx-set FIELD INDEX VAL)"
+  (if (whistler/compiler:bpf-type-p (first args))
+      ;; Legacy: (%ctx-set TYPE OFFSET VAL)
+      (lower-ctx-store ctx (first args) (second args) (third args))
+      ;; Field name: last arg is always the value
+      ;; Emit with CO-RE metadata for relocatable access
+      (let ((value-form (car (last args)))
+            (field-args (butlast (cdr args))))
+        (multiple-value-bind (type offset struct-name c-field)
+            (whistler/compiler:ctx-resolve-field (lower-ctx-prog-type ctx)
+                                       (first args) (first field-args))
+          (lower-core-ctx-store ctx type offset value-form
+                                struct-name c-field)))))
+
+(defun lower-setf-pairs (ctx args)
+  "Lower CL-style multi-pair setf: (setf place1 val1 place2 val2 ...)."
+  (let ((pairs args)
+        (result nil))
+    (loop while pairs do
+      (unless (cdr pairs)
+        (whistler/compiler:whistler-error
+         :what "odd number of arguments to setf"
+         :where (format nil "(setf ~{~s~^ ~})" args)
+         :expected "(setf place value ...) with paired arguments"))
+      (setf result (lower-setf ctx (first pairs) (second pairs)))
+      (setf pairs (cddr pairs)))
+    result))
+
+(defun lower-unknown-form (head)
+  "Signal a compile error for a form LOWER-FORM does not recognize."
+  (whistler/compiler:whistler-error
+   :what (format nil "unknown form: ~a" head)
+   :where (format nil "(~a ...)" head)
+   :expected "a Whistler builtin (let, if, when, dotimes, ...), arithmetic op (+, -, *, ...), comparison (=, >, <, ...), or BPF helper (probe-read-user, ktime-get-ns, ...)"
+   :hint (if (member (symbol-name head)
+                     '("FORMAT" "PRINT" "LOOP" "MAPCAR" "FUNCALL" "APPLY"
+                       "CONCATENATE" "STRING" "LIST" "CONS" "MAKE-ARRAY")
+                     :test #'string=)
+             (format nil "CL function ~a is not available in BPF programs" head)
+             (format nil "check spelling, or ensure the macro/form is defined before compilation"))))
 
 ;;; ========== Let bindings ==========
 
