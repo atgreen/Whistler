@@ -9,48 +9,9 @@
 ;;; Minimal ELF writer for BPF object files
 ;;; Produces 64-bit little-endian ELF relocatable objects
 
-;; ELF constants
-(defconstant +elfclass64+   2)
-(defconstant +elfdata2lsb+  1)
-(defconstant +ev-current+   1)
-(defconstant +elfosabi-none+ 0)
-(defconstant +et-rel+       1)    ; relocatable
-(defconstant +em-bpf+       247)  ; eBPF
-(defconstant +sht-null+     0)
-(defconstant +sht-progbits+ 1)
-(defconstant +sht-symtab+   2)
-(defconstant +sht-strtab+   3)
-(defconstant +sht-rel+      9)
-(defconstant +shf-alloc+    #x2)
-(defconstant +shf-execinstr+ #x4)
-(defconstant +stt-notype+   0)
-(defconstant +stt-object+   1)
-(defconstant +stt-section+  3)
-(defconstant +stt-func+     18)   ; STT_FUNC = 2, but encoded in st_info
-(defconstant +stb-local+    0)
-(defconstant +stb-global+   1)
-(defconstant +shn-undef+    0)
-(defconstant +r-bpf-64-64+  1)   ; BPF relocation type for map fd (ld_imm64)
-(defconstant +r-bpf-64-32+  10)  ; BPF relocation type for call imm (kfunc)
+;; ELF constants and byte writers come from whistler/binary.
 
 ;;; Binary writing utilities
-
-(defun write-u8 (stream val)
-  (write-byte (logand val #xff) stream))
-
-(defun write-u16le (stream val)
-  (write-u8 stream val)
-  (write-u8 stream (ash val -8)))
-
-(defun write-u32le (stream val)
-  (write-u8 stream val)
-  (write-u8 stream (ash val -8))
-  (write-u8 stream (ash val -16))
-  (write-u8 stream (ash val -24)))
-
-(defun write-u64le (stream val)
-  (write-u32le stream (logand val #xffffffff))
-  (write-u32le stream (logand (ash val -32) #xffffffff)))
 
 (defun write-bytes (stream bytes)
   (write-sequence bytes stream))
@@ -319,7 +280,7 @@
                    (sec-idx (cdr (assoc sec-name prog-sec-indices :test #'string=)))
                    (func-name-off (strtab-add strtab prog-name)))
               (push (encode-sym func-name-off
-                                (st-info +stb-global+ 2) 0  ; STT_FUNC=2
+                                (st-info +stb-global+ +stt-func+) 0
                                 sec-idx 0 (length prog-bytes))
                     syms)))
 

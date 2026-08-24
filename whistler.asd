@@ -1,9 +1,18 @@
+(defsystem "whistler/binary"
+  :description "Shared ELF/BTF constants and little-endian byte-IO helpers"
+  :version "1.11.0"
+  :author "Anthony Green <green@moxielogic.com>"
+  :license "MIT"
+  :depends-on ()
+  :pathname "src/"
+  :components ((:file "binary")))
+
 (defsystem "whistler"
   :description "A Lisp that compiles to eBPF"
   :version "1.11.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
-  :depends-on ()
+  :depends-on ("whistler/binary")
   :in-order-to ((test-op (test-op "whistler/tests")))
   :serial t
   :pathname "src/"
@@ -29,7 +38,7 @@
   :version "1.11.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
-  :depends-on ("whistler")
+  :depends-on ("whistler" "whistler/binary")
   :serial t
   :pathname "src/loader/"
   :components ((:file "packages")
@@ -59,7 +68,7 @@
   :version "1.11.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
-  :depends-on ()
+  :depends-on ("whistler/binary")
   :serial t
   :pathname "src/symbolize/"
   :components ((:file "packages")

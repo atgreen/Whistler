@@ -236,8 +236,8 @@
                         ;; type(4) key_size(4) value_size(4) max_entries(4) flags(4) ...
                         (make-map-info
                          :name (elf-sym-name sym)
-                         :type (elf-u32 data off)
-                         :key-size (elf-u32 data (+ off 4))
-                         :value-size (elf-u32 data (+ off 8))
-                         :max-entries (elf-u32 data (+ off 12))
-                         :flags (elf-u32 data (+ off 16)))))))))
+                         :type (u32 data off)
+                         :key-size (u32 data (+ off 4))
+                         :value-size (u32 data (+ off 8))
+                         :max-entries (u32 data (+ off 12))
+                         :flags (u32 data (+ off 16)))))))))

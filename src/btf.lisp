@@ -12,20 +12,9 @@
 
 ;;; BTF constants
 
-(defconstant +btf-magic+ #xeB9F)
+;; +btf-magic+ and the +btf-kind-*+ constants come from whistler/binary.
 (defconstant +btf-version+ 1)
 (defconstant +btf-header-size+ 24)
-
-;; BTF type kinds (stored in bits 24-28 of info field)
-(defconstant +btf-kind-int+        1)
-(defconstant +btf-kind-ptr+        2)
-(defconstant +btf-kind-array+      3)
-(defconstant +btf-kind-struct+     4)
-(defconstant +btf-kind-var+       14)
-(defconstant +btf-kind-datasec+   15)
-(defconstant +btf-kind-func-proto+ 13)
-(defconstant +btf-kind-func+      12)
-(defconstant +btf-kind-fwd+        7)
 
 ;; BTF_KIND_FUNC linkage (stored in the info vlen field)
 (defconstant +btf-func-static+ 0)

@@ -192,16 +192,16 @@
    PT_LOAD segment contains it — the kernel-side uprobe machinery
    will then reject EINVAL, which is correct: we couldn't classify
    the address."
-  (let ((e-phoff (elf-u64 bytes 32))
-        (e-phentsize (elf-u16 bytes 54))
-        (e-phnum (elf-u16 bytes 56)))
+  (let ((e-phoff (u64 bytes 32))
+        (e-phentsize (u16 bytes 54))
+        (e-phnum (u16 bytes 56)))
     (or (loop for i below e-phnum
               for ph-off = (+ e-phoff (* i e-phentsize))
-              for p-type = (elf-u32 bytes ph-off)
+              for p-type = (u32 bytes ph-off)
               when (= p-type 1)  ; PT_LOAD
-                do (let ((p-offset (elf-u64 bytes (+ ph-off 8)))
-                         (p-vaddr (elf-u64 bytes (+ ph-off 16)))
-                         (p-memsz (elf-u64 bytes (+ ph-off 40))))
+                do (let ((p-offset (u64 bytes (+ ph-off 8)))
+                         (p-vaddr (u64 bytes (+ ph-off 16)))
+                         (p-memsz (u64 bytes (+ ph-off 40))))
                      (when (and (>= vaddr p-vaddr)
                                 (< vaddr (+ p-vaddr p-memsz)))
                        (return (+ p-offset (- vaddr p-vaddr))))))
@@ -212,23 +212,23 @@
    Looks up st_value in symtab/dynsym, then converts the virtual address
    to a file offset via PT_LOAD segment mapping."
   (let* ((bytes (read-elf-bytes binary-path))
-         (e-shoff (elf-u64 bytes 40))
-         (e-shentsize (elf-u16 bytes 58))
-         (e-shnum (elf-u16 bytes 60)))
+         (e-shoff (u64 bytes 40))
+         (e-shentsize (u16 bytes 58))
+         (e-shnum (u16 bytes 60)))
     (loop for i below e-shnum
           for hdr-off = (+ e-shoff (* i e-shentsize))
-          for sh-type = (elf-u32 bytes (+ hdr-off 4))
-          for sh-link = (elf-u32 bytes (+ hdr-off 40))
+          for sh-type = (u32 bytes (+ hdr-off 4))
+          for sh-link = (u32 bytes (+ hdr-off 40))
           when (or (= sh-type 2) (= sh-type 11))  ; SHT_SYMTAB or SHT_DYNSYM
-          do (let* ((sym-off (elf-u64 bytes (+ hdr-off 24)))
-                    (sym-size (elf-u64 bytes (+ hdr-off 32)))
+          do (let* ((sym-off (u64 bytes (+ hdr-off 24)))
+                    (sym-size (u64 bytes (+ hdr-off 32)))
                     (str-hdr-off (+ e-shoff (* sh-link e-shentsize)))
-                    (str-off (elf-u64 bytes (+ str-hdr-off 24)))
-                    (str-size (elf-u64 bytes (+ str-hdr-off 32)))
+                    (str-off (u64 bytes (+ str-hdr-off 24)))
+                    (str-size (u64 bytes (+ str-hdr-off 32)))
                     (strtab (subseq bytes str-off (+ str-off str-size))))
                (loop for off from 0 below sym-size by 24
-                     for name = (elf-string strtab (elf-u32 bytes (+ sym-off off)))
-                     for value = (elf-u64 bytes (+ sym-off off 8))
+                     for name = (elf-string strtab (u32 bytes (+ sym-off off)))
+                     for value = (u64 bytes (+ sym-off off 8))
                      when (string= name symbol-name)
                      do (return-from resolve-elf-symbol-offset
                           (vaddr-to-file-offset bytes value)))))

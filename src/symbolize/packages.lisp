@@ -6,13 +6,14 @@
 ;;; address (typically an IP captured by bpf_get_stackid with
 ;;; BPF_F_USER_STACK), return the symbol name + offset + owning file.
 ;;;
-;;; Standalone — no dependencies beyond SBCL. Designed to be the
-;;; userspace counterpart to whistler/bpftrace's existing kallsyms
-;;; symboliser, used by `ustack' rendering and any future tool that
-;;; needs to make sense of userland addresses.
+;;; Depends only on SBCL and whistler/binary (shared ELF constants and
+;;; byte helpers). Designed to be the userspace counterpart to
+;;; whistler/bpftrace's existing kallsyms symboliser, used by `ustack'
+;;; rendering and any future tool that needs to make sense of userland
+;;; addresses.
 
 (defpackage #:whistler/symbolize
-  (:use #:cl)
+  (:use #:cl #:whistler/binary)
   (:export
    ;; Public API
    #:open-symbolizer

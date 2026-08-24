@@ -6,18 +6,7 @@
 
 (in-package #:whistler/loader)
 
-;;; ========== ELF constants ==========
-
-(defconstant +elf-magic+ #x464c457f)  ; "\x7fELF"
-(defconstant +em-bpf+ 247)
-(defconstant +sht-progbits+ 1)
-(defconstant +sht-symtab+ 2)
-(defconstant +sht-strtab+ 3)
-(defconstant +sht-rel+ 9)
-(defconstant +shf-execinstr+ 4)
-(defconstant +shf-alloc+ 2)
-(defconstant +stt-object+ 1)
-(defconstant +stt-func+ 2)
+;;; ELF constants and byte readers come from whistler/binary.
 
 ;;; ========== Data structures ==========
 
@@ -43,19 +32,6 @@
       (read-sequence bytes f)
       bytes)))
 
-(defun elf-u16 (bytes offset)
-  (logior (aref bytes offset) (ash (aref bytes (1+ offset)) 8)))
-
-(defun elf-u32 (bytes offset)
-  (logior (aref bytes offset)
-          (ash (aref bytes (+ offset 1)) 8)
-          (ash (aref bytes (+ offset 2)) 16)
-          (ash (aref bytes (+ offset 3)) 24)))
-
-(defun elf-u64 (bytes offset)
-  (logior (elf-u32 bytes offset)
-          (ash (elf-u32 bytes (+ offset 4)) 32)))
-
 (defun elf-string (strtab offset)
   "Read a null-terminated string from a string table byte vector."
   (let ((end (position 0 strtab :start offset)))
@@ -64,29 +40,29 @@
 (defun parse-section-header (bytes offset)
   "Parse a 64-byte ELF section header."
   (make-elf-section
-   :name (elf-u32 bytes offset)             ; sh_name (index into shstrtab)
-   :type (elf-u32 bytes (+ offset 4))       ; sh_type
-   :flags (elf-u64 bytes (+ offset 8))      ; sh_flags
-   :offset (elf-u64 bytes (+ offset 24))    ; sh_offset
-   :size (elf-u64 bytes (+ offset 32))      ; sh_size
-   :link (elf-u32 bytes (+ offset 40))      ; sh_link
-   :info (elf-u32 bytes (+ offset 44))))    ; sh_info
+   :name (u32 bytes offset)             ; sh_name (index into shstrtab)
+   :type (u32 bytes (+ offset 4))       ; sh_type
+   :flags (u64 bytes (+ offset 8))      ; sh_flags
+   :offset (u64 bytes (+ offset 24))    ; sh_offset
+   :size (u64 bytes (+ offset 32))      ; sh_size
+   :link (u32 bytes (+ offset 40))      ; sh_link
+   :info (u32 bytes (+ offset 44))))    ; sh_info
 
 (defun parse-symtab-entry (bytes offset strtab)
   "Parse a 24-byte ELF symbol table entry."
   (make-elf-sym
-   :name (elf-string strtab (elf-u32 bytes offset))
+   :name (elf-string strtab (u32 bytes offset))
    :info (aref bytes (+ offset 4))
-   :shndx (elf-u16 bytes (+ offset 6))
-   :value (elf-u64 bytes (+ offset 8))
-   :size (elf-u64 bytes (+ offset 16))))
+   :shndx (u16 bytes (+ offset 6))
+   :value (u64 bytes (+ offset 8))
+   :size (u64 bytes (+ offset 16))))
 
 (defun parse-rel-entry (bytes offset)
   "Parse a 16-byte ELF REL entry.
    r_info packs sym index (high 32) and relocation type (low 32)."
-  (let ((r-info (elf-u64 bytes (+ offset 8))))
+  (let ((r-info (u64 bytes (+ offset 8))))
     (make-elf-rel
-     :offset (elf-u64 bytes offset)
+     :offset (u64 bytes offset)
      :sym-idx (ash r-info -32)
      :type (logand r-info #xffffffff))))
 
@@ -96,20 +72,20 @@
   "Parse a BPF ELF object file. Returns a bpf-elf structure."
   (let* ((bytes (read-elf-bytes pathname))
          ;; Validate ELF header
-         (magic (elf-u32 bytes 0))
+         (magic (u32 bytes 0))
          (class (aref bytes 4))
          (data (aref bytes 5))
-         (machine (elf-u16 bytes 18)))
+         (machine (u16 bytes 18)))
     (unless (= magic +elf-magic+)
       (error "Not an ELF file: ~a" pathname))
     (unless (and (= class 2) (= data 1) (= machine +em-bpf+))
       (error "Not a 64-bit LE BPF ELF: class=~d data=~d machine=~d"
              class data machine))
 
-    (let* ((e-shoff (elf-u64 bytes 40))
-           (e-shentsize (elf-u16 bytes 58))
-           (e-shnum (elf-u16 bytes 60))
-           (e-shstrndx (elf-u16 bytes 62))
+    (let* ((e-shoff (u64 bytes 40))
+           (e-shentsize (u16 bytes 58))
+           (e-shnum (u16 bytes 60))
+           (e-shstrndx (u16 bytes 62))
            ;; Parse all section headers
            (sections (loop for i below e-shnum
                            collect (parse-section-header

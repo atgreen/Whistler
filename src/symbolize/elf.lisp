@@ -39,21 +39,7 @@
 
 (in-package #:whistler/symbolize)
 
-;;; ========== Byte-level helpers ==========
-
-(declaim (inline u8 u16 u32 u64))
-
-(defun u8  (buf off) (aref buf off))
-(defun u16 (buf off)
-  (logior (aref buf off)
-          (ash (aref buf (+ off 1))  8)))
-(defun u32 (buf off)
-  (logior (aref buf off)
-          (ash (aref buf (+ off 1))  8)
-          (ash (aref buf (+ off 2)) 16)
-          (ash (aref buf (+ off 3)) 24)))
-(defun u64 (buf off)
-  (logior (u32 buf off) (ash (u32 buf (+ off 4)) 32)))
+;;; Byte-level helpers (u8..u64) come from whistler/binary.
 
 (defun read-file-bytes (path)
   "Read PATH into a fresh (UNSIGNED-BYTE 8) vector. Returns NIL on any
@@ -67,17 +53,7 @@
           buf))
     (error () nil)))
 
-;;; ========== ELF constants ==========
-
-(defconstant +sht-symtab+   2)
-(defconstant +sht-dynsym+  11)
-(defconstant +sht-note+     7)
-(defconstant +sht-progbits+ 1)
-(defconstant +stt-func+     2)
-(defconstant +nt-gnu-build-id+ 3)
-
-(defconstant +et-exec+ 2)
-(defconstant +et-dyn+  3)
+;;; ELF constants come from whistler/binary.
 
 ;;; ========== Per-file info ==========
 

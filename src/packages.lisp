@@ -69,11 +69,11 @@
    #:encode-insn #:insn-bytes))
 
 (defpackage #:whistler/elf
-  (:use #:cl)
+  (:use #:cl #:whistler/binary)
   (:export #:write-bpf-elf))
 
 (defpackage #:whistler/btf
-  (:use #:cl)
+  (:use #:cl #:whistler/binary)
   (:export #:generate-btf #:generate-btf-and-ext))
 
 (defpackage #:whistler/compiler
@@ -119,6 +119,17 @@
 (defpackage #:whistler
   (:use #:cl #:whistler/bpf #:whistler/compiler #:whistler/elf #:whistler/btf)
   (:shadow #:case #:defstruct #:incf #:decf)
+  ;; BTF constants for the vmlinux reader. The byte readers (u8..u64)
+  ;; can't be imported here — those names are surface-language types —
+  ;; so vmlinux.lisp calls them package-qualified.
+  (:import-from #:whistler/binary
+                #:+btf-magic+
+                #:+btf-kind-int+ #:+btf-kind-ptr+ #:+btf-kind-array+
+                #:+btf-kind-struct+ #:+btf-kind-union+ #:+btf-kind-enum+
+                #:+btf-kind-fwd+ #:+btf-kind-typedef+ #:+btf-kind-volatile+
+                #:+btf-kind-const+ #:+btf-kind-restrict+ #:+btf-kind-func+
+                #:+btf-kind-func-proto+ #:+btf-kind-var+ #:+btf-kind-datasec+
+                #:+btf-kind-float+ #:+btf-kind-enum64+)
   (:export #:compile-file* #:defmap #:defprog #:defkfunc #:compile-to-elf #:main
            #:reset-compilation-state
            ;; Surface language macros

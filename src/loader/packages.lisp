@@ -6,7 +6,7 @@
   (require :sb-posix))
 
 (defpackage #:whistler/loader
-  (:use #:cl)
+  (:use #:cl #:whistler/binary)
   (:export
    ;; Top-level
    #:with-bpf-session #:*bpf-session* #:bpf-session-maps #:bpf-session-progs
