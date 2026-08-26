@@ -259,17 +259,6 @@
 
 ;;; ========== Block ordering and label resolution ==========
 
-(defun flatten-blocks (prog)
-  "Return all instructions in program order with block labels resolved to indices."
-  ;; First pass: collect all IR instructions in block order
-  (let ((block-order (order-blocks prog)))
-    (values block-order
-            (let ((insn-list '()))
-              (dolist (block block-order)
-                (dolist (insn (basic-block-insns block))
-                  (push insn insn-list)))
-              (nreverse insn-list)))))
-
 (defun block-has-ret-p (block)
   "Does this block end with a :ret instruction?"
   (let ((last-insn (car (last (basic-block-insns block)))))

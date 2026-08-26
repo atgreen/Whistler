@@ -16,13 +16,6 @@
 (defun write-bytes (stream bytes)
   (write-sequence bytes stream))
 
-(defun write-padding (stream alignment current-pos)
-  "Write zero padding to reach alignment. Returns new position."
-  (let* ((rem (mod current-pos alignment))
-         (pad (if (zerop rem) 0 (- alignment rem))))
-    (dotimes (i pad) (write-byte 0 stream))
-    (+ current-pos pad)))
-
 (defun strtab-add (strtab string)
   "Add a string to string table, return its offset."
   (let ((offset (length strtab)))

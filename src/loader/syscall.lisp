@@ -171,10 +171,6 @@
           (ash (aref buf (+ offset 2)) 16)
           (ash (aref buf (+ offset 3)) 24)))
 
-(defun get-u64 (buf offset)
-  (logior (get-u32 buf offset)
-          (ash (get-u32 buf (+ offset 4)) 32)))
-
 (defun put-ptr (buf offset sap)
   "Store a SAP (system area pointer) as a u64 in the buffer."
   (put-u64 buf offset (sb-sys:sap-int sap)))

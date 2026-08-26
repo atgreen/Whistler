@@ -492,11 +492,6 @@
         (dotimes (i n) (when (< i width) (setf (char out i) #\@)))
         out)))
 
-(defun bignum->comm-string (key)
-  "Treat KEY as 16 little-endian bytes (a `comm' value) and convert
-   the prefix up to the first NUL byte to a Lisp string."
-  (bignum->string key 16))
-
 (defun bignum->string (key max-bytes)
   "Treat KEY as MAX-BYTES little-endian bytes (a str()/comm-style key)
    and return the prefix up to the first NUL as a Lisp string."
@@ -1274,10 +1269,6 @@
                              (second (first args)))
                             (t 0))))
                (setf *bpftrace-exit-code* code)))))))))
-
-(defun run-user-probe (probe)
-  "Compatibility wrapper — earlier callers passed a (… :body …) plist."
-  (run-user-probe-body (getf probe :body)))
 
 (defun install-self-signal-handlers (user-probes)
   "Walk USER-PROBES for `:self :signal NAME' entries and arrange for

@@ -75,21 +75,6 @@
 ;;; ========== Constant collection ==========
 ;;; *user-constants* is defined in whistler.lisp (single source of truth).
 
-(defun find-new-constants (before after)
-  "Find constants in AFTER that are new or changed vs BEFORE.
-   Both are alists of (name . value). Returns a list of symbols."
-  (let ((before-map (make-hash-table :test 'equal))
-        (result '()))
-    (dolist (entry before)
-      (setf (gethash (car entry) before-map) (cdr entry)))
-    (dolist (entry after)
-      (let ((old-val (gethash (car entry) before-map :missing)))
-        (when (or (eq old-val :missing)
-                  (not (eql old-val (cdr entry))))
-          (let ((sym (find-symbol (car entry) (find-package '#:whistler))))
-            (when sym (push sym result))))))
-    result))
-
 (defun collect-user-constants-from-file (path)
   "Scan a .lisp file for (defconstant +NAME+ VALUE) forms and return
    a list of the corresponding interned symbols after loading."

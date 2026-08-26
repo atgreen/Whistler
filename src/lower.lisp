@@ -94,21 +94,6 @@
         ((string= name "S<")   :jslt)
         ((string= name "S<=")  :jsle)))))
 
-(defun ir-invert-jmp (op)
-  (ecase op
-    (:jeq :jne) (:jne :jeq)
-    (:jgt :jle) (:jge :jlt) (:jlt :jge) (:jle :jgt)
-    (:jsgt :jsle) (:jsge :jslt) (:jslt :jsge) (:jsle :jsgt)))
-
-;;; Size info
-(defun ir-type-bytes (type-kw)
-  (let ((name (string-upcase (string type-kw))))
-    (cond
-      ((or (string= name "U8")  (string= name "I8"))  1)
-      ((or (string= name "U16") (string= name "I16")) 2)
-      ((or (string= name "U32") (string= name "I32")) 4)
-      ((or (string= name "U64") (string= name "I64")) 8)
-      (t 8))))
 
 ;;; Builtin constants, helpers, and forms — from whistler/compiler (single source of truth)
 (defun ir-builtin-helper-p (sym)

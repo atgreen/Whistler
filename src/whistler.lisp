@@ -779,13 +779,6 @@
       (format stream ";   insn-byte-offset=~d map-index=~d~%"
               (first r) (second r)))))
 
-(defun split-lines (string)
-  "Split STRING into lines."
-  (with-input-from-string (in string)
-    (loop for line = (read-line in nil nil)
-          while line
-          collect line)))
-
 (defun command-output (program args)
   "Run PROGRAM with ARGS and return trimmed stdout, or nil on failure."
   (handler-case

@@ -194,11 +194,6 @@
              (readable (format nil "~A.debug/~A" dir debuglink))
              (readable (format nil "~A~A" dir debuglink))))))))
 
-(defun parse-elf-symbols-from (path)
-  "Parse PATH and return its function-symbol vector (or NIL)."
-  (let ((info (parse-elf path)))
-    (and info (elf-info-symbols info))))
-
 (defun section-with-name (buf secs shstrtab name)
   "Return the SECTION whose name equals NAME, or NIL."
   (loop for sec across secs

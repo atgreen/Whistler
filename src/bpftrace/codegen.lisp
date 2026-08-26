@@ -270,9 +270,6 @@
     (4 (intern "U32" :whistler))
     (8 (intern "U64" :whistler))))
 
-(defun align-up (n alignment)
-  (* alignment (ceiling n alignment)))
-
 (defun composite-key-layout (keys)
   "Plan the on-stack layout for a composite map key. Every component
    takes a full u64 slot (zero-extending narrower types), giving total
@@ -391,16 +388,6 @@
     (:str
      (format nil "string[~D]" (1+ (length (second expr)))))
     (t nil)))
-
-(defun bt-key-arity-string (args)
-  "Comma-joined bpftrace type names for ARGS, or NIL if any slot type
-   is unknown. The single-slot form is bare `int8' (no parens); the
-   composite form is `(int8,string[3])'."
-  (let ((tys (mapcar #'bt-key-arg-type-string args)))
-    (when (every #'identity tys)
-      (if (= (length tys) 1)
-          (first tys)
-          (format nil "(~{~A~^,~})" tys)))))
 
 (declaim (special *probe-spec* *map-table* *time-format-table*))
 
@@ -3098,14 +3085,6 @@
          (n    (and pair (parse-integer (cdr pair) :junk-allowed t))))
     (or n default)))
 
-(defun script-config-string (key default)
-  "Return KEY's value from *script-config* as a trimmed string, or
-   DEFAULT when absent."
-  (let ((pair (assoc key *script-config* :test #'string=)))
-    (if pair
-        (string-trim '(#\Space #\Tab) (cdr pair))
-        default)))
-
 (defun script-max-map-keys (default)
   "Effective default max-entries for hash maps. Honors
    `config = { max_map_keys = N }'."
@@ -4292,14 +4271,6 @@
                     for (offset _size type expr) = entry
                     collect (store-key-component k offset type expr))
             ,(funcall body-fn k)))))))
-
-(defun lower-key-form (keys)
-  "Single-value form for scalar key callers (hist bucket lookup, etc.).
-   For composite keys, prefer WITH-KEY which builds the stack buffer."
-  (cond
-    ((null keys)         0)
-    ((= (length keys) 1) (lower-expr (first keys)))
-    (t (unsupported "composite keys cannot appear in this position"))))
 
 (defun lower-index (expr)
   "Lower `BASE[KEY]' for shapes other than @-maps:
