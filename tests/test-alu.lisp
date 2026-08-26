@@ -35,6 +35,17 @@
     (is (has-opcode-p bytes #x87)
         "neg of a runtime value should still emit NEG")))
 
+(test negative-constant-uses-mov-imm
+  "A negative constant whose 64-bit pattern is a sign-extended 32-bit value
+   materializes via one mov64-imm (0xb7), not a two-slot ld_imm64 (0x18)."
+  (let ((bytes (w-body "(return -5)")))
+    (is (= 16 (length bytes)) "-5 should be mov + exit = 2 instructions")
+    (is (has-opcode-p bytes +alu64-mov-imm+) "should use mov64-imm (0xb7)")
+    (is (not (has-opcode-p bytes +ld-imm64+)) "should not use ld_imm64 (0x18)"))
+  ;; A genuinely 64-bit value (not sign-ext-32 representable) still needs ld_imm64.
+  (let ((bytes (w-body "(let ((x u64 #x100000000)) (return x))")))
+    (is (has-opcode-p bytes +ld-imm64+) "a true 64-bit constant still uses ld_imm64")))
+
 (test sub-imm
   "Subtraction with immediate should emit alu64 sub imm"
   (let ((bytes (w-body "(let ((x (get-prandom-u32)))
