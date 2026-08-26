@@ -306,8 +306,49 @@
 
       (t (lower-unknown-form head)))))
 
+;;; ========== Compile-time return-code validation ==========
+;;;
+;;; First slice of the compile-time verifier model: catch a constant
+;;; return value that the program type's verifier will reject, at compile
+;;; time with a clear message, instead of at load time with a cryptic
+;;; "R0 invalid mem access" / "invalid return code". Only XDP is checked
+;;; for now — its action set (XDP_ABORTED..XDP_REDIRECT) is small and
+;;; strictly enforced. Other program types have looser or context-dependent
+;;; return semantics and are left to the kernel verifier (tracked as
+;;; follow-up children of the verifier epic).
+
+(defparameter *prog-type-return-codes*
+  '((:xdp . (0 1 2 3 4)))  ; XDP_ABORTED XDP_DROP XDP_PASS XDP_TX XDP_REDIRECT
+  "Program type → the set of constant return codes we validate at compile
+   time. Program types absent from this table are not checked.")
+
+(defun resolve-const-return (form)
+  "If FORM is a compile-time integer constant — a literal, or a builtin
+   constant symbol like XDP_PASS — return its value; otherwise NIL."
+  (cond
+    ((integerp form) form)
+    ((symbolp form)
+     (let ((c (assoc (symbol-name form) whistler/compiler:*builtin-constants*
+                     :test #'string=)))
+       (and c (cdr c))))
+    (t nil)))
+
+(defun check-return-code (ctx form)
+  "Signal a compile-time error if FORM is a constant return value that is
+   invalid for the program type. Non-constant returns are left to the
+   kernel verifier."
+  (let* ((prog-type (lower-ctx-prog-type ctx))
+         (valid (cdr (assoc prog-type *prog-type-return-codes*)))
+         (val (and valid (resolve-const-return form))))
+    (when (and val (not (member val valid)))
+      (whistler/compiler:whistler-error
+       :what (format nil "return value ~d is not a valid ~a action" val prog-type)
+       :expected (format nil "one of ~{~a~^, ~}" valid)
+       :hint "XDP programs must return XDP_ABORTED (0), XDP_DROP (1), XDP_PASS (2), XDP_TX (3), or XDP_REDIRECT (4)"))))
+
 (defun lower-return (ctx args)
   "Lower (return [VALUE]) — a missing value returns 0."
+  (when args (check-return-code ctx (first args)))
   (let ((val (if args (lower-expr ctx (first args))
                  (let ((v (ctx-fresh-vreg ctx)))
                    (ctx-emit ctx :mov v (list '(:imm 0)) 'u64)

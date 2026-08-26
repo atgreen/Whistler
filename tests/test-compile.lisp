@@ -95,6 +95,29 @@
     (signals error
       (whistler::compile-to-elf "/tmp/whistler-5am-license-test.bpf.o"))))
 
+(test xdp-invalid-return-code-rejected
+  "First slice of the compile-time verifier model: an out-of-range constant
+   return in an XDP program is a compile-time error, while valid and
+   non-constant returns compile (the latter left to the kernel verifier)."
+  ;; Out-of-range constant → rejected at compile time.
+  (let ((whistler::*maps* nil) (whistler::*programs* nil))
+    (eval-whistler "(defprog badret (:type :xdp :section \"xdp\" :license \"GPL\")
+                      (return 99))")
+    (signals error
+      (whistler::compile-to-elf "/tmp/whistler-5am-badret.bpf.o")))
+  ;; Valid XDP action constant → compiles.
+  (let ((whistler::*maps* nil) (whistler::*programs* nil))
+    (eval-whistler "(defprog okret (:type :xdp :section \"xdp\" :license \"GPL\")
+                      (return XDP_PASS))")
+    (finishes
+      (whistler::compile-to-elf "/tmp/whistler-5am-okret.bpf.o")))
+  ;; Non-constant return → not checked here; left to the kernel verifier.
+  (let ((whistler::*maps* nil) (whistler::*programs* nil))
+    (eval-whistler "(defprog dynret (:type :xdp :section \"xdp\" :license \"GPL\")
+                      (return (get-prandom-u32)))")
+    (finishes
+      (whistler::compile-to-elf "/tmp/whistler-5am-dynret.bpf.o"))))
+
 (test matching-licenses-accepted
   "compile-to-elf should accept programs with the same license"
   (let ((whistler::*maps* nil)
