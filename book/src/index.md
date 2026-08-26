@@ -71,9 +71,9 @@ optimization pipeline (SSA-based passes, sparse conditional constant
 propagation, linear-scan register allocation, and a peephole optimizer)
 produces bytecode competitive with an optimizing C compiler. On the three
 programs tracked by `make bench` (each with a hand-written clang equivalent in
-`examples/*.c`): a packet counter, 12 vs 12; a port blocker, 27 vs 27; and a
-SYN-flood mitigator, **71 vs 73** — Whistler two instructions tighter on the
-most complex one. The comparison is reproducible: `make bench`.
+`examples/*.c`): a packet counter, 12 vs 12; a port blocker, **25 vs 27**; and a
+SYN-flood mitigator, **70 vs 73** — Whistler tighter than clang on both
+non-trivial programs. The comparison is reproducible: `make bench`.
 
 ## The userspace loader
 

@@ -209,3 +209,29 @@
                            (return 0)))")))
     ;; With peephole, this should be compact
     (is (<= n 8) "Simple if/else should be compact after peephole")))
+
+(test jumps-threaded-through-trampolines
+  "A program whose early-exit paths share a return value produces tail-merged
+   epilogues; the final cleanup loop must thread branches through the resulting
+   goto trampolines and delete them. Invariant: after peephole, no jump targets
+   an unconditional jump (JA, opcode 0x05). Regression for tail-merge
+   trampolines surviving the final cleanup loop."
+  (let* ((bytes (w-body "(with-tcp (data data-end tcp)
+                           (when (= (tcp-dst-port tcp) 80)
+                             (return XDP_DROP)))
+                         XDP_PASS"))
+         (n (floor (length bytes) 8)))
+    (flet ((opc (i) (aref bytes (* i 8)))
+           (joff (i)
+             (let ((raw (logior (aref bytes (+ (* i 8) 2))
+                                (ash (aref bytes (+ (* i 8) 3)) 8))))
+               (if (>= raw #x8000) (- raw #x10000) raw))))
+      (loop for i below n
+            for op = (opc i)
+            ;; a jump (JMP/JMP32 class) that is not call (0x85) or exit (0x95)
+            when (and (member (logand op #x07) '(#x05 #x06))
+                      (/= op #x85) (/= op #x95))
+            do (let ((tgt (+ i 1 (joff i))))
+                 (when (and (>= tgt 0) (< tgt n))
+                   (is (/= (opc tgt) #x05)
+                       (format nil "insn ~d targets unconditional jump at ~d" i tgt))))))))

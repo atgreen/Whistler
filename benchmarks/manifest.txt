@@ -14,5 +14,5 @@
 #
 # name       section  whistler  clang
 count-xdp    xdp      12        12
-drop-port    xdp      27        27
-synflood-xdp xdp      71        73
+drop-port    xdp      25        27
+synflood-xdp xdp      70        73

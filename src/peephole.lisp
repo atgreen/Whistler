@@ -43,14 +43,22 @@
     (setf result (peephole-forward-cross-reg-imm result))
     (setf result (peephole-coalesce-copy result))
     (setf result (peephole-forward-mov-chain result))
-    ;; Final cleanup pass — iterate branch inversion + dead-jump removal
-    ;; since dead-jump removal can expose new cleanup candidates
+    ;; Final cleanup pass — iterate branch inversion, jump threading, and
+    ;; dead-code removal since each can expose new cleanup candidates.
+    ;; Threading + dead-after-exit are included here (not just earlier)
+    ;; because tail-merge introduces goto-to-epilogue trampolines *after*
+    ;; the first threading pass; without re-threading, a conditional branch
+    ;; that lands on such a trampoline stays a two-hop and the now-unreachable
+    ;; trampoline survives. Length is monotonically non-increasing, so this
+    ;; converges.
     (setf result (peephole-eliminate-redundant-movs result))
     (setf result (peephole-fold-stack-addr result))
     (loop
       (let ((prev-len (length result)))
         (setf result (peephole-invert-branch result))
+        (setf result (peephole-thread-jumps result))
         (setf result (peephole-eliminate-dead-jumps result))
+        (setf result (peephole-eliminate-dead-after-exit result))
         (when (= (length result) prev-len)
           (return))))
     result))

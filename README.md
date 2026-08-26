@@ -185,7 +185,7 @@ int count_packets(struct xdp_md *ctx) {
 
 ### Port blocker
 
-Whistler: 27 instructions. clang -O2: 27 instructions.
+Whistler: 25 instructions. clang -O2: 27 instructions.
 
 <table>
 <tr><th>Whistler</th><th>C + clang</th></tr>
@@ -257,7 +257,7 @@ int drop_port(struct xdp_md *ctx) {
 
 ### SYN flood mitigation
 
-Whistler: 71 instructions. clang -O2: 73 instructions.
+Whistler: 70 instructions. clang -O2: 73 instructions.
 
 <table>
 <tr><th>Whistler</th><th>C + clang</th></tr>
