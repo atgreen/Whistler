@@ -17,3 +17,4 @@ count-xdp         xdp  12  12
 drop-port         xdp  25  27
 synflood-xdp      xdp  70  73
 tail-call-dispatch xdp  27  29
+ratelimit-xdp     xdp  63  58
