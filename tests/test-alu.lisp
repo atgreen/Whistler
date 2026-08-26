@@ -23,6 +23,18 @@
     (is (has-opcode-p bytes +alu64-add-reg+)
         "Expected alu64 add reg (0x0f)")))
 
+(test neg-constant-folds
+  "Unary minus of a compile-time constant folds away the runtime NEG
+   (0x87 = alu64|neg|k); a runtime operand still emits it."
+  ;; (- x) where x is a constant → folded, no NEG instruction.
+  (let ((bytes (w-body "(let ((x u64 5)) (return (- x)))")))
+    (is (not (has-opcode-p bytes #x87))
+        "neg of a constant should not emit a NEG instruction"))
+  ;; (- runtime) → NEG remains.
+  (let ((bytes (w-body "(return (- (get-prandom-u32)))")))
+    (is (has-opcode-p bytes #x87)
+        "neg of a runtime value should still emit NEG")))
+
 (test sub-imm
   "Subtraction with immediate should emit alu64 sub imm"
   (let ((bytes (w-body "(let ((x (get-prandom-u32)))

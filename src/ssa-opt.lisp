@@ -215,6 +215,19 @@
                        (setf (gethash (ir-insn-dst insn) constants)
                              `(:imm ,folded))))))))
 
+            ;; neg of a constant → fold to MOV of the 64-bit two's-complement
+            ;; value. emit-neg-insn does a 64-bit BPF_NEG.
+            ((eq op :neg)
+             (when (and (= (length args) 1) (integerp (first args)))
+               (let ((imm (gethash (first args) constants)))
+                 (when (and imm (integerp (second imm)))
+                   (let ((folded (logand (- (second imm)) #xFFFFFFFFFFFFFFFF)))
+                     (setf (ir-insn-op insn) :mov)
+                     (setf (ir-insn-args insn) (list `(:imm ,folded)))
+                     (when (ir-insn-dst insn)
+                       (setf (gethash (ir-insn-dst insn) constants)
+                             `(:imm ,folded))))))))
+
             ;; map-update/map-update-ptr: propagate flags (4th arg)
             ((member op '(:map-update :map-update-ptr))
              (when (and (>= (length args) 4)
