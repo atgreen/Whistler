@@ -1,6 +1,6 @@
 (defsystem "whistler/binary"
   :description "Shared ELF/BTF constants and little-endian byte-IO helpers"
-  :version "1.11.0"
+  :version "1.12.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ()
@@ -9,7 +9,7 @@
 
 (defsystem "whistler"
   :description "A Lisp that compiles to eBPF"
-  :version "1.11.0"
+  :version "1.12.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ("whistler/binary")
@@ -35,7 +35,7 @@
 
 (defsystem "whistler/loader"
   :description "Pure Common Lisp BPF loader — load .bpf.o into the kernel"
-  :version "1.11.0"
+  :version "1.12.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ("whistler" "whistler/binary")
@@ -53,7 +53,7 @@
 
 (defsystem "whistler/cli"
   :description "CLI binary — bundles whistler + loader + bpftrace into one self-contained executable"
-  :version "1.11.0"
+  :version "1.12.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ("whistler" "whistler/loader"
@@ -65,7 +65,7 @@
 
 (defsystem "whistler/symbolize"
   :description "Standalone /proc/<pid>/maps + ELF symbolizer for user-stack resolution"
-  :version "1.11.0"
+  :version "1.12.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ("whistler/binary")
@@ -80,7 +80,7 @@
 
 (defsystem "whistler/bpftrace"
   :description "bpftrace frontend — parses bpftrace scripts and compiles them via Whistler"
-  :version "1.11.0"
+  :version "1.12.0"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :depends-on ("whistler" "whistler/loader" "whistler/symbolize" "iparse")

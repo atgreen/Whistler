@@ -2,6 +2,67 @@
 
 All notable user-facing changes per release. Newest first.
 
+## 1.12.0 — 2026-08-26
+
+### New Features
+
+#### Compile-time return-code validation
+
+The compiler now catches an invalid constant return value at compile
+time, with a clear message, instead of letting it through to a cryptic
+kernel-load rejection. A program that returns a value outside its
+program type's action set — e.g. `(return 99)` from an XDP program — is
+now a compile error naming the valid actions. Both explicit `(return
+...)` and the implicit trailing-value return are checked. Enforced for
+the program types whose return set is small and strict: XDP
+(`XDP_ABORTED`..`XDP_REDIRECT`), `cgroup_skb`, and `sk_lookup`; other
+types are left to the kernel verifier. This is the first slice of a
+broader compile-time verifier model.
+
+#### Annotated disassembly
+
+`disassemble-cu` now annotates each emitted BPF instruction with the
+surface Whistler form it was lowered from (falling back to the IR op for
+instructions produced by optimization passes), making the shape of the
+generated code legible at a glance — a `map-lookup` expanding into its
+lookup/null-check/increment sequence, which branch a guard produced, and
+so on.
+
+#### `make bench` — instruction-count benchmarking against clang
+
+A reproducible harness (`make bench`, `benchmarks/manifest.txt`,
+`scripts/bench.sh`) compiles curated Whistler programs alongside
+hand-written `clang -O2` equivalents (`examples/*.c`) and compares their
+instruction counts, failing on a regression above a committed baseline.
+On the current suite Whistler matches or beats `clang -O2`.
+
+#### Codegen improvements
+
+Several optimizations reduce instruction counts: `log2` and unary
+negation of compile-time constants now fold to a literal; constants
+whose 64-bit value is a sign-extended 32-bit immediate (notably any
+negative constant) materialize with a single `mov64` instead of a
+two-slot `ld_imm64`; and the peephole pass now threads conditional
+branches through the goto-to-epilogue trampolines that tail-merging
+introduces, deleting the now-unreachable trampolines.
+
+A new `examples/percpu-counter.lisp` demonstrates a genuine per-CPU
+packet counter over a `:percpu-array` map.
+
+### Bug Fixes
+
+- The loader no longer mislabels every failed `BPF_PROG_LOAD` as a
+  verifier rejection. Only `EACCES` (the verifier-rejection errno, whose
+  log holds the verifier trace) is reported as such; `EPERM` (e.g. a
+  missing `CAP_NET_ADMIN` when loading XDP/TC programs) and `EINVAL`
+  now surface the real errno instead of a misleading empty verifier log.
+- A bare `map-lookup` result — a maybe-null pointer — passed directly as
+  a kfunc argument is now rejected at compile time, matching the
+  existing checks on `load`, `store`, and `atomic-add`.
+- Fixed a latent truncation in the emitter that could load a genuine
+  64-bit constant with a sign-extended 32-bit `mov64` instead of
+  `ld_imm64` on the constant-register path.
+
 ## 1.11.0 — 2026-08-14
 
 ### New Features
