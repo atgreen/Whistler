@@ -198,6 +198,23 @@
                          (setf (gethash (ir-insn-dst insn) constants)
                                `(:imm ,folded)))))))))
 
+            ;; log2 of a constant → fold to MOV of floor(log2(value)).
+            ;; emit-log2-insn computes the highest-set-bit position, i.e.
+            ;; (integer-length v) - 1 for v > 0. Only fold positive values:
+            ;; the runtime op returns 0 for 0, and a u64 with the top bit set
+            ;; may be stored as a negative Lisp integer here — leave both to
+            ;; the runtime path rather than risk a wrong fold.
+            ((eq op :log2)
+             (when (and (= (length args) 1) (integerp (first args)))
+               (let ((imm (gethash (first args) constants)))
+                 (when (and imm (integerp (second imm)) (plusp (second imm)))
+                   (let ((folded (1- (integer-length (second imm)))))
+                     (setf (ir-insn-op insn) :mov)
+                     (setf (ir-insn-args insn) (list `(:imm ,folded)))
+                     (when (ir-insn-dst insn)
+                       (setf (gethash (ir-insn-dst insn) constants)
+                             `(:imm ,folded))))))))
+
             ;; map-update/map-update-ptr: propagate flags (4th arg)
             ((member op '(:map-update :map-update-ptr))
              (when (and (>= (length args) 4)

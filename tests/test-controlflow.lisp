@@ -38,6 +38,19 @@
     ;; get-prandom-u32 + log2 (15) + exit = at least 17
     (is (>= n 17) "log2 should produce at least 17 instructions")))
 
+(test log2-constant-folds
+  "log2 of a compile-time constant folds to a MOV of floor(log2 n),
+   not the runtime binary search."
+  ;; (log2 1024) → mov r0,10 ; exit = 2 instructions (16 bytes)
+  (let ((bytes (w-body "(let ((x u64 1024)) (return (log2 x)))")))
+    (is (= 16 (length bytes)) "log2 of a constant should fold to 2 instructions")
+    (is (= +alu64-mov-imm+ (nth-insn-opcode bytes 0)) "first insn should be mov-imm")
+    (is (= 10 (aref bytes 4)) "folded value of (log2 1024) should be 10"))
+  ;; floor(log2 1000) = 9 (non-power-of-two: highest set bit)
+  (let ((bytes (w-body "(let ((x u64 1000)) (return (log2 x)))")))
+    (is (= 16 (length bytes)) "log2 of a constant should fold to 2 instructions")
+    (is (= 9 (aref bytes 4)) "floor(log2 1000) should be 9")))
+
 ;;; ========== cast ==========
 
 (test cast-u32-to-u64
