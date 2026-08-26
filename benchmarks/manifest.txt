@@ -14,3 +14,4 @@
 #
 # name       section  whistler  clang
 count-xdp    xdp      12        12
+drop-port    xdp      27        27
