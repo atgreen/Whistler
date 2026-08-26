@@ -66,9 +66,10 @@ Change a BPF program, recompile, and reload without leaving your REPL session.
 | Interactive development | REPL | no | yes | no | yes |
 | Code quality vs clang -O2 | matches or beats | baseline | n/a | comparable | n/a |
 
-Whistler matches clang -O2 instruction counts on real programs. On the
-Cilium `nodeport-lb4` load balancer (a complex production BPF program),
-Whistler produces 76 instructions to clang's 75.
+Whistler matches clang -O2 instruction counts on real programs — its
+optimization pipeline (SSA-based passes, sparse conditional constant
+propagation, linear-scan register allocation, and a peephole optimizer)
+produces bytecode competitive with an optimizing C compiler.
 
 ## The userspace loader
 

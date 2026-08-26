@@ -135,10 +135,6 @@ Multiple `defprog` forms compile into a single ELF with separate sections. Tail 
 - Call-like ops (map-lookup, map-lookup-ptr, tail-call, etc.) must be in regalloc's call-positions list
 - Shared definitions (helpers, constants, builtins) live in `compiler.lisp` — `lower.lisp` references them, not copies
 
-## Benchmarks (nodeport-lb4)
-
-Whistler: 76 instructions, clang -O2: 75 instructions.
-
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:1105d646 -->
 ## Beads Issue Tracker
