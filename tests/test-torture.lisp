@@ -18,10 +18,17 @@
 ;;; ========== CAP_BPF detection ==========
 
 (defvar *has-cap-bpf* :unknown
-  "Cached result of CAP_BPF probe. :unknown, T, or NIL.")
+  "Cached XDP-load probe. :unknown, T, or NIL. XDP/networking programs need
+   CAP_BPF + CAP_NET_ADMIN.")
 
-(defun probe-cap-bpf ()
-  "Try loading a trivial XDP program (mov r0,0; exit). Returns T if it works."
+(defvar *has-cap-tracing* :unknown
+  "Cached tracing-load probe. :unknown, T, or NIL. Tracing programs (kprobe)
+   need only CAP_BPF + CAP_PERFMON — available in the documented
+   cap_bpf,cap_perfmon setup even without CAP_NET_ADMIN.")
+
+(defun probe-cap (prog-type)
+  "Try loading a trivial program (mov r0,0; exit) as PROG-TYPE. Returns T if
+   the kernel accepts the load (caps present + verifier OK), NIL otherwise."
   (let ((trivial-insns (make-array 16 :element-type '(unsigned-byte 8)
                                       :initial-element 0)))
     ;; mov r0, 0  → opcode #xb7, dst=0, imm=0
@@ -29,19 +36,24 @@
     ;; exit       → opcode #x95
     (setf (aref trivial-insns 8) #x95)
     (handler-case
-        (let ((fd (whistler/loader::load-program
-                   trivial-insns
-                   whistler/loader::+bpf-prog-type-xdp+
-                   "GPL")))
+        (let ((fd (whistler/loader::load-program trivial-insns prog-type "GPL")))
           (sb-posix:close fd)
           t)
       (error () nil))))
 
 (defun has-cap-bpf-p ()
-  "Return T if kernel verification is available."
+  "Return T if XDP/networking programs load (CAP_BPF + CAP_NET_ADMIN)."
   (when (eq *has-cap-bpf* :unknown)
-    (setf *has-cap-bpf* (probe-cap-bpf)))
+    (setf *has-cap-bpf* (probe-cap whistler/loader::+bpf-prog-type-xdp+)))
   *has-cap-bpf*)
+
+(defun has-cap-tracing-p ()
+  "Return T if tracing programs (kprobe) load (CAP_BPF + CAP_PERFMON). This is
+   available in the standard cap_bpf,cap_perfmon setup without CAP_NET_ADMIN, so
+   context-free bytecode can be kernel-verified there even when XDP can't load."
+  (when (eq *has-cap-tracing* :unknown)
+    (setf *has-cap-tracing* (probe-cap whistler/loader::+bpf-prog-type-kprobe+)))
+  *has-cap-tracing*)
 
 ;;; ========== Secure temp directory ==========
 ;;; Use a private temp directory to avoid symlink attacks in /tmp.
@@ -79,9 +91,12 @@
 
 ;;; ========== Verification helpers ==========
 
-(defun verify-bytecode (insn-bytes &key (prog-type whistler/loader::+bpf-prog-type-xdp+)
+(defun verify-bytecode (insn-bytes &key (prog-type whistler/loader::+bpf-prog-type-kprobe+)
                                         (license "GPL"))
-  "Load INSN-BYTES into the kernel verifier.
+  "Load INSN-BYTES into the kernel verifier as PROG-TYPE (default kprobe).
+   Context-free bytecode (no program-specific context access) loads fine as a
+   tracing program, which needs only CAP_BPF + CAP_PERFMON — so this verifies
+   codegen in the standard cap setup without requiring CAP_NET_ADMIN.
    Returns (values T nil) on success, (values NIL verifier-log) on failure.
    Closes the program FD on success."
   (handler-case
@@ -143,15 +158,31 @@
                     (when ok (cl:incf *torture-verified*)))))
            (when (probe-file lisp-path) (delete-file lisp-path))
            (when (probe-file elf-path) (delete-file elf-path))))
-      ;; Mapless program: direct bytecode verification
-      `(let ((bytes (compile-insn-bytes (read-whistler-forms ,source))))
-         (is (not (null bytes)) "Compilation failed")
-         (is (plusp (length bytes)) "Compilation produced no instructions")
-         (cl:incf *torture-compiled*)
-         (when (has-cap-bpf-p)
-           (multiple-value-bind (ok log) (verify-bytecode bytes)
-             (is-true ok (format nil "Verifier rejected program:~%~a" log))
-             (when ok (cl:incf *torture-verified*)))))))
+      ;; Mapless program: direct bytecode verification.
+      ;; A program that touches its context (e.g. ctx-load of xdp_md->data) is
+      ;; only valid loaded as its real type (XDP) — loading it as a kprobe makes
+      ;; the packet-pointer access invalid — so gate those on CAP_NET_ADMIN.
+      ;; Context-free bytecode (pure ALU/cmp/branch/const) verifies as a kprobe,
+      ;; which needs only CAP_BPF + CAP_PERFMON. `source' is a literal string, so
+      ;; the ctx check resolves at macroexpand time.
+      (if (search "ctx" source)
+          `(let ((bytes (compile-insn-bytes (read-whistler-forms ,source))))
+             (is (not (null bytes)) "Compilation failed")
+             (is (plusp (length bytes)) "Compilation produced no instructions")
+             (cl:incf *torture-compiled*)
+             (when (has-cap-bpf-p)
+               (multiple-value-bind (ok log)
+                   (verify-bytecode bytes :prog-type whistler/loader::+bpf-prog-type-xdp+)
+                 (is-true ok (format nil "Verifier rejected program:~%~a" log))
+                 (when ok (cl:incf *torture-verified*)))))
+          `(let ((bytes (compile-insn-bytes (read-whistler-forms ,source))))
+             (is (not (null bytes)) "Compilation failed")
+             (is (plusp (length bytes)) "Compilation produced no instructions")
+             (cl:incf *torture-compiled*)
+             (when (has-cap-tracing-p)
+               (multiple-value-bind (ok log) (verify-bytecode bytes)
+                 (is-true ok (format nil "Verifier rejected program:~%~a" log))
+                 (when ok (cl:incf *torture-verified*))))))))
 
 ;;; ========== Category 1: Constant folding edge cases ==========
 
