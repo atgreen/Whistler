@@ -1315,7 +1315,10 @@
            :where (format nil "(~a ~s ...)" kfunc-name a)
            :expected "a null-checked pointer (the BPF verifier requires it)"
            :hint (format nil "bind and guard it: (let ((p ~s)) (when p (~a ...p...)))"
-                         a kfunc-name))))
+                         a kfunc-name)))
+        ;; Likewise a bare map-lookup result (also maybe-null) passed straight
+        ;; into a kfunc — same syntactic check load/store/atomic-add use.
+        (check-unchecked-map-ptr a (string-downcase (symbol-name kfunc-name))))
       (let ((arg-vregs (mapcar (lambda (a) (lower-expr ctx a)) args)))
         ;; A :release consumes an acquired reference — clear it from the
         ;; pending set so it is not reported as leaked.

@@ -118,6 +118,31 @@
     (finishes
       (whistler::compile-to-elf "/tmp/whistler-5am-dynret.bpf.o"))))
 
+(test bare-map-lookup-rejected-at-deref-sites
+  "A bare (map-lookup ...) result — maybe-null — used directly as a pointer is
+   a compile-time error at every syntactic deref site (load, store, kfunc arg).
+   A when-let-guarded dereference compiles."
+  (flet ((compiles-p (src)
+           ;; Read in the whistler package so macros (when-let) and builtins
+           ;; resolve, matching real program compilation.
+           (let ((whistler::*maps* nil)
+                 (whistler::*programs* nil)
+                 (whistler::*struct-defs* (make-hash-table :test 'equal)))
+             (handler-case
+                 (progn (whistler::compile-program "s" "GPL"
+                          '((m :type :hash :key-size 4 :value-size 8 :max-entries 1))
+                          (read-whistler-forms src) :prog-type :xdp)
+                        t)
+               (error () nil)))))
+    (is (not (compiles-p "(load u64 (map-lookup m 0) 0)"))
+        "load through a bare map-lookup should be rejected")
+    (is (not (compiles-p "(store u64 (map-lookup m 0) 0 1)"))
+        "store through a bare map-lookup should be rejected")
+    (is (not (compiles-p "(bpf-task-release (map-lookup m 0))"))
+        "a bare map-lookup passed to a kfunc should be rejected")
+    (is (compiles-p "(when-let ((p (map-lookup m 0))) (load u64 p 0))")
+        "a when-let-guarded dereference should compile")))
+
 (test cgroup-and-sklookup-return-codes-validated
   "Return-code validation extends to :cgroup-skb and :sk-lookup ({0,1}),
    covering the implicit trailing-value return (wrap-implicit-return)."
