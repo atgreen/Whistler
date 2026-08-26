@@ -63,7 +63,7 @@
    #:+xdp-aborted+ #:+xdp-drop+ #:+xdp-pass+ #:+xdp-tx+ #:+xdp-redirect+
    ;; Instruction struct
    #:bpf-insn #:bpf-insn-code #:bpf-insn-dst #:bpf-insn-src
-   #:bpf-insn-off #:bpf-insn-imm
+   #:bpf-insn-off #:bpf-insn-imm #:bpf-insn-origin
    ;; Byte-swap
    #:emit-bswap16 #:emit-bswap32 #:emit-bswap64
    #:encode-insn #:insn-bytes))

@@ -766,13 +766,14 @@
   (format stream "; Instructions (~d):~%" (length (cu-insns cu)))
   (loop for insn in (cu-insns cu)
         for i from 0
-        do (format stream "  ~3d: ~2,'0x ~d ~d ~4d ~8d~%"
+        do (format stream "  ~3d: ~2,'0x ~d ~d ~4d ~8d~@[  ; ~(~a~)~]~%"
                   i
                   (bpf-insn-code insn)
                   (bpf-insn-dst insn)
                   (bpf-insn-src insn)
                   (bpf-insn-off insn)
-                  (bpf-insn-imm insn)))
+                  (bpf-insn-imm insn)
+                  (bpf-insn-origin insn)))
   (when (cu-map-relocs cu)
     (format stream "; Relocations:~%")
     (dolist (r (cu-map-relocs cu))

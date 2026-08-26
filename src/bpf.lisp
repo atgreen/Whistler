@@ -139,7 +139,8 @@
   (dst  0 :type (unsigned-byte 4))
   (src  0 :type (unsigned-byte 4))
   (off  0 :type integer)
-  (imm  0 :type integer))
+  (imm  0 :type integer)
+  (origin nil))   ; IR op (keyword) this instruction was emitted for — disassembly annotation only
 
 (defun insn (code dst src off imm)
   (make-bpf-insn :code code :dst dst :src src :off off :imm imm))

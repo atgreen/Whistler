@@ -37,11 +37,17 @@
   (ptr-cache (make-hash-table))     ; R10-relative offset → stack slot holding cached ptr
   (struct-ptr-uses (make-hash-table)) ; struct vreg → count of map-ptr uses
   (phi-moves (make-hash-table :test 'equal)) ; (src-label . tgt-label) → ((phi-dst . src-vreg) ...)
-  (stack-ledger '()))                 ; ((category . size) ...) for stack usage breakdown
+  (stack-ledger '())                  ; ((category . size) ...) for stack usage breakdown
+  (current-op nil))                   ; IR op currently being emitted — tags emitted insns for disassembly
 
 (defun ectx-emit (ctx insn-list)
-  (dolist (insn insn-list)
-    (push insn (emit-ctx-insns ctx))))
+  (let ((op (emit-ctx-current-op ctx)))
+    (dolist (insn insn-list)
+      ;; Tag each emitted instruction with the IR op it came from (best-effort
+      ;; provenance for disassemble-cu). Don't overwrite an existing origin.
+      (when (and op (null (whistler/bpf:bpf-insn-origin insn)))
+        (setf (whistler/bpf:bpf-insn-origin insn) op))
+      (push insn (emit-ctx-insns ctx)))))
 
 (defun ectx-current-idx (ctx)
   (length (emit-ctx-insns ctx)))
@@ -513,6 +519,7 @@
   (let* ((op (ir-insn-op insn))
          (dst (ir-insn-dst insn))
          (args (ir-insn-args insn)))
+    (setf (emit-ctx-current-op ctx) op)  ; provenance for emitted insns (disassembly)
     (cond
      ((eq op :arg0) nil)
 
