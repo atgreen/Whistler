@@ -224,11 +224,21 @@
                     (bpf-error (e)
                       (let* ((end (or (position 0 log-buf) (length log-buf)))
                              (log-str (sb-ext:octets-to-string
-                                       log-buf :end end :external-format :utf-8)))
-                        (error 'bpf-verifier-error
-                               :context "prog-load"
-                               :errno (bpf-error-errno e)
-                               :log log-str)))))))))))))
+                                       log-buf :end end :external-format :utf-8))
+                             (errno (bpf-error-errno e)))
+                        ;; Only EACCES (13) is a verifier-logic rejection — the
+                        ;; log buffer holds the verifier trace. Other errnos are
+                        ;; not verifier rejections and yield an empty log:
+                        ;; EPERM (1, missing capability such as CAP_NET_ADMIN),
+                        ;; EINVAL (22, bad attr / prog type), etc. Surfacing them
+                        ;; as bpf-verifier-error with a blank log is misleading,
+                        ;; so re-raise the underlying bpf-error (carrying errno).
+                        (if (= errno 13)
+                            (error 'bpf-verifier-error
+                                   :context "prog-load"
+                                   :errno errno
+                                   :log log-str)
+                            (error e))))))))))))))
 
 (defun prog-test-run (prog-fd)
   "Invoke a loaded BPF program once via BPF_PROG_TEST_RUN. Mirrors
