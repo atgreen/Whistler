@@ -1,7 +1,7 @@
 SBCL ?= sbcl
 SBCL_FLAGS = --noinform --non-interactive
 
-.PHONY: all test test-torture check clean examples repl repl-loader \
+.PHONY: all test test-torture check clean examples repl repl-loader bench \
         bpftrace-parse-test bpftrace-runtime-test bpftrace-testprogs
 
 all: whistler
@@ -37,6 +37,13 @@ test-torture:
 		--eval '(unless (fiveam:run! (quote whistler/tests::torture-suite)) (uiop:quit 1))'
 
 check: test
+
+# Compare Whistler vs clang -O2 BPF instruction counts against committed
+# baselines (benchmarks/manifest.txt). Compile-only — no kernel load, no root.
+# clang is optional (its column is informational). Fails on a Whistler
+# regression above baseline, guarding the clang-parity goal.
+bench:
+	SBCL="$(SBCL)" ./scripts/bench.sh
 
 # bpftrace's tools-parsing-test.sh equivalent — runs each script under
 # bpftrace's tools/ directory through `whistler bpftrace --dump' and

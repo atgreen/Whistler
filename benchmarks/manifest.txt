@@ -1,0 +1,16 @@
+# Whistler benchmark manifest — Whistler vs clang -O2 BPF instruction counts.
+#
+# One benchmark per line:
+#   <name>  <section>  <whistler_baseline>  <clang_baseline>
+#
+# <name>      basename of the pair examples/<name>.lisp and examples/<name>.c
+# <section>   the program's ELF section (e.g. xdp, tc, "classifier")
+# baselines   committed expected instruction counts; `make bench` fails on a
+#             Whistler regression (count above baseline). The clang baseline is
+#             informational (may vary slightly by clang/LLVM version).
+#
+# The two sources MUST implement the same algorithm for the comparison to be
+# meaningful — curate each pair deliberately.
+#
+# name       section  whistler  clang
+count-xdp    xdp      12        12
