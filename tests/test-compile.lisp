@@ -118,6 +118,24 @@
     (finishes
       (whistler::compile-to-elf "/tmp/whistler-5am-dynret.bpf.o"))))
 
+(test cgroup-and-sklookup-return-codes-validated
+  "Return-code validation extends to :cgroup-skb and :sk-lookup ({0,1}),
+   covering the implicit trailing-value return (wrap-implicit-return)."
+  ;; cgroup-skb: out-of-range trailing return rejected; {0,1} accepted.
+  (let ((whistler::*maps* nil) (whistler::*programs* nil))
+    (eval-whistler "(defprog cgbad (:type :cgroup-skb :section \"cgroup_skb/egress\" :license \"GPL\") 5)")
+    (signals error (whistler::compile-to-elf "/tmp/whistler-5am-cgbad.bpf.o")))
+  (let ((whistler::*maps* nil) (whistler::*programs* nil))
+    (eval-whistler "(defprog cgok (:type :cgroup-skb :section \"cgroup_skb/egress\" :license \"GPL\") 1)")
+    (finishes (whistler::compile-to-elf "/tmp/whistler-5am-cgok.bpf.o")))
+  ;; sk-lookup: out-of-range rejected; SK_PASS accepted.
+  (let ((whistler::*maps* nil) (whistler::*programs* nil))
+    (eval-whistler "(defprog skbad (:type :sk-lookup :section \"sk_lookup\" :license \"GPL\") 7)")
+    (signals error (whistler::compile-to-elf "/tmp/whistler-5am-skbad.bpf.o")))
+  (let ((whistler::*maps* nil) (whistler::*programs* nil))
+    (eval-whistler "(defprog skok (:type :sk-lookup :section \"sk_lookup\" :license \"GPL\") SK_PASS)")
+    (finishes (whistler::compile-to-elf "/tmp/whistler-5am-skok.bpf.o"))))
+
 (test matching-licenses-accepted
   "compile-to-elf should accept programs with the same license"
   (let ((whistler::*maps* nil)

@@ -318,9 +318,14 @@
 ;;; follow-up children of the verifier epic).
 
 (defparameter *prog-type-return-codes*
-  '((:xdp . (0 1 2 3 4)))  ; XDP_ABORTED XDP_DROP XDP_PASS XDP_TX XDP_REDIRECT
+  '((:xdp        . (0 1 2 3 4))   ; XDP_ABORTED XDP_DROP XDP_PASS XDP_TX XDP_REDIRECT
+    (:cgroup-skb . (0 1))         ; drop / pass — verifier enforces [0,1]
+    (:sk-lookup  . (0 1)))        ; SK_DROP / SK_PASS
   "Program type → the set of constant return codes we validate at compile
-   time. Program types absent from this table are not checked.")
+   time. Only types whose verifier-enforced return set is small and strict
+   are listed; program types absent from this table (e.g. :tc, which accepts
+   a broad TC_ACT range, and :cgroup-sock*, whose return semantics are
+   context-dependent) are left to the kernel verifier.")
 
 (defun resolve-const-return (form)
   "If FORM is a compile-time integer constant — a literal, or a builtin
