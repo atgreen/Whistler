@@ -104,7 +104,7 @@ Pure CL BPF loader — no libbpf, no CFFI. ASDF system `whistler/loader`. Key AP
 
 `deftracepoint` reads tracepoint format files from tracefs at macroexpand time: `(deftracepoint sched/sched-switch prev-pid prev-state next-pid)` → generates `(tp-prev-pid)` etc. `import-kernel-struct` reads `/sys/kernel/btf/vmlinux`: `(import-kernel-struct task_struct pid tgid)` → generates `(task-struct-pid ptr)` etc.
 
-Permissions: `CAP_BPF` + `CAP_PERFMON` for loading/attaching. Use `sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/sbcl` instead of root. Tracepoint format files need `chmod a+r`.
+Permissions: `CAP_BPF` + `CAP_PERFMON` loads/attaches **tracing** programs (kprobe, tracepoint, perf_event). **Networking** programs (XDP, TC/sched_cls) additionally need `CAP_NET_ADMIN` — without it, `BPF_PROG_LOAD` fails with `EPERM` (not a verifier rejection). Use `sudo setcap cap_bpf,cap_perfmon,cap_net_admin+ep /usr/bin/sbcl` instead of root to cover both. Tracepoint format files need `chmod a+r`. Note: `make test-torture`'s `has-cap-bpf-p` probes by loading a trivial *XDP* program, so with only `cap_bpf,cap_perfmon` it reports no-cap and the suite verifies compilation but **skips** the kernel-load assertions.
 
 Protocol headers: Ethernet, IPv4, IPv6, TCP, UDP, ICMP with constants and `with-packet`/`with-tcp`/`with-udp` parsing macros. TC (sched_cls) programs use `with-tc-packet`/`with-tc-tcp`/`with-tc-udp` (same API, `__sk_buff` offsets, `TC_ACT_OK`/`TC_ACT_SHOT` return codes).
 
