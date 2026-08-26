@@ -66,10 +66,14 @@ Change a BPF program, recompile, and reload without leaving your REPL session.
 | Interactive development | REPL | no | yes | no | yes |
 | Code quality vs clang -O2 | matches or beats | baseline | n/a | comparable | n/a |
 
-Whistler matches clang -O2 instruction counts on real programs — its
+Whistler matches or beats clang -O2 instruction counts on real programs — its
 optimization pipeline (SSA-based passes, sparse conditional constant
 propagation, linear-scan register allocation, and a peephole optimizer)
-produces bytecode competitive with an optimizing C compiler.
+produces bytecode competitive with an optimizing C compiler. On the three
+programs tracked by `make bench` (each with a hand-written clang equivalent in
+`examples/*.c`): a packet counter, 12 vs 12; a port blocker, 27 vs 27; and a
+SYN-flood mitigator, **71 vs 73** — Whistler two instructions tighter on the
+most complex one. The comparison is reproducible: `make bench`.
 
 ## The userspace loader
 

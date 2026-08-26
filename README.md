@@ -131,9 +131,13 @@ the same `defstruct` declarations used in the BPF program:
 
 ## Examples
 
+Instruction counts below are reproducible with `make bench`, which compiles
+each Whistler program and its hand-written clang `-O2` equivalent (in
+`examples/*.c`) and compares the instruction counts. See `benchmarks/manifest.txt`.
+
 ### Packet counter
 
-Whistler: 11 instructions. clang -O2: 11 instructions.
+Whistler: 12 instructions. clang -O2: 12 instructions.
 
 <table>
 <tr><th>Whistler</th><th>C + clang</th></tr>
@@ -181,7 +185,7 @@ int count_packets(struct xdp_md *ctx) {
 
 ### Port blocker
 
-Whistler: 25 instructions. clang -O2: 26 instructions.
+Whistler: 27 instructions. clang -O2: 27 instructions.
 
 <table>
 <tr><th>Whistler</th><th>C + clang</th></tr>
@@ -253,7 +257,7 @@ int drop_port(struct xdp_md *ctx) {
 
 ### SYN flood mitigation
 
-Whistler: 65 instructions. clang -O2: 68 instructions.
+Whistler: 71 instructions. clang -O2: 73 instructions.
 
 <table>
 <tr><th>Whistler</th><th>C + clang</th></tr>
