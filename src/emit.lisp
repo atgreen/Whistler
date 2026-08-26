@@ -519,7 +519,10 @@
   (let* ((op (ir-insn-op insn))
          (dst (ir-insn-dst insn))
          (args (ir-insn-args insn)))
-    (setf (emit-ctx-current-op ctx) op)  ; provenance for emitted insns (disassembly)
+    ;; Provenance for emitted insns (disassembly): prefer the surface source
+    ;; form the IR insn was lowered from, falling back to the IR op keyword for
+    ;; insns created by optimization passes (which carry no source form).
+    (setf (emit-ctx-current-op ctx) (or (ir-insn-source insn) op))
     (cond
      ((eq op :arg0) nil)
 

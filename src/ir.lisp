@@ -26,7 +26,8 @@
                   ;   labels (:label sym), map names (:map sym),
                   ;   types (:type sym), helper ids (:helper N)
   (type nil)      ; result type keyword: u8 u16 u32 u64
-  (id 0))         ; unique ID for ordering within block
+  (id 0)          ; unique ID for ordering within block
+  (source nil))   ; surface source form this insn was lowered from (disassembly annotation)
 
 ;;; Basic block
 

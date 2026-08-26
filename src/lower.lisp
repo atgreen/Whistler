@@ -22,10 +22,15 @@
   (prog-type nil)     ; program type keyword (e.g., :xdp, :cgroup-sock-addr)
   (pending-acquires '())) ; ((kfunc-name . vreg) ...) acquired refs not yet released
 
+(defvar *lowering-form* nil
+  "The surface form currently being lowered — dynamically bound by lower-expr so
+   ctx-emit can tag each IR insn with its source form for disassembly annotation.")
+
 (defun ctx-emit (ctx op dst args &optional type)
   "Emit an IR instruction into the current block."
   (let ((insn (make-ir-insn :op op :dst dst :args args :type type
-                            :id (lower-ctx-next-id ctx))))
+                            :id (lower-ctx-next-id ctx)
+                            :source *lowering-form*)))
     (incf (lower-ctx-next-id ctx))
     (bb-emit (lower-ctx-block ctx) insn)
     dst))
@@ -160,7 +165,8 @@
 
 (defun lower-expr (ctx form)
   "Lower FORM, returning the vreg holding the result (or nil for void)."
-  (cond
+  (let ((*lowering-form* form))  ; tag insns emitted for FORM with its source (disassembly)
+   (cond
     ((null form)
      (let ((v (ctx-fresh-vreg ctx)))
        (ctx-emit ctx :mov v (list `(:imm 0)) 'u64)
@@ -180,7 +186,7 @@
     (t (whistler/compiler:whistler-error
         :what (format nil "cannot compile expression: ~s" form)
         :expected "an integer, symbol, or (form ...) expression"
-        :hint "strings, floats, and other CL literals are not available in BPF"))))
+        :hint "strings, floats, and other CL literals are not available in BPF")))))
 
 (defun lower-symbol (ctx sym)
   "Lower a symbol reference — variable or constant."
