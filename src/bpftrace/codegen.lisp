@@ -5938,14 +5938,15 @@
 
 (defun emit-key-bytes (buf offset key-expr key-size)
   "Emit stores that copy KEY-EXPR's bytes into BUF starting at OFFSET.
-   For comm/str/composite-shaped keys we'd need a byte-copy; for the
-   single-key hist case we currently support only scalar u64-ish keys."
+   Reuse the ordinary map-key component emitter so string-shaped keys
+   such as comm retain their byte representation when the histogram
+   bucket is appended."
   (let ((store-type (case key-size
                       (1 (intern "U8"  :whistler))
                       (2 (intern "U16" :whistler))
                       (4 (intern "U32" :whistler))
                       (t (intern "U64" :whistler)))))
-    `(whistler::store ,store-type ,buf ,offset ,(lower-expr key-expr))))
+    (store-key-component buf offset store-type key-expr)))
 
 (defun lower-incdec-expr (expr)
   "Lower `$x++' / `++$x' / `@m[k]++' / `++@m[k]' used as an expression

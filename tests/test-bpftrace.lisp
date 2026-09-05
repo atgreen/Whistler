@@ -93,6 +93,17 @@
     (is (= 12 (getf (cdr info) :max-entries))
         "buckets = N+2 (10 in-range + 1 underflow + 1 overflow)")))
 
+(test codegen-keyed-hist-comm
+  "comm remains a valid map key when hist/lhist append a bucket slot."
+  (dolist (rhs '("hist(arg0)" "lhist(arg0, 0, 1000, 100)"))
+    (let* ((src (format nil "kprobe:foo { @h[comm] = ~A; }" rhs))
+           (gen (whistler/bpftrace:compile-script src))
+           (info (first (getf gen :info))))
+      (is (= 20 (getf (cdr info) :key-size))
+          "16-byte comm plus a 4-byte bucket")
+      (is (eq :comm (getf (cdr info) :key-builtin)))
+      (is (= 1 (length (getf gen :progs)))))))
+
 (test codegen-printf-ntop-v4
   "ntop(addr) emits a 4-byte slot tagged :ipv4."
   (let* ((src "kprobe:foo { printf(\"%s\\n\", ntop(arg0)); }")
