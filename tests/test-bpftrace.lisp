@@ -72,6 +72,40 @@
                         (eq (fourth m) :percpu-array)))
                  maps))))
 
+(test codegen-hist-buckets-match-bpftrace-labels
+  "hist() reserves distinct 0/1 buckets and shifts positive log2 buckets."
+  (dolist (src '("kprobe:foo { @h = hist(18); }"
+                 "kprobe:foo { @h[comm] = hist(18); }"))
+    (let* ((gen (whistler/bpftrace:compile-script src))
+           (info (first (getf gen :info)))
+           (program-text (prin1-to-string (first (getf gen :progs)))))
+      (is (search "(+ 1 (WHISTLER::LOG2" program-text)
+          "positive values need the bucket after floor(log2(value))")
+      (is (search "(IF (= " program-text)
+          "zero must remain in its own bucket")
+      (is (= (if (getf (cdr info) :keyed-p) (* 65 1024) 65)
+             (getf (cdr info) :max-entries))))))
+
+(test print-hist-trims-leading-empty-buckets
+  "hist() rendering starts at the first nonzero bucket, like bpftrace."
+  (let ((original-sum (symbol-function 'whistler/bpftrace::lookup-percpu-sum)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'whistler/bpftrace::lookup-percpu-sum)
+                 (lambda (info i)
+                   (declare (ignore info))
+                   (if (= i 5) 1 0)))   ; one sample in [16, 32)
+           (let* ((out (with-output-to-string (*standard-output*)
+                         (whistler/bpftrace::print-hist "h" nil)))
+                  (lines (remove "" (uiop:split-string out :separator '(#\Newline))
+                                 :test #'string=)))
+             (is (= 2 (length lines)) "header plus exactly one bucket line")
+             (is (search "[16, 32)" (second lines)))
+             (is (not (search "[0]" out))
+                 "leading empty buckets must not be printed")))
+      (setf (symbol-function 'whistler/bpftrace::lookup-percpu-sum)
+            original-sum))))
+
 (test codegen-counter-incdec
   "@m[k]++ generates a counter map and (incf (getmap m k))."
   (let* ((src "kprobe:foo { @counts[pid]++; }")

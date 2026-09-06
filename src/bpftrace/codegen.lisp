@@ -758,7 +758,7 @@
 (defun infer-size-hist-maps (table)
   "Histogram maps: the bucket index is always a u32 slot.
      * Non-keyed (`@m = hist(x)') uses a percpu-array keyed by bucket
-       only — key-size = 4, max-entries = 64 (log2) or N+2 (lhist).
+       only — key-size = 4, max-entries = 65 (log2) or N+2 (lhist).
      * Keyed (`@m[k] = hist(x)') uses a percpu-hash whose key is the
        user-key bytes followed by a u32 bucket — that's the
        user-key-size we already computed + 4. max-entries scales to
@@ -768,7 +768,7 @@
                  (eq (minfo-kind info) :lhist))
           do (let ((bucket-count
                      (if (eq (minfo-kind info) :hist)
-                         64
+                         65
                          (let* ((params (minfo-hist-params info)))
                            (+ 2 (max 1 (floor (- (second params)
                                                  (first params))
@@ -5852,6 +5852,12 @@
        (let ((,cur (whistler::load ,u64 ,p 0)))
          (whistler::store ,u64 ,p 0 (,sym ,cur ,delta))))))
 
+(defun gen-log2-hist-bucket (value-form)
+  "Return bpftrace's log2 bucket form: 0, 1, then floor(log2(VALUE))+1."
+  `(if (whistler::= ,value-form 0)
+       0
+       (whistler::+ 1 (whistler::log2 ,value-form))))
+
 (defun gen-hist-update (mname keys value-form &optional info)
   "log2 histogram update. KEYS is the surface key list — empty for
    non-keyed (the original percpu-array-indexed-by-bucket form), or
@@ -5863,8 +5869,8 @@
       ;; Non-keyed: original percpu-array path.
       ((null keys)
        `(let* ((,val ,value-form)
-               (,slot (whistler::log2 ,val)))
-          (when (whistler::>= ,slot 64) (setf ,slot 63))
+               (,slot ,(gen-log2-hist-bucket val)))
+          (when (whistler::>= ,slot 65) (setf ,slot 64))
           (whistler:when-let ((,p (whistler::map-lookup ,mname ,slot)))
             (whistler::atomic-add ,p 0 1))))
       ((= 1 (length keys))
@@ -5918,8 +5924,8 @@
          (bucket
            (ecase (if (consp mode) (first mode) mode)
              (:log2
-              `(let ((,slot (whistler::log2 ,val)))
-                 (when (whistler::>= ,slot 64) (setf ,slot 63))
+              `(let ((,slot ,(gen-log2-hist-bucket val)))
+                 (when (whistler::>= ,slot 65) (setf ,slot 64))
                  ,slot))
              (:linear
               (destructuring-bind (lo hi step over) (rest mode)

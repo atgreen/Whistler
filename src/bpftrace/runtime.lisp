@@ -711,15 +711,16 @@
   (cond
     (keyed-info (print-hist-keyed label info keyed-info))
     (t
-     (let* ((buckets (loop for i below 64
+     (let* ((buckets (loop for i below 65
                            collect (lookup-percpu-sum info i)))
             (last    (or (position-if-not #'zerop buckets :from-end t) -1))
+            (firstnz (or (position-if-not #'zerop buckets) 0))
             (maxc    (or (reduce #'max buckets) 0)))
        (format t "~%~A:~%" (map-display-prefix label))
        (when (minusp last)
          (format t "    (no samples)~%")
          (return-from print-hist))
-       (loop for i from 0 to last
+       (loop for i from firstnz to last
              for count = (nth i buckets)
              do (format t "~16A ~10D |~A|~%"
                         (hist-bucket-label i)
@@ -757,7 +758,7 @@
   (let* ((user-key-size (getf keyed-info :user-key-size))
          (key-builtin   (getf keyed-info :key-builtin))
          (key-parts     (or (getf keyed-info :key-parts) 1))
-         (groups        (group-keyed-buckets info user-key-size 64)))
+         (groups        (group-keyed-buckets info user-key-size 65)))
     (when (zerop (hash-table-count groups))
       (format t "~%~A: (no samples)~%" (map-display-prefix label))
       (return-from print-hist-keyed))
@@ -765,6 +766,7 @@
             using (hash-value buckets)
           for vector-list = (coerce buckets 'list)
           for last = (or (position-if-not #'zerop vector-list :from-end t) -1)
+          for firstnz = (or (position-if-not #'zerop vector-list) 0)
           for maxc = (or (reduce #'max vector-list) 0)
           do (format t "~%~A[~A]:~%"
                      (map-display-prefix label)
@@ -773,7 +775,7 @@
                                  :key-builtin key-builtin))
              (when (minusp last)
                (format t "    (no samples)~%"))
-             (loop for i from 0 to last
+             (loop for i from firstnz to last
                    for count = (nth i vector-list)
                    do (format t "~16A ~10D |~A|~%"
                               (hist-bucket-label i)
@@ -806,12 +808,13 @@
               (buckets (loop for i below total
                              collect (lookup-percpu-sum info i)))
               (last    (or (position-if-not #'zerop buckets :from-end t) -1))
+              (firstnz (or (position-if-not #'zerop buckets) 0))
               (maxc    (or (reduce #'max buckets) 0)))
          (format t "~%@~A:~%" label)
          (when (minusp last)
            (format t "    (no samples)~%")
            (return-from print-lhist))
-         (loop for i from 0 to last
+         (loop for i from firstnz to last
                for count = (nth i buckets)
                do (format t "~20A ~10D |~A|~%"
                           (lhist-bucket-label i lo hi step)
@@ -834,6 +837,7 @@
               using (hash-value buckets)
             for vector-list = (coerce buckets 'list)
             for last = (or (position-if-not #'zerop vector-list :from-end t) -1)
+            for firstnz = (or (position-if-not #'zerop vector-list) 0)
             for maxc = (or (reduce #'max vector-list) 0)
             do (format t "~%@~A[~A]:~%"
                        label
@@ -842,7 +846,7 @@
                                    :key-builtin key-builtin))
                (when (minusp last)
                  (format t "    (no samples)~%"))
-               (loop for i from 0 to last
+               (loop for i from firstnz to last
                      for count = (nth i vector-list)
                      do (format t "~20A ~10D |~A|~%"
                                 (lhist-bucket-label i lo hi step)
