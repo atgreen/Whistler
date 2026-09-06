@@ -73,17 +73,23 @@
     (put-u64 buf 8 config)        ; config (offset 8)
     buf))
 
-(defun attach-perf-bpf (perf-attr prog-fd &key per-cpu)
+(defun attach-perf-bpf (perf-attr prog-fd &key per-cpu attach-program-once)
   "Open perf events, attach BPF prog, and enable.
-   When PER-CPU is true, opens one event per online CPU (for tracepoints).
+   When PER-CPU is true, opens one event per online CPU.
    Otherwise opens a single event on CPU 0 (for kprobe/uprobe PMU attachment).
+   When ATTACH-PROGRAM-ONCE is true, associates the BPF program only with the
+   first perf event. This is required for tracepoints, whose program attachment
+   is global even though an enabled perf event is required on every CPU.
    Returns list of perf event FDs."
   (let ((cpu-ids (if per-cpu (online-cpu-ids) '(0)))
         (fds '()))
-    (dolist (cpu cpu-ids)
+    (loop for cpu in cpu-ids
+          for first-p = t then nil
+          do
       (let ((fd (%perf-event-open perf-attr -1 cpu -1 +perf-flag-fd-cloexec+)))
         (push fd fds)
-        (%ioctl fd +perf-event-ioc-set-bpf+ prog-fd)
+        (when (or first-p (not attach-program-once))
+          (%ioctl fd +perf-event-ioc-set-bpf+ prog-fd))
         (%ioctl fd +perf-event-ioc-enable+ 0)))
     (nreverse fds)))
 
@@ -170,14 +176,15 @@
   "Attach a BPF program to a tracepoint.
    TRACEPOINT-NAME is e.g. \"tracepoint/sched/sched_process_fork\"
    or \"sched/sched_process_fork\".
-   Opens a single perf event (pid=-1, cpu=0) matching libbpf's behavior.
-   The kernel uses a per-tracepoint shared prog array, so attaching on
-   one CPU covers events from every CPU; doing a per-CPU loop with the
-   same prog trips EEXIST in perf_event_attach_bpf_prog.
+   Opens and enables one perf event on every online CPU, but associates the
+   program only once because the kernel's tracepoint BPF program attachment is
+   global. Repeating PERF_EVENT_IOC_SET_BPF for that program returns EEXIST.
    Returns an attachment that can be passed to detach."
   (let* ((tp-id (resolve-tracepoint-id tracepoint-name))
          (attr (make-perf-attr +perf-type-tracepoint+ tp-id))
-         (fds (attach-perf-bpf attr prog-fd)))
+         (fds (attach-perf-bpf attr prog-fd
+                               :per-cpu t
+                               :attach-program-once t)))
     (make-attachment :type :tracepoint :perf-fds fds :prog-fd prog-fd)))
 
 ;;; ========== Uprobe attachment ==========

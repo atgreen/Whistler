@@ -107,6 +107,50 @@
     (is (not (null (search "CLOSE-RING-CONSUMER"
                            (prin1-to-string expansion)))))))
 
+(test tracepoint-attachment-covers-every-online-cpu
+  "Tracepoint perf events cover every CPU but set the shared BPF program once."
+  (let ((opens '())
+        (ioctls '())
+        (original-cpu-ids
+          (symbol-function 'whistler/loader::online-cpu-ids))
+        (original-open
+          (symbol-function 'whistler/loader::%perf-event-open))
+        (original-ioctl
+          (symbol-function 'whistler/loader::%ioctl)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'whistler/loader::online-cpu-ids)
+                 (lambda () '(0 2 7))
+                 (symbol-function 'whistler/loader::%perf-event-open)
+                 (lambda (attributes pid cpu group-fd flags)
+                   (declare (ignore attributes))
+                   (push (list pid cpu group-fd flags) opens)
+                   (+ 100 cpu))
+                 (symbol-function 'whistler/loader::%ioctl)
+                 (lambda (fd request argument)
+                   (push (list fd request argument) ioctls)
+                   0))
+           (let ((fds (whistler/loader::attach-perf-bpf
+                       (whistler/loader::make-perf-attr 2 1234)
+                       17
+                       :per-cpu t
+                       :attach-program-once t)))
+             (is (equal '(100 102 107) fds))
+             (is (equal '((-1 0 -1 8) (-1 2 -1 8) (-1 7 -1 8))
+                        (nreverse opens)))
+             (is (equal (list
+                         (list 100 whistler/loader::+perf-event-ioc-set-bpf+ 17)
+                         (list 100 whistler/loader::+perf-event-ioc-enable+ 0)
+                         (list 102 whistler/loader::+perf-event-ioc-enable+ 0)
+                         (list 107 whistler/loader::+perf-event-ioc-enable+ 0))
+                        (nreverse ioctls)))))
+      (setf (symbol-function 'whistler/loader::online-cpu-ids)
+            original-cpu-ids
+            (symbol-function 'whistler/loader::%perf-event-open)
+            original-open
+            (symbol-function 'whistler/loader::%ioctl)
+            original-ioctl))))
+
 ;;; ========== ELF structure validation ==========
 
 (test elf-has-license-section
