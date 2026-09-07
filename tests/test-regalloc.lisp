@@ -252,6 +252,11 @@
                              (or (gethash (+ (aref regs src) off) stack) 0)))
                  (#x7b (setf (gethash (+ (aref regs dst) off) stack)   ; stx dw
                              (aref regs src)))
+                 (#x77 (setf (aref regs dst)                           ; rsh64 imm
+                             (ash (aref regs dst) (- imm))))
+                 (#xa5 (when (< (aref regs dst) (ldb (byte 32 0) imm))  ; jlt imm
+                         (incf pc off)))
+                 (#x05 (incf pc off))                                   ; ja
                  (#x85 (setf (aref regs 0) (pop results)               ; call
                              (aref regs 1) :clobbered (aref regs 2) :clobbered
                              (aref regs 3) :clobbered (aref regs 4) :clobbered
@@ -277,3 +282,11 @@
     (is (= 63 (interpret-scalar-bpf bytes '(1 2 4 8 16 32)))
         "sum of six call results must be 63 — a wrong value means a spill
          reload clobbered a live register")))
+
+(test log2-preserves-live-source
+  "log2 must not shift a still-live source register in place (whistler-dtx)."
+  (let ((bytes (w-body "(let ((x (get-prandom-u32)))
+                          (return (+ (log2 x) x)))")))
+    ;; log2(1000) = 9 (floor), so the result must be 1009.
+    (is (= 1009 (interpret-scalar-bpf bytes '(1000)))
+        "log2 corrupted its source: (+ (log2 1000) 1000) must be 1009")))

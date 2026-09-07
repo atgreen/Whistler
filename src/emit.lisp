@@ -38,7 +38,9 @@
   (struct-ptr-uses (make-hash-table)) ; struct vreg → count of map-ptr uses
   (phi-moves (make-hash-table :test 'equal)) ; (src-label . tgt-label) → ((phi-dst . src-vreg) ...)
   (stack-ledger '())                  ; ((category . size) ...) for stack usage breakdown
-  (current-op nil))                   ; IR op currently being emitted — tags emitted insns for disassembly
+  (current-op nil)                    ; IR op currently being emitted — tags emitted insns for disassembly
+  (dying-vregs (make-hash-table :test 'eq)) ; ir-insn → list of vregs whose live interval ends there
+  (current-insn nil))                 ; the ir-insn currently being emitted
 
 (defun ectx-emit (ctx insn-list)
   (let ((op (emit-ctx-current-op ctx)))
@@ -119,6 +121,13 @@
                         whistler/bpf:+bpf-dw+ tmp-reg
                         whistler/bpf:+bpf-reg-10+ (cadr loc)))
        tmp-reg))))
+
+(defun vreg-dies-here-p (ctx vreg)
+  "True when VREG's live interval ends at the IR instruction currently
+   being emitted — its register may then be reused destructively."
+  (and (integerp vreg)
+       (member vreg (gethash (emit-ctx-current-insn ctx)
+                             (emit-ctx-dying-vregs ctx)))))
 
 (defun store-to-vreg (ctx vreg src-reg)
   "Store SRC-REG into the physical location for VREG."
@@ -387,6 +396,23 @@
            (blocks (order-blocks prog))
            (block-positions (make-hash-table)))
 
+    ;; Map each vreg's live-interval end back to the ir-insn at that
+    ;; position (same walk order compute-liveness uses:
+    ;; ir-program-blocks, insns in order) so emitters can tell when a
+    ;; source register may be reused destructively. Keyed by insn
+    ;; identity because emission order (order-blocks) may differ from
+    ;; the liveness walk order.
+    (let ((pos-insns (make-array 0 :adjustable t :fill-pointer t)))
+      (dolist (b (ir-program-blocks prog))
+        (dolist (i (basic-block-insns b))
+          (vector-push-extend i pos-insns)))
+      (dolist (iv (compute-liveness prog))
+        (let ((end (live-interval-end iv)))
+          (when (< end (length pos-insns))
+            (push (live-interval-vreg iv)
+                  (gethash (aref pos-insns end)
+                           (emit-ctx-dying-vregs ctx)))))))
+
     ;; Populate const-values: vreg → integer for mov %v (:imm N)
     (dolist (block blocks)
       (dolist (insn (basic-block-insns block))
@@ -525,6 +551,7 @@
     ;; form the IR insn was lowered from, falling back to the IR op keyword for
     ;; insns created by optimization passes (which carry no source form).
     (setf (emit-ctx-current-op ctx) (or (ir-insn-source insn) op))
+    (setf (emit-ctx-current-insn ctx) insn)
     (cond
      ((eq op :arg0) nil)
 
@@ -1529,11 +1556,22 @@
          (dst-loc (allocate-vreg ctx dst))
          ;; Spilled dst computes in R5 (reserved when anything spills).
          (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-5+))
-         ;; work-reg holds the value being shifted during binary search.
-         ;; It MUST differ from dst-reg to avoid clobbering on init.
-         ;; val-reg == dst-reg implies both are allocated registers, so
-         ;; R0 is free as the work scratch.
-         (work-reg (if (/= val-reg dst-reg) val-reg whistler/bpf:+bpf-reg-0+)))
+         ;; work-reg holds the value being shifted during binary search
+         ;; — the shifts destroy it. It MUST differ from dst-reg (init
+         ;; clobbers) and must not be the source's own register unless
+         ;; the source dies at this insn (whistler-dtx: shifting a
+         ;; still-live source in place silently corrupts it).
+         (work-reg (cond
+                     ;; Spill reload already sits in R0 scratch — the
+                     ;; stack slot still holds the value; shift freely.
+                     ((= val-reg whistler/bpf:+bpf-reg-0+) val-reg)
+                     ((and (/= val-reg dst-reg)
+                           (vreg-dies-here-p ctx (first args)))
+                      val-reg)
+                     ;; Source is live past the log2 (or shares dst's
+                     ;; register): shift a copy in R0. dst-reg is never
+                     ;; R0, so the result init can't clobber it.
+                     (t whistler/bpf:+bpf-reg-0+))))
     ;; Copy val to work register if needed
     (unless (= val-reg work-reg)
       (ectx-emit ctx (whistler/bpf:emit-mov64-reg work-reg val-reg)))
