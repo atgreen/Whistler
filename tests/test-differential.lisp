@@ -37,16 +37,25 @@
   (mod (fuzz-next) n))
 
 (defparameter *fuzz-binops* '(+ - * logand logior logxor))
+(defparameter *fuzz-cmp-ops* '(> < >= <= = /=))
 
 (defun gen-scalar-expr (leaves depth)
   "Generate a random expression tree over the symbols in LEAVES using
-   64-bit binops and constant shifts."
+   64-bit binops, constant shifts, and if-expressions over unsigned
+   comparisons (exercising branch emission and phi moves)."
   (if (or (zerop depth) (< (fuzz-int 100) 25))
       (elt leaves (fuzz-int (length leaves)))
-      (case (fuzz-int 8)
+      (case (fuzz-int 10)
         (6 (list 'ash (gen-scalar-expr leaves (1- depth)) (+ 1 (fuzz-int 31))))
         (7 (list (intern ">>" '#:whistler)
                  (gen-scalar-expr leaves (1- depth)) (+ 1 (fuzz-int 31))))
+        ((8 9)
+         (list 'if
+               (list (elt *fuzz-cmp-ops* (fuzz-int (length *fuzz-cmp-ops*)))
+                     (gen-scalar-expr leaves (1- depth))
+                     (gen-scalar-expr leaves (1- depth)))
+               (gen-scalar-expr leaves (1- depth))
+               (gen-scalar-expr leaves (1- depth))))
         (t (list (elt *fuzz-binops* (fuzz-int (length *fuzz-binops*)))
                  (gen-scalar-expr leaves (1- depth))
                  (gen-scalar-expr leaves (1- depth)))))))
@@ -64,6 +73,15 @@
                  (ash (eval-scalar-expr (second expr) env) (third expr)))
                 ((string= (symbol-name op) ">>")
                  (ash (eval-scalar-expr (second expr) env) (- (third expr))))
+                ((eq op 'if)
+                 (let* ((cmp (second expr))
+                        (a (eval-scalar-expr (second cmp) env))
+                        (b (eval-scalar-expr (third cmp) env))
+                        (taken (ecase (first cmp)
+                                 (> (> a b)) (< (< a b))
+                                 (>= (>= a b)) (<= (<= a b))
+                                 (= (= a b)) (/= (/= a b)))))
+                   (eval-scalar-expr (if taken (third expr) (fourth expr)) env)))
                 (t (let ((a (eval-scalar-expr (second expr) env))
                          (b (eval-scalar-expr (third expr) env)))
                      (ecase op
@@ -94,7 +112,7 @@
    spill reloads (6 leaves live across 6 helper calls force a spill)."
   (fuzz-seed 20260907)
   (let ((failures '()))
-    (dotimes (i 120)
+    (dotimes (i 160)
       ;; Cycle leaf counts 1-6 so both the spill-free and spilling
       ;; regalloc paths are exercised; depth 2-4.
       (let ((n-leaves (+ 1 (mod i 6)))

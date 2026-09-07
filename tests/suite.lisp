@@ -281,10 +281,22 @@
                    ((= op #x7b)          ; stx dw
                     (setf (gethash (+ (rr dst) off) stack) (rr src)))
                    ((= op #x05) (incf pc off))                             ; ja
-                   ((= op #xa5) (when (< (rr dst) (ldb (byte 32 0) imm))   ; jlt imm
-                                  (incf pc off)))
-                   ((= op #x35) (when (>= (rr dst) (ldb (byte 32 0) imm))  ; jge imm
-                                  (incf pc off)))
+                   ;; Conditional jumps (JMP class, reg or sign-extended imm).
+                   ((and (= (logand op #x07) #x05)
+                         (member (logand op #xf0)
+                                 '(#x10 #x20 #x30 #x40 #x50 #x60 #x70 #xa0 #xb0 #xc0 #xd0)))
+                    (let* ((a (rr dst))
+                           (b (if (logbitp 3 op) (rr src) (u64 imm)))
+                           (sa (if (logbitp 63 a) (- a (ash 1 64)) a))
+                           (sb (if (logbitp 63 b) (- b (ash 1 64)) b))
+                           (taken (case (logand op #xf0)
+                                    (#x10 (= a b))   (#x50 (/= a b))
+                                    (#x20 (> a b))   (#x30 (>= a b))
+                                    (#xa0 (< a b))   (#xb0 (<= a b))
+                                    (#x40 (plusp (logand a b)))
+                                    (#x60 (> sa sb)) (#x70 (>= sa sb))
+                                    (#xc0 (< sa sb)) (#xd0 (<= sa sb)))))
+                      (when taken (incf pc off))))
                    ((= op #x85)          ; call
                     (setf (aref regs 0) (pop results)
                           (aref regs 1) :clobbered (aref regs 2) :clobbered

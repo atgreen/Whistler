@@ -1604,47 +1604,84 @@
                     (setf changed t)))))))
 
         ;; Sub-pass B: Merge jump-only blocks
-        ;; A block with only a :br (no other instructions) can be bypassed
-        (dolist (block (ir-program-blocks prog))
-          (let ((insns (basic-block-insns block)))
-            (when (and (= 1 (length insns))
-                       (eq (ir-insn-op (first insns)) :br)
-                       ;; Don't remove entry block
-                       (not (eq (basic-block-label block)
-                                (ir-program-entry prog))))
-              (let* ((target-label (second (first (ir-insn-args (first insns)))))
-                     (target-block (ir-find-block prog target-label))
-                     (block-label (basic-block-label block)))
-                (when target-block
-                  ;; Redirect all predecessors to target
-                  (dolist (pred-label (basic-block-preds block))
-                    (let ((pred (ir-find-block prog pred-label)))
-                      (when pred
-                        (let ((pred-term (car (last (basic-block-insns pred)))))
-                          (when pred-term
-                            (setf (ir-insn-args pred-term)
-                                  (mapcar (lambda (arg)
-                                            (if (and (consp arg) (eq (car arg) :label)
-                                                     (eq (second arg) block-label))
-                                                (list :label target-label)
-                                                arg))
-                                          (ir-insn-args pred-term))))))))
-                  ;; Update PHIs in target: replace (:label block) with pred labels
-                  (dolist (insn (basic-block-insns target-block))
-                    (when (eq (ir-insn-op insn) :phi)
-                      (let ((new-args '()))
-                        (dolist (phi-arg (ir-insn-args insn))
-                          (if (and (consp phi-arg)
-                                   (consp (second phi-arg))
-                                   (eq (car (second phi-arg)) :label)
-                                   (eq (second (second phi-arg)) block-label))
-                              ;; Expand to one entry per predecessor
-                              (dolist (pred-label (basic-block-preds block))
-                                (push (list (first phi-arg) (list :label pred-label))
-                                      new-args))
-                              (push phi-arg new-args)))
-                        (setf (ir-insn-args insn) (nreverse new-args)))))
-                  (setf changed t))))))
+        ;; A block with only a :br (no other instructions) can be bypassed.
+        ;;
+        ;; Correctness: ONE merge per sweep (same rationale as Sub-pass C
+        ;; below). A merge redirects predecessors and expands target-PHI
+        ;; inputs using this block's recorded predecessor list; a second
+        ;; merge in the same sweep would consult predecessor data made
+        ;; stale by the first. Concretely, bypassing then_12/else_13 and
+        ;; then join_14 in one sweep expanded a join PHI's input into
+        ;; labels of blocks that were themselves already bypassed —
+        ;; prune-stale-phi-args then deleted those inputs, collapsing the
+        ;; PHI to the wrong arm (whistler-413).
+        (compute-cfg-edges prog)
+        (block pass-b
+          (dolist (block (ir-program-blocks prog))
+            (let ((insns (basic-block-insns block)))
+              (when (and (= 1 (length insns))
+                         (eq (ir-insn-op (first insns)) :br)
+                         ;; Don't remove entry block
+                         (not (eq (basic-block-label block)
+                                  (ir-program-entry prog))))
+                (let* ((target-label (second (first (ir-insn-args (first insns)))))
+                       (target-block (ir-find-block prog target-label))
+                       (block-label (basic-block-label block))
+                       ;; A jump-only block feeding a PHI-bearing target is
+                       ;; a critical-edge splitter: it gives the edge its
+                       ;; own predecessor label, which is what keys the
+                       ;; PHI input. Bypassing it is only safe if no
+                       ;; predecessor would end up with TWO edges into the
+                       ;; target (e.g. a br-cond whose other arm already
+                       ;; reaches it) — otherwise the PHI gets two inputs
+                       ;; from one label and the edge identity is lost
+                       ;; (whistler-413: the wrong arm's value survives).
+                       (phi-conflict
+                         (and target-block
+                              (some (lambda (i) (eq (ir-insn-op i) :phi))
+                                    (basic-block-insns target-block))
+                              (loop for pred-label in (basic-block-preds block)
+                                    for pred = (ir-find-block prog pred-label)
+                                    for term = (and pred (car (last (basic-block-insns pred))))
+                                    thereis
+                                    (and term
+                                         (> (loop for arg in (ir-insn-args term)
+                                                  count (and (consp arg)
+                                                             (eq (car arg) :label)
+                                                             (member (second arg)
+                                                                     (list block-label target-label))))
+                                            1))))))
+                  (when (and target-block (not phi-conflict))
+                    ;; Redirect all predecessors to target
+                    (dolist (pred-label (basic-block-preds block))
+                      (let ((pred (ir-find-block prog pred-label)))
+                        (when pred
+                          (let ((pred-term (car (last (basic-block-insns pred)))))
+                            (when pred-term
+                              (setf (ir-insn-args pred-term)
+                                    (mapcar (lambda (arg)
+                                              (if (and (consp arg) (eq (car arg) :label)
+                                                       (eq (second arg) block-label))
+                                                  (list :label target-label)
+                                                  arg))
+                                            (ir-insn-args pred-term))))))))
+                    ;; Update PHIs in target: replace (:label block) with pred labels
+                    (dolist (insn (basic-block-insns target-block))
+                      (when (eq (ir-insn-op insn) :phi)
+                        (let ((new-args '()))
+                          (dolist (phi-arg (ir-insn-args insn))
+                            (if (and (consp phi-arg)
+                                     (consp (second phi-arg))
+                                     (eq (car (second phi-arg)) :label)
+                                     (eq (second (second phi-arg)) block-label))
+                                ;; Expand to one entry per predecessor
+                                (dolist (pred-label (basic-block-preds block))
+                                  (push (list (first phi-arg) (list :label pred-label))
+                                        new-args))
+                                (push phi-arg new-args)))
+                          (setf (ir-insn-args insn) (nreverse new-args)))))
+                    (setf changed t)
+                    (return-from pass-b)))))))
 
         ;; Sub-pass C: Merge linear chains
         ;; If A's only successor is B (via :br), and B's only predecessor is A
