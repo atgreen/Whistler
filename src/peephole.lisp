@@ -801,7 +801,14 @@
                     (or (bpf-alu64-imm-p b)
                         (/= (whistler/bpf:bpf-insn-src b)
                             (whistler/bpf:bpf-insn-src a))))
-          do ;; Fuse: change alu to operate on rY directly, delete mov's
+          do ;; Fuse: change alu to operate on rY directly, delete mov's.
+             ;; When the ALU's src is rX itself (alu rX, rX — both operands
+             ;; the same copied value), rewrite the src to rY too: rX no
+             ;; longer holds the value once the mov is deleted.
+             (when (and (bpf-alu64-reg-p b)
+                        (= (whistler/bpf:bpf-insn-src b)
+                           (whistler/bpf:bpf-insn-dst a)))
+               (setf (whistler/bpf:bpf-insn-src b) (whistler/bpf:bpf-insn-src a)))
              (setf (whistler/bpf:bpf-insn-dst b) (whistler/bpf:bpf-insn-src a))
              (setf (gethash i to-delete) t)
              (setf (gethash (+ i 2) to-delete) t)

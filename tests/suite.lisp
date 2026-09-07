@@ -212,3 +212,86 @@
 (defun run-tests ()
   "Run all Whistler tests. Returns T on success."
   (run! 'whistler-suite))
+
+;;; ========== Scalar BPF interpreter (differential/regression oracle) ==========
+;;;
+;;; Executes the scalar subset of emitted BPF so tests can check computed
+;;; values, not just instruction shapes — the only way to catch silent
+;;; wrong-value miscompiles (spill-scratch clobbers, destructive source
+;;; reuse) that the kernel verifier happily accepts. Errors loudly on any
+;;; opcode outside the subset so coverage gaps surface as test failures.
+
+(defun interpret-scalar-bpf (bytes call-results)
+  "Interpret scalar BPF: ALU64/ALU32 reg+imm ops, dw ldx/stx via R10,
+   ld_imm64, ja/jlt/jge-imm, helper calls, exit. CALL-RESULTS supplies
+   successive R0 values for call instructions; calls clobber R1-R5 with
+   a poison symbol so reading a clobbered register errors. Returns R0
+   at exit."
+  (let ((regs (make-array 11 :initial-element 0))
+        (stack (make-hash-table))
+        (n (/ (length bytes) 8))
+        (results call-results))
+    (flet ((u64 (x) (ldb (byte 64 0) x))
+           (u32 (x) (ldb (byte 32 0) x))
+           (rr (i) (let ((v (aref regs i)))
+                     (unless (integerp v)
+                       (error "interpret-scalar-bpf: read of clobbered R~D" i))
+                     v)))
+      (loop with pc = 0
+            while (< pc n)
+            do (let* ((op (nth-insn-opcode bytes pc))
+                      (dst (logand (nth-insn-regs bytes pc) #x0f))
+                      (src (ash (nth-insn-regs bytes pc) -4))
+                      (off (nth-insn-off bytes pc))
+                      (imm (nth-insn-imm bytes pc))
+                      (alu-class (logand op #x07))
+                      (alu-op (logand op #xf0))
+                      (alu64-p (= alu-class #x07))
+                      (alu32-p (= alu-class #x04))
+                      (reg-src-p (logbitp 3 op)))
+                 (cond
+                   ;; ALU64 / ALU32 (BPF_ALU64=0x07, BPF_ALU=0x04 class)
+                   ((and (or alu64-p alu32-p)
+                         (member alu-op '(#x00 #x10 #x20 #x40 #x50 #x60 #x70 #xa0 #xb0)))
+                    (let* ((a (if (= alu-op #xb0)
+                                  0   ; mov doesn't read dst (may be poisoned)
+                                  (if alu32-p (u32 (rr dst)) (rr dst))))
+                           (b (let ((raw (if reg-src-p (rr src) (ldb (byte 64 0) imm))))
+                                (if alu32-p (u32 raw) raw)))
+                           (r (case alu-op
+                                (#x00 (+ a b))
+                                (#x10 (- a b))
+                                (#x20 (* a b))
+                                (#x40 (logior a b))
+                                (#x50 (logand a b))
+                                (#x60 (ash a (logand b (if alu32-p 31 63))))
+                                (#x70 (ash a (- (logand b (if alu32-p 31 63)))))
+                                (#xa0 (logxor a b))
+                                (#xb0 b))))
+                      (setf (aref regs dst) (if alu32-p (u32 r) (u64 r)))))
+                   ;; ld_imm64 — two slots, imm is low 32, next insn imm is high 32
+                   ((= op #x18)
+                    (setf (aref regs dst)
+                          (logior (ldb (byte 32 0) imm)
+                                  (ash (ldb (byte 32 0) (nth-insn-imm bytes (1+ pc))) 32)))
+                    (incf pc))
+                   ((= op #x79)          ; ldx dw
+                    (setf (aref regs dst)
+                          (or (gethash (+ (rr src) off) stack) 0)))
+                   ((= op #x7b)          ; stx dw
+                    (setf (gethash (+ (rr dst) off) stack) (rr src)))
+                   ((= op #x05) (incf pc off))                             ; ja
+                   ((= op #xa5) (when (< (rr dst) (ldb (byte 32 0) imm))   ; jlt imm
+                                  (incf pc off)))
+                   ((= op #x35) (when (>= (rr dst) (ldb (byte 32 0) imm))  ; jge imm
+                                  (incf pc off)))
+                   ((= op #x85)          ; call
+                    (setf (aref regs 0) (pop results)
+                          (aref regs 1) :clobbered (aref regs 2) :clobbered
+                          (aref regs 3) :clobbered (aref regs 4) :clobbered
+                          (aref regs 5) :clobbered))
+                   ((= op #x95) (return-from interpret-scalar-bpf (aref regs 0))) ; exit
+                   (t (error "interpret-scalar-bpf: unhandled opcode ~2,'0X at insn ~D"
+                             op pc)))
+                 (incf pc))))
+    (error "interpret-scalar-bpf: fell off the end without exit")))

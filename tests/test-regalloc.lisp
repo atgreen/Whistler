@@ -224,49 +224,6 @@
 ;;; interpreter, so any scratch clobber shows up as a wrong sum no
 ;;; matter which registers the emitter picks.
 
-(defun interpret-scalar-bpf (bytes call-results)
-  "Interpret the scalar subset of BPF (mov/add reg+imm, dw ldx/stx via
-   R10, helper calls, exit). CALL-RESULTS supplies successive R0 values
-   for call instructions. Returns R0 at exit. Errors on any opcode
-   outside the subset so the test fails loudly if codegen changes shape."
-  (let ((regs (make-array 11 :initial-element 0))
-        (stack (make-hash-table))
-        (n (/ (length bytes) 8))
-        (results call-results))
-    (setf (aref regs 10) 0)
-    (loop with pc = 0
-          while (< pc n)
-          do (let ((op (nth-insn-opcode bytes pc))
-                   (dst (logand (nth-insn-regs bytes pc) #x0f))
-                   (src (ash (nth-insn-regs bytes pc) -4))
-                   (off (nth-insn-off bytes pc))
-                   (imm (nth-insn-imm bytes pc)))
-               (case op
-                 (#xbf (setf (aref regs dst) (aref regs src)))         ; mov64 reg
-                 (#xb7 (setf (aref regs dst) imm))                     ; mov64 imm
-                 (#x0f (setf (aref regs dst)                           ; add64 reg
-                             (ldb (byte 64 0) (+ (aref regs dst) (aref regs src)))))
-                 (#x07 (setf (aref regs dst)                           ; add64 imm
-                             (ldb (byte 64 0) (+ (aref regs dst) imm))))
-                 (#x79 (setf (aref regs dst)                           ; ldx dw
-                             (or (gethash (+ (aref regs src) off) stack) 0)))
-                 (#x7b (setf (gethash (+ (aref regs dst) off) stack)   ; stx dw
-                             (aref regs src)))
-                 (#x77 (setf (aref regs dst)                           ; rsh64 imm
-                             (ash (aref regs dst) (- imm))))
-                 (#xa5 (when (< (aref regs dst) (ldb (byte 32 0) imm))  ; jlt imm
-                         (incf pc off)))
-                 (#x05 (incf pc off))                                   ; ja
-                 (#x85 (setf (aref regs 0) (pop results)               ; call
-                             (aref regs 1) :clobbered (aref regs 2) :clobbered
-                             (aref regs 3) :clobbered (aref regs 4) :clobbered
-                             (aref regs 5) :clobbered))
-                 (#x95 (return-from interpret-scalar-bpf (aref regs 0))) ; exit
-                 (t (error "interpret-scalar-bpf: unhandled opcode ~2,'0X at insn ~D"
-                           op pc)))
-               (incf pc)))
-    (error "interpret-scalar-bpf: fell off the end without exit")))
-
 (test spill-reload-scratch-preserves-live-values
   "A spilled operand's reload must not corrupt live registers (whistler-snx).
    Six helper-call results overflow the callee-saved pool, spilling one;

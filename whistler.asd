@@ -115,6 +115,7 @@
                (:file "test-percpu")
                (:file "test-programs")
                (:file "test-regalloc")
+               (:file "test-differential")
                (:file "test-torture")
                (:file "test-bpftrace")
                (:file "test-symbolize")))
