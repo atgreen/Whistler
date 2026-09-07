@@ -888,13 +888,14 @@
            (ectx-emit ctx insns))))
       ;; Normal pointer-based store
       (t
-       ;; Materialize the value before the pointer. This avoids cases where
-       ;; computing VAL reuses/clobbers the register currently holding PTR,
-       ;; which is especially important for ringbuf record pointers.
-       (emit-vreg-to-reg ctx val-arg whistler/bpf:+bpf-reg-2+)
-       (emit-vreg-to-reg ctx ptr-vreg whistler/bpf:+bpf-reg-1+)
-       (let ((ptr-reg whistler/bpf:+bpf-reg-1+)
-             (val-reg whistler/bpf:+bpf-reg-2+))
+       ;; Use the operands' allocated registers directly (R1/R2 only as
+       ;; spill-reload scratch). A store is not call-like, so R1-R5 may
+       ;; hold live vregs — unconditionally copying the operands into
+       ;; R1/R2 clobbered a live loop counter and loop-carried pointer
+       ;; across the back-edge (issue #41). Reload the value first so a
+       ;; spilled value cannot land on top of a just-reloaded pointer.
+       (let* ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-2+))
+              (ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-1+)))
          (let ((insns (whistler/bpf:emit-stx-mem bpf-size ptr-reg val-reg off)))
            (setf store-insn (first insns))
            (ectx-emit ctx insns)))))

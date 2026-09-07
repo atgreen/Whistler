@@ -383,6 +383,19 @@
           (setf count (+ count 1))))
       (return count))"))
 
+(test torture-loop-byte-copy-derived-pointers
+  "Byte-copy dotimes whose body derives pointers from the counter (issue #41).
+   The store's operands must be read from their allocated registers — the old
+   emit path copied them into R1/R2 unconditionally, clobbering the loop
+   counter and a loop-carried pointer across the back-edge, which the kernel
+   verifier rejected with 'R1 pointer += pointer prohibited'."
+  (torture-verify
+   "(let ((src (struct-alloc 17))
+          (dst (struct-alloc 17)))
+      (dotimes (i 17)
+        (store u8 (+ dst i) 0 (load u8 (+ src i) 0)))
+      (return 0))"))
+
 (test torture-early-return-in-branch
   "Return from inside nested when"
   (torture-verify
