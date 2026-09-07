@@ -42,9 +42,19 @@
 (defun gen-scalar-expr (leaves depth)
   "Generate a random expression tree over the symbols in LEAVES using
    64-bit binops, constant shifts, and if-expressions over unsigned
-   comparisons (exercising branch emission and phi moves)."
+   comparisons (exercising branch emission and phi moves). Leaves are
+   sometimes integer literals, so comparisons can become compile-time
+   constant — driving simplify-cfg's constant-branch folding and
+   trivial-phi collapse (the issue #42 machinery)."
   (if (or (zerop depth) (< (fuzz-int 100) 25))
-      (elt leaves (fuzz-int (length leaves)))
+      (if (< (fuzz-int 100) 30)
+          ;; Small constants collide often (making constant compares and
+          ;; equal phi arms likely); occasional large ones stress
+          ;; immediates.
+          (if (< (fuzz-int 100) 80)
+              (fuzz-int 4)
+              (fuzz-int (expt 2 32)))
+          (elt leaves (fuzz-int (length leaves))))
       (case (fuzz-int 10)
         (6 (list 'ash (gen-scalar-expr leaves (1- depth)) (+ 1 (fuzz-int 31))))
         (7 (list (intern ">>" '#:whistler)

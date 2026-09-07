@@ -132,6 +132,23 @@
               (and (plusp (logand code #x08))
                    (= (whistler/bpf:bpf-insn-src insn) reg)))))))
 
+(defun collect-jump-targets (vec)
+  "Return a hash of instruction indices that are jump targets in VEC.
+   Pattern passes that rewrite or delete an instruction must skip
+   candidates whose non-first instructions are jump targets: a jump
+   landing mid-pattern executes rewritten semantics (or skips a deleted
+   instruction entirely) that its own path never set up."
+  (let ((targets (make-hash-table))
+        (len (length vec)))
+    (loop for i from 0 below len
+          for insn = (aref vec i)
+          when (or (bpf-unconditional-jmp-p insn)
+                   (bpf-conditional-jmp-p insn))
+          do (let ((target (+ i 1 (whistler/bpf:bpf-insn-off insn))))
+               (when (and (>= target 0) (< target len))
+                 (setf (gethash target targets) t))))
+    targets))
+
 (defun insn-writes-reg (insn reg)
   "Does INSN write to REG?"
   (let ((code (whistler/bpf:bpf-insn-code insn)))
@@ -386,10 +403,11 @@
 
 (defun peephole-fold-return (insns)
   "Fold mov rX, IMM; mov r0, rX; exit into mov r0, IMM; exit."
-  (let ((vec (coerce insns 'vector))
-        (len (length insns))
-        (to-delete (make-hash-table))
-        (changed nil))
+  (let* ((vec (coerce insns 'vector))
+         (len (length insns))
+         (targets (collect-jump-targets vec))
+         (to-delete (make-hash-table))
+         (changed nil))
     (loop for i from 0 below (- len 2)
           for a = (aref vec i)
           for b = (aref vec (1+ i))
@@ -399,7 +417,11 @@
                     (= (whistler/bpf:bpf-insn-dst b) 0) ; dst is r0
                     (= (whistler/bpf:bpf-insn-src b)
                        (whistler/bpf:bpf-insn-dst a)) ; src matches
-                    (bpf-exit-p c))
+                    (bpf-exit-p c)
+                    ;; Other paths may jump straight to the mov r0, rX
+                    ;; (a shared return move) — deleting it would land
+                    ;; them on exit with r0 stale (issue #42 family).
+                    (not (gethash (1+ i) targets)))
           do ;; Replace: a becomes mov r0, IMM; delete b
              (setf (whistler/bpf:bpf-insn-dst a) 0)
              (setf (gethash (1+ i) to-delete) t)
@@ -779,10 +801,11 @@
 
 (defun peephole-fuse-mov-alu-mov (insns)
   "Fuse mov rX, rY; alu rX, ...; mov rY, rX into alu rY, ..."
-  (let ((vec (coerce insns 'vector))
-        (len (length insns))
-        (to-delete (make-hash-table))
-        (changed nil))
+  (let* ((vec (coerce insns 'vector))
+         (len (length insns))
+         (targets (collect-jump-targets vec))
+         (to-delete (make-hash-table))
+         (changed nil))
     (loop for i from 0 below (- len 2)
           for a = (aref vec i)
           for b = (aref vec (1+ i))
@@ -791,6 +814,10 @@
           when (and (bpf-mov64-reg-p a)
                     (or (bpf-alu64-reg-p b) (bpf-alu64-imm-p b))
                     (bpf-mov64-reg-p c)
+                    ;; Jumps may land on the ALU or the writeback mov;
+                    ;; rewriting/deleting them breaks those paths.
+                    (not (gethash (1+ i) targets))
+                    (not (gethash (+ i 2) targets))
                     ;; mov rX, rY: a.dst = rX, a.src = rY
                     ;; alu rX, ...: b.dst = rX
                     ;; mov rY, rX: c.dst = rY, c.src = rX
@@ -824,10 +851,11 @@
 
 (defun peephole-fold-swap-add (insns)
   "Fold mov rA, rB; mov rB, rC; alu rB, rA into alu rC, rB; mov rB, rC."
-  (let ((vec (coerce insns 'vector))
-        (len (length insns))
-        (to-delete (make-hash-table))
-        (changed nil))
+  (let* ((vec (coerce insns 'vector))
+         (len (length insns))
+         (targets (collect-jump-targets vec))
+         (to-delete (make-hash-table))
+         (changed nil))
     (loop for i from 0 below (- len 2)
           for a = (aref vec i)
           for b = (aref vec (1+ i))
@@ -835,6 +863,10 @@
           ;; Match: mov rA, rB; mov rB, rC; alu rB, rA (reg-src)
           when (and (bpf-mov64-reg-p a)
                     (bpf-mov64-reg-p b)
+                    ;; Both b and c are rewritten in place — a jump
+                    ;; landing on either executes the wrong op.
+                    (not (gethash (1+ i) targets))
+                    (not (gethash (+ i 2) targets))
                     (let ((cc (whistler/bpf:bpf-insn-code c)))
                       (and (or (= (logand cc #x07) whistler/bpf:+bpf-alu64+)
                                (= (logand cc #x07) whistler/bpf:+bpf-alu+))

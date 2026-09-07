@@ -235,3 +235,48 @@
                  (when (and (>= tgt 0) (< tgt n))
                    (is (/= (opc tgt) #x05)
                        (format nil "insn ~d targets unconditional jump at ~d" i tgt))))))))
+
+;;; ========== Issue #42 family: CFG folds and peephole vs shared code ==========
+
+(test fold-return-preserves-jump-target-paths
+  "peephole-fold-return must not delete a shared `mov r0, rX' that other
+   paths jump to directly (issue #42 family, found by differential fuzz).
+   The then-path's value used to be lost, returning x1 instead of the
+   logand."
+  (let ((bytes (w-body "(let ((x1 (get-prandom-u32)) (x2 (get-prandom-u32)))
+                          (declare (type u64 x1 x2))
+                          (return (if (= x1 x1)
+                                      (logand x1 x2)
+                                      (if (<= 1 x1) 1 x2))))")))
+    (is (= (logand 3667470010 3411868279)
+           (interpret-scalar-bpf bytes '(3667470010 3411868279))))))
+
+(test narrow-alu-keeps-lsh-carry-bits
+  "narrow-alu-types must not emit lsh32 when the shifted value can carry
+   past bit 31: (u32-masked << 13) needs up to 44 bits."
+  (let ((bytes (w-body "(let ((x1 (get-prandom-u32)))
+                          (declare (type u64 x1))
+                          (return (ash (logand x1 1258033823) 13)))")))
+    (is (= (ash (logand 3715303140 1258033823) 13)
+           (interpret-scalar-bpf bytes '(3715303140))))))
+
+(test narrow-alu-keeps-mul-product-bits
+  "narrow-alu-types must not emit mul32 for a product that needs more
+   than 32 bits: (u32-masked * u32-masked) can need 62."
+  (let ((bytes (w-body "(let ((x1 (get-prandom-u32)) (x2 (get-prandom-u32)))
+                          (declare (type u64 x1 x2))
+                          (return (* (logand x1 #x7fffffff) (logand x2 #x7fffffff))))")))
+    (is (= (ldb (byte 64 0) (* (logand 3715303140 #x7fffffff)
+                               (logand 2921185455 #x7fffffff)))
+           (interpret-scalar-bpf bytes '(3715303140 2921185455))))))
+
+(test issue-42-nested-constant-conditions
+  "The issue #42 repro shape — unless/when over constant conditions —
+   must compile without dangling branches and return the right value."
+  (let ((bytes (w-body "(let* ((bf 0))
+                          (let* ((cf 0))
+                            (unless cf
+                              (when (= cf 0)
+                                (setf bf 1))))
+                          (return bf))")))
+    (is (= 1 (interpret-scalar-bpf bytes '())))))

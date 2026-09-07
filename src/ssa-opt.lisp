@@ -848,11 +848,21 @@
                    (setf (ir-insn-type insn) 'u32))))
 
               ;; (xor x MASK), (or x MASK) → u32 if both operands are u32
+              ;; (bitwise results can't exceed their widest operand).
               ;; Note: add/sub are NOT narrowed because carry bits may exceed
               ;; 32 bits (e.g., checksum folding). Use explicit (cast u32 ...)
               ;; in source if 32-bit add is desired.
-              ((member op '(:xor :or :mul))
+              ((member op '(:xor :or))
                (when (both-operands-narrow-p args def-map)
+                 (setf (ir-insn-type insn) 'u32)))
+
+              ;; (* x y) → u32 only when the product provably fits:
+              ;; width(x) + width(y) <= 32. u32*u32 needs 64 bits — a
+              ;; mul32 would silently truncate the product.
+              ((eq op :mul)
+               (when (<= (+ (operand-value-width (first args) def-map)
+                            (operand-value-width (second args) def-map))
+                         32)
                  (setf (ir-insn-type insn) 'u32)))
 
               ;; (mod x y), (div x y) → u32 if both operands u32
@@ -860,19 +870,38 @@
                (when (both-operands-narrow-p args def-map)
                  (setf (ir-insn-type insn) 'u32)))
 
-              ;; (lsh x N) — stays wide unless x is narrow and shift is small
+              ;; (lsh x N) — narrow only when the shifted value provably
+              ;; fits 32 bits: width(x) + N <= 32. A u32 shifted left by
+              ;; even 1 can carry into bit 32; lsh32 would truncate it
+              ;; (found by the differential fuzzer, issue #42 follow-up).
               ((eq op :lsh)
-               (let ((lhs (first args))
-                     (rhs-imm (and (consp (second args))
+               (let ((rhs-imm (and (consp (second args))
                                    (eq (first (second args)) :imm)
                                    (second (second args)))))
-                 (when (and rhs-imm (<= rhs-imm 16)
-                            (integerp lhs)
-                            (let ((def (gethash lhs def-map)))
-                              (and def (ir-insn-type def)
-                                   (narrow-type-p (ir-insn-type def)))))
+                 (when (and rhs-imm
+                            (<= (+ (operand-value-width (first args) def-map)
+                                   rhs-imm)
+                                32))
                    (setf (ir-insn-type insn) 'u32))))))))))
   prog)
+
+(defun operand-value-width (arg def-map)
+  "Upper bound on the number of significant bits in operand ARG:
+   the exact bit length for an immediate, the defining instruction's
+   type width for a narrow-typed vreg, 64 otherwise."
+  (cond
+    ((and (consp arg) (eq (first arg) :imm))
+     (max 1 (integer-length (second arg))))
+    ((integerp arg)
+     (let* ((def (gethash arg def-map))
+            (type (and def (ir-insn-type def)))
+            (name (and type (string-upcase (string type)))))
+       (cond ((null name) 64)
+             ((or (string= name "U8")  (string= name "I8"))  8)
+             ((or (string= name "U16") (string= name "I16")) 16)
+             ((or (string= name "U32") (string= name "I32")) 32)
+             (t 64))))
+    (t 64)))
 
 (defun narrow-type-p (type)
   "Is TYPE 32-bit or narrower?"
