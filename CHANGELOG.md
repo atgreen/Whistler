@@ -2,6 +2,72 @@
 
 All notable user-facing changes per release. Newest first.
 
+## 1.14.0 — 2026-09-07
+
+A correctness release. A new differential-fuzzing harness — random
+programs compiled through the full pipeline, executed in a scalar BPF
+interpreter, and checked against direct evaluation — caught most of the
+wrong-code bugs fixed below; several were silent miscompiles the kernel
+verifier happily accepts.
+
+### New Features
+
+#### Differential fuzzing of scalar codegen
+
+The test suite now includes a deterministic (seeded) fuzzer that
+generates random scalar expressions — 64-bit arithmetic, constant
+shifts, `if`-expressions over comparisons, and integer-literal
+operands — over helper-call results, compiles them through the full
+pipeline, executes the emitted BPF in a test interpreter with stubbed
+call results, and requires the value to match direct evaluation. The
+interpreter poisons R1–R5 at calls, so reading a call-clobbered
+register fails loudly. This is the only oracle that catches
+wrong-*value* miscompiles, and it found four of the bugs below within
+its first few hundred cases.
+
+### Bug Fixes
+
+All of these produced wrong eBPF; each fix ships with a regression
+test that fails on the previous release.
+
+- **Pointer-based stores clobbered live registers** (issue #41). The
+  emitter copied a store's value and pointer into fixed R1/R2, but a
+  store is not call-like — regalloc keeps live values there. A
+  `dotimes` byte-copy corrupted its loop counter and destination
+  pointer every iteration, rejected by the verifier as
+  `pointer += pointer prohibited`. Stores now use the operands'
+  allocated registers. Bonus: `ringbuf-events` dropped 59 → 51
+  instructions.
+- **Spill reloads used unsafe scratch registers.** Reloading a spilled
+  operand into fixed R1–R3 at any non-call instruction (ALU, compare,
+  load, store, atomic) silently corrupted whichever live value regalloc
+  had placed there — a six-way sum computed `2e+f` instead of
+  `a+b+c+d+e+f`, verifier-clean. Scratch is now R0 (never allocated)
+  plus R5, backed by a two-pass allocator that reserves R5 whenever
+  anything spills.
+- **`log2` destroyed a still-live source.** The unrolled binary search
+  right-shifted the source register in place, so `(+ (log2 x) x)`
+  returned garbage. The emitter now tracks where each vreg's live
+  interval ends and only shifts in place when the source dies at the
+  `log2`.
+- **Peephole passes rewrote or deleted jump targets.**
+  `fuse-mov-alu-mov` mis-fused `(logand x x)` into reading a
+  call-clobbered register, and `fold-return` deleted a shared
+  `mov r0, rX` return move that other paths jump to — returning the
+  wrong arm of an `if`. These passes (and `fold-swap-add`) now skip
+  patterns whose instructions are jump targets.
+- **`simplify-cfg` corrupted join phis.** Merging jump-only blocks used
+  stale predecessor data (dropping a phi input, so the wrong arm's
+  value survived) and bypassed critical-edge-splitter blocks (leaving a
+  phi with two values under one predecessor label). Merges now happen
+  one per sweep with a phi-conflict guard. This resolves issue #42's
+  dangling-branch/stale-phi class properly, with no need for the
+  semantics-degrading safety nets prototyped there.
+- **Unsound 32-bit narrowing.** `narrow-alu-types` emitted `lsh32` for
+  shifts whose result needs more than 32 bits, and `mul32` for u32×u32
+  products needing up to 64. Narrowing now requires the operand widths
+  (plus shift amount) to provably fit 32 bits.
+
 ## 1.13.0 — 2026-09-07
 
 ### Bug Fixes
