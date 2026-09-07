@@ -2,6 +2,27 @@
 
 All notable user-facing changes per release. Newest first.
 
+## 1.13.0 — 2026-09-07
+
+### Bug Fixes
+
+- `attach-tracepoint` opened a single perf event on CPU 0 only, so
+  tracepoint samples from a process running on any other CPU were never
+  delivered. The loader now opens and enables one perf event per online
+  CPU (issuing `PERF_EVENT_IOC_SET_BPF` once, since tracepoint program
+  attachment is global).
+- `hist()` bucket indexing now matches bpftrace: value 0 lands in
+  bucket `[0]`, value 1 in `[1]`, and each power-of-two interval in its
+  labeled slot — previously every positive bucket landed one slot low
+  and values 0 and 1 were merged. log2 histogram maps and runtime
+  iteration widened from 64 to 65 buckets so the full u64 range stays
+  representable, and all four histogram printers now trim leading empty
+  buckets the way upstream bpftrace does.
+- Fixed comm-keyed histogram lowering: `@h[comm] = hist(...)` now
+  copies the comm string's bytes into the map key instead of storing it
+  as a scalar, so string-shaped keys survive having the bucket slot
+  appended.
+
 ## 1.12.0 — 2026-08-26
 
 ### New Features
