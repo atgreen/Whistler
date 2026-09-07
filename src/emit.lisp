@@ -170,12 +170,14 @@
   (member op '(:add :mul :and :or :xor)))
 
 (defun choose-temp-reg (&rest avoid)
-  "Pick a caller-saved scratch register not present in AVOID."
+  "Pick a scratch register not present in AVOID. Only R0 (never allocated
+   by regalloc) and R5 (removed from the caller pool whenever anything
+   spills — see linear-scan-alloc) are safe: any other register may hold
+   a live vreg at a non-call instruction, and clobbering it is a silent
+   wrong-value miscompile. Scratch is only ever needed to reload spilled
+   operands, and spills imply R5 is reserved."
   (or (find-if (lambda (reg) (not (member reg avoid)))
-               (list whistler/bpf:+bpf-reg-1+
-                     whistler/bpf:+bpf-reg-2+
-                     whistler/bpf:+bpf-reg-3+
-                     whistler/bpf:+bpf-reg-4+
+               (list whistler/bpf:+bpf-reg-0+
                      whistler/bpf:+bpf-reg-5+))
       whistler/bpf:+bpf-reg-5+))
 
@@ -579,7 +581,7 @@
      ((eq op :ret)
       (let ((val (first args)))
         (when (integerp val)
-          (let ((src-reg (vreg-to-physical ctx val whistler/bpf:+bpf-reg-1+)))
+          (let ((src-reg (vreg-to-physical ctx val whistler/bpf:+bpf-reg-0+)))
             ;; Always emit mov r0, src — even if src is already r0.
             ;; Needed when multiple branches converge on a shared exit:
             ;; one branch may have the value in r0 while another has it
@@ -624,7 +626,7 @@
     (let ((arg (first args)))
       (cond
        ((integerp arg)
-        (let ((src-phys (vreg-to-physical ctx arg whistler/bpf:+bpf-reg-1+)))
+        (let ((src-phys (vreg-to-physical ctx arg whistler/bpf:+bpf-reg-0+)))
           (store-to-vreg ctx dst src-phys)))
        ;; (:btf-id N) — load the address of a BTF-typed kernel symbol
        ;; (e.g. a `__percpu' variable). Encoded as ld_imm64 with
@@ -662,7 +664,7 @@
 
 (defun emit-neg-insn (ctx dst args)
   "Emit a negation instruction."
-  (let ((src-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+))
+  (let ((src-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-0+))
         (dst-loc (allocate-vreg ctx dst)))
     (ecase (car dst-loc)
       (:reg
@@ -670,11 +672,13 @@
          (ectx-emit ctx (whistler/bpf:emit-mov64-reg (cadr dst-loc) src-reg)))
        (ectx-emit ctx (whistler/bpf:emit-alu64-imm whistler/bpf:+bpf-neg+ (cadr dst-loc) 0)))
       (:stack
-       (ectx-emit ctx (whistler/bpf:emit-mov64-reg whistler/bpf:+bpf-reg-1+ src-reg))
-       (ectx-emit ctx (whistler/bpf:emit-alu64-imm whistler/bpf:+bpf-neg+ whistler/bpf:+bpf-reg-1+ 0))
+       ;; Work in R0 — never allocated, so never live here.
+       (unless (= src-reg whistler/bpf:+bpf-reg-0+)
+         (ectx-emit ctx (whistler/bpf:emit-mov64-reg whistler/bpf:+bpf-reg-0+ src-reg)))
+       (ectx-emit ctx (whistler/bpf:emit-alu64-imm whistler/bpf:+bpf-neg+ whistler/bpf:+bpf-reg-0+ 0))
        (ectx-emit ctx (whistler/bpf:emit-stx-mem
                        whistler/bpf:+bpf-dw+
-                       whistler/bpf:+bpf-reg-10+ whistler/bpf:+bpf-reg-1+ (cadr dst-loc)))))))
+                       whistler/bpf:+bpf-reg-10+ whistler/bpf:+bpf-reg-0+ (cadr dst-loc)))))))
 
 ;;; ========== ALU emission ==========
 
@@ -690,7 +694,9 @@
   (let* ((bpf-op (ir-alu-to-bpf op))
          (rhs (second args))
          (dst-loc (allocate-vreg ctx dst))
-         (work-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-1+))
+         ;; Spilled dst computes in R5 — reserved as scratch whenever
+         ;; anything spills — leaving R0 free for operand reloads.
+         (work-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-5+))
          (use-alu32 (ir-type-is-32bit-p type))
          (emit-alu (if use-alu32 #'whistler/bpf:emit-alu32-reg #'whistler/bpf:emit-alu64-reg))
          (emit-alu-i (if use-alu32 #'whistler/bpf:emit-alu32-imm #'whistler/bpf:emit-alu64-imm)))
@@ -702,43 +708,42 @@
                (lhs-phys (if (eq (car lhs-loc) :reg) (cadr lhs-loc) nil))
                (rhs-phys (if (eq (car rhs-loc) :reg) (cadr rhs-loc) nil)))
           (cond
-            ;; Case 1: lhs already in work-reg — just load rhs
+            ;; Case 1: lhs already in work-reg — just load rhs.
+            ;; Spill reloads use R0: never allocated, so never live here.
             ((and lhs-phys (= lhs-phys work-reg))
-             (let ((rhs-reg (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-2+)))
+             (let ((rhs-reg (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-0+)))
                (ectx-emit ctx (funcall emit-alu bpf-op work-reg rhs-reg))))
             ;; Case 2: rhs NOT in work-reg — safe to load lhs first
             ((not (and rhs-phys (= rhs-phys work-reg)))
              (let ((lhs-reg (vreg-to-physical ctx (first args) work-reg)))
                (unless (= lhs-reg work-reg)
                  (ectx-emit ctx (whistler/bpf:emit-mov64-reg work-reg lhs-reg)))
-               (let ((rhs-reg (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-2+)))
+               (let ((rhs-reg (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-0+)))
                  (ectx-emit ctx (funcall emit-alu bpf-op work-reg rhs-reg)))))
-            ;; Case 3: rhs IS in work-reg — evacuate rhs before loading lhs
+            ;; Case 3: rhs IS in work-reg — evacuate rhs before loading lhs.
+            ;; R0 is safe for the lhs reload / rhs evacuation; work-reg is
+            ;; never R5 here (rhs-phys = work-reg implies dst has a register).
             (t
              (if (commutative-alu-op-p op)
                  ;; For commutative ops, keep rhs in work-reg and apply lhs.
-                 (let* ((lhs-tmp (if (= work-reg whistler/bpf:+bpf-reg-2+)
-                                     whistler/bpf:+bpf-reg-3+
-                                     whistler/bpf:+bpf-reg-2+))
-                        (lhs-reg (vreg-to-physical ctx (first args) lhs-tmp)))
+                 (let ((lhs-reg (vreg-to-physical ctx (first args)
+                                                  whistler/bpf:+bpf-reg-0+)))
                    (ectx-emit ctx (funcall emit-alu bpf-op work-reg lhs-reg)))
-                 (let ((scratch (if (and lhs-phys (= lhs-phys whistler/bpf:+bpf-reg-2+))
-                                    whistler/bpf:+bpf-reg-3+
-                                    whistler/bpf:+bpf-reg-2+)))
+                 (let ((scratch whistler/bpf:+bpf-reg-0+))
                    (ectx-emit ctx (whistler/bpf:emit-mov64-reg scratch work-reg))
                    (let ((lhs-reg (vreg-to-physical ctx (first args) work-reg)))
                      (unless (= lhs-reg work-reg)
                        (ectx-emit ctx (whistler/bpf:emit-mov64-reg work-reg lhs-reg))))
                    (ectx-emit ctx (funcall emit-alu bpf-op work-reg scratch)))))))
         ;; Immediate or non-integer rhs
-        (let ((lhs-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+))
+        (let ((lhs-reg (vreg-to-physical ctx (first args) work-reg))
               (imm (imm-arg-value rhs)))
           (unless (= lhs-reg work-reg)
             (ectx-emit ctx (whistler/bpf:emit-mov64-reg work-reg lhs-reg)))
           (if (and imm (typep imm '(signed-byte 32)))
               (ectx-emit ctx (funcall emit-alu-i bpf-op work-reg imm))
               ;; Must be a vreg in a non-standard form
-              (let ((rhs-reg (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-2+)))
+              (let ((rhs-reg (vreg-to-physical ctx rhs whistler/bpf:+bpf-reg-0+)))
                 (ectx-emit ctx (funcall emit-alu bpf-op work-reg rhs-reg))))))
     ;; Store result if on stack
     (when (eq (car dst-loc) :stack)
@@ -753,23 +758,34 @@
          (bpf-jmp (ir-cmp-to-bpf-jmp cmp-op))
          (lhs (second args))
          (rhs (third args))
-         (dst-loc (allocate-vreg ctx dst))
-         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-1+)))
-    (multiple-value-bind (lhs-reg rhs-reg imm)
-        (materialize-compare-operands ctx lhs rhs :avoid-reg dst-reg)
-      ;; Set result = 1
-      (ectx-emit ctx (whistler/bpf:emit-mov64-imm dst-reg 1))
-      ;; Compare
-      (if (and imm (typep imm '(signed-byte 32)))
-          (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 1))
-          (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 1)))
-      ;; Set result = 0 (fallthrough)
-      (ectx-emit ctx (whistler/bpf:emit-mov64-imm dst-reg 0)))
-    ;; Store if needed
-    (when (eq (car dst-loc) :stack)
-      (ectx-emit ctx (whistler/bpf:emit-stx-mem
-                       whistler/bpf:+bpf-dw+
-                       whistler/bpf:+bpf-reg-10+ dst-reg (cadr dst-loc))))))
+         (dst-loc (allocate-vreg ctx dst)))
+    (if (eq (car dst-loc) :reg)
+        (let ((dst-reg (cadr dst-loc)))
+          (multiple-value-bind (lhs-reg rhs-reg imm)
+              (materialize-compare-operands ctx lhs rhs :avoid-reg dst-reg)
+            ;; Set result = 1
+            (ectx-emit ctx (whistler/bpf:emit-mov64-imm dst-reg 1))
+            ;; Compare
+            (if (and imm (typep imm '(signed-byte 32)))
+                (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 1))
+                (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 1)))
+            ;; Set result = 0 (fallthrough)
+            (ectx-emit ctx (whistler/bpf:emit-mov64-imm dst-reg 0))))
+        ;; Spilled dst: the operands may occupy both scratch registers
+        ;; (R0/R5), so branch first — once the compare has consumed them,
+        ;; R0 is free to materialize the result.
+        (let ((tmp whistler/bpf:+bpf-reg-0+))
+          (multiple-value-bind (lhs-reg rhs-reg imm)
+              (materialize-compare-operands ctx lhs rhs)
+            (if (and imm (typep imm '(signed-byte 32)))
+                (ectx-emit ctx (whistler/bpf:emit-jmp-imm bpf-jmp lhs-reg imm 2))
+                (ectx-emit ctx (whistler/bpf:emit-jmp-reg bpf-jmp lhs-reg rhs-reg 2)))
+            (ectx-emit ctx (whistler/bpf:emit-mov64-imm tmp 0))
+            (ectx-emit ctx (whistler/bpf:emit-jmp-a 1))
+            (ectx-emit ctx (whistler/bpf:emit-mov64-imm tmp 1))
+            (ectx-emit ctx (whistler/bpf:emit-stx-mem
+                            whistler/bpf:+bpf-dw+
+                            whistler/bpf:+bpf-reg-10+ tmp (cadr dst-loc))))))))
 
 ;;; ========== Load/Store emission ==========
 
@@ -781,7 +797,7 @@
          (type-kw (type-arg-name (third args)))
          (bpf-size (ir-type-to-bpf-size type-kw))
          (dst-loc (allocate-vreg ctx dst))
-         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-1+))
+         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-0+))
          (core-info (core-arg-info args))
          load-insn)
     (if struct-base
@@ -790,8 +806,9 @@
                        whistler/bpf:+bpf-reg-10+ (+ struct-base off))))
           (setf load-insn (first insns))
           (ectx-emit ctx insns))
-        ;; Normal pointer-based load
-        (let ((ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-1+)))
+        ;; Normal pointer-based load — R0 scratch is safe even when the
+        ;; spilled dst also lands in R0 (ldx allows dst == src).
+        (let ((ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-0+)))
           (let ((insns (whistler/bpf:emit-ldx-mem bpf-size dst-reg ptr-reg off)))
             (setf load-insn (first insns))
             (ectx-emit ctx insns))))
@@ -810,13 +827,13 @@
   ;; that hasn't been initialized.
   (let* ((ctx-early (ctx-loads-early-p (emit-ctx-ir-prog ctx)))
          (ctx-reg (if ctx-early
-                      (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+)
+                      (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-0+)
                       whistler/bpf:+bpf-reg-6+))
          (off (imm-arg-value (second args)))
          (type-kw (type-arg-name (third args)))
          (bpf-size (ir-type-to-bpf-size type-kw))
          (dst-loc (allocate-vreg ctx dst))
-         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-1+))
+         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-0+))
          (core-info (core-arg-info args)))
     (let ((insns (whistler/bpf:emit-ldx-mem bpf-size dst-reg ctx-reg off)))
       (when core-info
@@ -833,7 +850,7 @@
    Records CO-RE relocations when (:core ...) metadata is present."
   (let* ((ctx-early (ctx-loads-early-p (emit-ctx-ir-prog ctx)))
          (ctx-reg (if ctx-early
-                      (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+)
+                      (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-0+)
                       whistler/bpf:+bpf-reg-6+))
          (off (imm-arg-value (second args)))
          (val-arg (third args))
@@ -845,7 +862,9 @@
          (core-info (core-arg-info args)))
     (let ((insns (if val-imm
                      (whistler/bpf:emit-st-mem bpf-size ctx-reg off val-imm)
-                     (let ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-2+)))
+                     ;; R0 scratch: the ctx pointer never reloads through
+                     ;; R0 (early ctx is pre-assigned R1, otherwise R6).
+                     (let ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-0+)))
                        (whistler/bpf:emit-stx-mem bpf-size ctx-reg val-reg off)))))
       (when core-info
         (push (list (first insns) (first core-info) (second core-info))
@@ -875,13 +894,13 @@
          (ectx-emit ctx insns)))
       ;; Immediate value + normal pointer → st-mem through pointer reg
       (val-imm
-       (let ((ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-1+)))
+       (let ((ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-0+)))
          (let ((insns (whistler/bpf:emit-st-mem bpf-size ptr-reg off val-imm)))
            (setf store-insn (first insns))
            (ectx-emit ctx insns))))
       ;; Vreg value + struct base → stx-mem to R10-relative
       (struct-base
-       (let ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-2+)))
+       (let ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-0+)))
          (let ((insns (whistler/bpf:emit-stx-mem bpf-size
                         whistler/bpf:+bpf-reg-10+ val-reg (+ struct-base off))))
            (setf store-insn (first insns))
@@ -894,8 +913,10 @@
        ;; R1/R2 clobbered a live loop counter and loop-carried pointer
        ;; across the back-edge (issue #41). Reload the value first so a
        ;; spilled value cannot land on top of a just-reloaded pointer.
-       (let* ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-2+))
-              (ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-1+)))
+       ;; Scratch: R0 for the value, R5 for the pointer (R5 is reserved
+       ;; from allocation whenever anything spills).
+       (let* ((val-reg (vreg-to-physical ctx val-arg whistler/bpf:+bpf-reg-0+))
+              (ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-5+)))
          (let ((insns (whistler/bpf:emit-stx-mem bpf-size ptr-reg val-reg off)))
            (setf store-insn (first insns))
            (ectx-emit ctx insns)))))
@@ -909,14 +930,14 @@
          (struct-base (and (integerp ptr-vreg)
                            (gethash ptr-vreg (emit-ctx-struct-offsets ctx))))
          (off (imm-arg-value (second args)))
-         (val-reg (vreg-to-physical ctx (third args) whistler/bpf:+bpf-reg-2+))
+         (val-reg (vreg-to-physical ctx (third args) whistler/bpf:+bpf-reg-0+))
          (type-kw (if (fourth args) (type-arg-name (fourth args)) 'u64))
          (bpf-size (ir-type-to-bpf-size type-kw)))
     (if struct-base
         (ectx-emit ctx (whistler/bpf:emit-stx-atomic
                          bpf-size whistler/bpf:+bpf-reg-10+
                          val-reg (+ struct-base off) whistler/bpf:+bpf-add+))
-        (let ((ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-1+)))
+        (let ((ptr-reg (vreg-to-physical ctx ptr-vreg whistler/bpf:+bpf-reg-5+)))
           (ectx-emit ctx (whistler/bpf:emit-stx-atomic
                            bpf-size ptr-reg
                            val-reg off whistler/bpf:+bpf-add+))))))
@@ -1018,7 +1039,7 @@
               (ectx-emit ctx (whistler/bpf:emit-st-mem
                               bpf-size
                               whistler/bpf:+bpf-reg-10+ offset const-val))
-              (let ((src-reg (vreg-to-physical ctx key-arg whistler/bpf:+bpf-reg-3+)))
+              (let ((src-reg (vreg-to-physical ctx key-arg whistler/bpf:+bpf-reg-0+)))
                 (ectx-emit ctx (whistler/bpf:emit-stx-mem
                                 bpf-size
                                 whistler/bpf:+bpf-reg-10+ src-reg offset))))
@@ -1504,16 +1525,15 @@
 ;;; ========== Log2 emission ==========
 
 (defun emit-log2-insn (ctx dst args)
-  (let* ((val-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+))
+  (let* ((val-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-0+))
          (dst-loc (allocate-vreg ctx dst))
-         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-2+))
+         ;; Spilled dst computes in R5 (reserved when anything spills).
+         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-5+))
          ;; work-reg holds the value being shifted during binary search.
          ;; It MUST differ from dst-reg to avoid clobbering on init.
-         (work-reg (cond
-                     ((/= val-reg dst-reg) val-reg)
-                     ;; val-reg == dst-reg: pick a scratch register
-                     ((/= dst-reg whistler/bpf:+bpf-reg-1+) whistler/bpf:+bpf-reg-1+)
-                     (t whistler/bpf:+bpf-reg-2+))))
+         ;; val-reg == dst-reg implies both are allocated registers, so
+         ;; R0 is free as the work scratch.
+         (work-reg (if (/= val-reg dst-reg) val-reg whistler/bpf:+bpf-reg-0+)))
     ;; Copy val to work register if needed
     (unless (= val-reg work-reg)
       (ectx-emit ctx (whistler/bpf:emit-mov64-reg work-reg val-reg)))
@@ -1536,10 +1556,10 @@
 ;;; ========== Cast emission ==========
 
 (defun emit-cast-insn (ctx dst args)
-  (let* ((src-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+))
+  (let* ((src-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-0+))
          (type-kw (type-arg-name (second args)))
          (dst-loc (allocate-vreg ctx dst))
-         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-1+)))
+         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-0+)))
     (unless (= src-reg dst-reg)
       (ectx-emit ctx (whistler/bpf:emit-mov64-reg dst-reg src-reg)))
     (let ((name (string-upcase (string type-kw))))
@@ -1559,9 +1579,9 @@
 ;;; ========== Byte swap emission ==========
 
 (defun emit-bswap-insn (ctx op dst args)
-  (let* ((src-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-1+))
+  (let* ((src-reg (vreg-to-physical ctx (first args) whistler/bpf:+bpf-reg-0+))
          (dst-loc (allocate-vreg ctx dst))
-         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-1+)))
+         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-0+)))
     (unless (= src-reg dst-reg)
       (ectx-emit ctx (whistler/bpf:emit-mov64-reg dst-reg src-reg)))
     (ecase op

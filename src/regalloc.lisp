@@ -293,12 +293,35 @@
     max-refs))
 
 (defun linear-scan-alloc (prog &key ctx-early reserve-callee-count auto-reserve-helper-setup)
+  "Allocate physical registers for all vregs in PROG. Two-pass: if the
+   first pass spills anything, rerun with R5 removed from the caller pool
+   so the emitter has a guaranteed second scratch register (R0 is the
+   first) for spill reloads at non-call instructions. Without this, a
+   spill reload into a fixed scratch register can silently clobber a live
+   caller-saved vreg — a wrong-value miscompile the verifier can't see.
+   Returns (values result stack-offset); see linear-scan-alloc-pass."
+  (multiple-value-bind (result stack-offset)
+      (linear-scan-alloc-pass prog :ctx-early ctx-early
+                                   :reserve-callee-count reserve-callee-count
+                                   :auto-reserve-helper-setup auto-reserve-helper-setup)
+    (if (loop for loc being the hash-values of result
+              thereis (eq (car loc) :stack))
+        (linear-scan-alloc-pass prog :ctx-early ctx-early
+                                     :reserve-callee-count reserve-callee-count
+                                     :auto-reserve-helper-setup auto-reserve-helper-setup
+                                     :reserve-scratch t)
+        (values result stack-offset))))
+
+(defun linear-scan-alloc-pass (prog &key ctx-early reserve-callee-count
+                                         auto-reserve-helper-setup reserve-scratch)
   "Allocate physical registers for all vregs in PROG.
    CTX-EARLY means ctx-loads happen before any calls, so R1 can be used
    directly and R6 is free for general allocation.
    RESERVE-CALLEE-COUNT hard-reserves that many callee-saved registers for
    helper setup/caching. When NIL, AUTO-RESERVE-HELPER-SETUP controls the
    existing heuristic that may preserve one call-safe register opportunistically.
+   RESERVE-SCRATCH removes R5 from the caller pool so the emitter can use
+   it as a spill-reload scratch register.
    Returns a hash table: vreg → (:reg N) or (:stack OFF)."
   (let* ((intervals (compute-liveness prog))
          (ctx-vreg (find-ctx-vreg prog))
@@ -311,9 +334,11 @@
                               (max 0 (- (length all-callee) reserved-callee-count))))
          ;; R0 is reserved for return values — never allocate it.
          ;; When ctx-early, R1 holds the live ctx pointer — exclude it too.
-         (caller-free (if (and ctx-vreg ctx-used ctx-early)
-                          '(2 3 4 5)
-                          '(1 2 3 4 5)))
+         ;; When reserve-scratch, R5 is the emitter's second spill scratch.
+         (caller-free (let ((pool (if (and ctx-vreg ctx-used ctx-early)
+                                      '(2 3 4 5)
+                                      '(1 2 3 4 5))))
+                        (if reserve-scratch (remove 5 pool) pool)))
          ;; Reserve a callee-saved register for map-fd caching when
          ;; the savings outweigh the cost of spilling one recomputable value.
          ;; Cost of spill: ~2 insns (recompute at each use, typically 1-2 uses).

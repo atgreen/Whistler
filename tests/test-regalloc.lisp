@@ -210,3 +210,70 @@
                        :maps maps))))
     ;; Should compile without issues
     (is (> n 5) "getmap without helper call should compile")))
+
+;;; ========== Spill-reload scratch regression (whistler-snx) ==========
+;;;
+;;; Spill reloads must never clobber a live caller-saved vreg. The old
+;;; emitter reloaded spilled operands into fixed R1/R2/R3 scratch at
+;;; non-call instructions; with six values live across helper calls one
+;;; spills, and its reload silently corrupted whichever vreg regalloc had
+;;; placed in the scratch register — a wrong-value miscompile the
+;;; verifier accepts. Now R0 (never allocated) is the first scratch and
+;;; R5 (reserved from the caller pool whenever anything spills) the
+;;; second. This test *executes* the emitted scalar code in a mini
+;;; interpreter, so any scratch clobber shows up as a wrong sum no
+;;; matter which registers the emitter picks.
+
+(defun interpret-scalar-bpf (bytes call-results)
+  "Interpret the scalar subset of BPF (mov/add reg+imm, dw ldx/stx via
+   R10, helper calls, exit). CALL-RESULTS supplies successive R0 values
+   for call instructions. Returns R0 at exit. Errors on any opcode
+   outside the subset so the test fails loudly if codegen changes shape."
+  (let ((regs (make-array 11 :initial-element 0))
+        (stack (make-hash-table))
+        (n (/ (length bytes) 8))
+        (results call-results))
+    (setf (aref regs 10) 0)
+    (loop with pc = 0
+          while (< pc n)
+          do (let ((op (nth-insn-opcode bytes pc))
+                   (dst (logand (nth-insn-regs bytes pc) #x0f))
+                   (src (ash (nth-insn-regs bytes pc) -4))
+                   (off (nth-insn-off bytes pc))
+                   (imm (nth-insn-imm bytes pc)))
+               (case op
+                 (#xbf (setf (aref regs dst) (aref regs src)))         ; mov64 reg
+                 (#xb7 (setf (aref regs dst) imm))                     ; mov64 imm
+                 (#x0f (setf (aref regs dst)                           ; add64 reg
+                             (ldb (byte 64 0) (+ (aref regs dst) (aref regs src)))))
+                 (#x07 (setf (aref regs dst)                           ; add64 imm
+                             (ldb (byte 64 0) (+ (aref regs dst) imm))))
+                 (#x79 (setf (aref regs dst)                           ; ldx dw
+                             (or (gethash (+ (aref regs src) off) stack) 0)))
+                 (#x7b (setf (gethash (+ (aref regs dst) off) stack)   ; stx dw
+                             (aref regs src)))
+                 (#x85 (setf (aref regs 0) (pop results)               ; call
+                             (aref regs 1) :clobbered (aref regs 2) :clobbered
+                             (aref regs 3) :clobbered (aref regs 4) :clobbered
+                             (aref regs 5) :clobbered))
+                 (#x95 (return-from interpret-scalar-bpf (aref regs 0))) ; exit
+                 (t (error "interpret-scalar-bpf: unhandled opcode ~2,'0X at insn ~D"
+                           op pc)))
+               (incf pc)))
+    (error "interpret-scalar-bpf: fell off the end without exit")))
+
+(test spill-reload-scratch-preserves-live-values
+  "A spilled operand's reload must not corrupt live registers (whistler-snx).
+   Six helper-call results overflow the callee-saved pool, spilling one;
+   summing them exercises spill reloads at ALU instructions while the
+   partial sums are live in caller-saved registers."
+  (let ((bytes (w-body "(let ((a (get-prandom-u32))
+                              (b (get-prandom-u32))
+                              (c (get-prandom-u32))
+                              (d (get-prandom-u32))
+                              (e (get-prandom-u32))
+                              (f (get-prandom-u32)))
+                          (return (+ (+ (+ a b) (+ c d)) (+ e f))))")))
+    (is (= 63 (interpret-scalar-bpf bytes '(1 2 4 8 16 32)))
+        "sum of six call results must be 63 — a wrong value means a spill
+         reload clobbered a live register")))
