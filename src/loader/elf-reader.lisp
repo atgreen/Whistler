@@ -8,6 +8,9 @@
 
 ;;; ELF constants and byte readers come from whistler/binary.
 
+(defconstant +elf64-ehdr-size+ 64
+  "Size of an ELF64 file header, and so the smallest file that can carry one.")
+
 ;;; ========== Data structures ==========
 
 (defstruct elf-section
@@ -66,17 +69,19 @@
 
 (defun read-bpf-elf (pathname)
   "Parse a BPF ELF object file. Returns a bpf-elf structure."
-  (let* ((bytes (read-elf-bytes pathname))
-         ;; Validate ELF header
-         (magic (u32 bytes 0))
-         (class (aref bytes 4))
-         (data (aref bytes 5))
-         (machine (u16 bytes 18)))
-    (unless (= magic +elf-magic+)
+  (let ((bytes (read-elf-bytes pathname)))
+    ;; Validate ELF header. A field only means anything once the file has been
+    ;; shown to be long enough to hold it, so measure before reading.
+    (unless (and (>= (length bytes) 4) (= (u32 bytes 0) +elf-magic+))
       (error "Not an ELF file: ~a" pathname))
-    (unless (and (= class 2) (= data 1) (= machine +em-bpf+))
-      (error "Not a 64-bit LE BPF ELF: class=~d data=~d machine=~d"
-             class data machine))
+    (unless (>= (length bytes) +elf64-ehdr-size+)
+      (error "Truncated ELF header: ~a is ~d bytes" pathname (length bytes)))
+    (let ((class (aref bytes 4))
+          (data (aref bytes 5))
+          (machine (u16 bytes 18)))
+      (unless (and (= class 2) (= data 1) (= machine +em-bpf+))
+        (error "Not a 64-bit LE BPF ELF: class=~d data=~d machine=~d"
+               class data machine)))
 
     (multiple-value-bind (e-shoff e-shentsize e-shnum e-shstrndx)
         (elf64-shdr-table bytes)
