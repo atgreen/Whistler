@@ -118,4 +118,5 @@
                (:file "test-differential")
                (:file "test-torture")
                (:file "test-bpftrace")
-               (:file "test-symbolize")))
+               (:file "test-symbolize")
+               (:file "test-loader")))
