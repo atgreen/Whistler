@@ -13,7 +13,11 @@
 ;;; unmaps memory this process really owns and closes an fd it really holds,
 ;;; so nothing here can fault the image.
 
-(defconstant +ring-test-page-size+ 4096)
+;; Take the page size from the loader rather than repeating a literal:
+;; close-ring-consumer unmaps using its notion of a page, so a test that
+;; mapped a different size would unmap the wrong span on a 16K or 64K
+;; page kernel.
+(defun ring-test-page-size () (whistler/loader::page-size))
 (defconstant +ring-test-ring-size+ 4096)
 
 ;;; MAP_FIXED_NOREPLACE — take an address back only if it is still free,
@@ -21,7 +25,7 @@
 (defconstant +map-fixed-noreplace+ #x100000)
 
 (defun ring-test-ro-size ()
-  (+ +ring-test-page-size+ (* 2 +ring-test-ring-size+)))
+  (+ (ring-test-page-size) (* 2 +ring-test-ring-size+)))
 
 (defun map-anon-pages (size &optional addr)
   "Map SIZE bytes of private anonymous memory. With ADDR, map at that exact
@@ -34,7 +38,7 @@
 
 (defun make-test-ring-consumer ()
   "Build a ring-consumer over anonymous pages and a real epoll fd."
-  (let* ((rw (map-anon-pages +ring-test-page-size+))
+  (let* ((rw (map-anon-pages (ring-test-page-size)))
          (ro (map-anon-pages (ring-test-ro-size)))
          (epoll-fd (whistler/loader::syscall
                     whistler/loader::+sys-epoll-create1+
@@ -45,7 +49,7 @@
      :mmap-ptr rw
      :consumer-ptr rw
      :producer-ptr ro
-     :data-ptr (sb-sys:sap+ ro +ring-test-page-size+)
+     :data-ptr (sb-sys:sap+ ro (ring-test-page-size))
      :epoll-fd epoll-fd
      :callback (lambda (sap len) (declare (ignore sap len))))))
 
@@ -74,7 +78,7 @@
          (epoll-fd (whistler/loader::ring-consumer-epoll-fd consumer)))
     (whistler/loader:close-ring-consumer consumer)
     ;; Take the addresses back so a second close unmaps memory we own.
-    (map-anon-pages +ring-test-page-size+ rw)
+    (map-anon-pages (ring-test-page-size) rw)
     (map-anon-pages (ring-test-ro-size) ro)
     ;; The kernel hands out the lowest free descriptor, so this lands on the
     ;; number the consumer just gave up.
@@ -92,7 +96,7 @@
                  reused-fd))
         (when (fd-open-p reused-fd)
           (sb-posix:close reused-fd))
-        (sb-posix:munmap rw +ring-test-page-size+)
+        (sb-posix:munmap rw (ring-test-page-size))
         (sb-posix:munmap ro (ring-test-ro-size))))))
 
 ;;; ========== Reading after close ==========
@@ -106,14 +110,14 @@
     ;; Make the surrendered addresses valid and event-shaped again. This is
     ;; what an unlucky reallocation looks like from the outside, and it is
     ;; what the consumer's stale pointers would read.
-    (map-anon-pages +ring-test-page-size+ rw)
+    (map-anon-pages (ring-test-page-size) rw)
     (map-anon-pages (ring-test-ro-size) ro)
     (stage-one-event rw ro data)
     (unwind-protect
          (is (signals-bpf-error-p
               (lambda () (whistler/loader:ring-consume consumer)))
              "ring-consume read the recycled pages instead of signalling")
-      (sb-posix:munmap rw +ring-test-page-size+)
+      (sb-posix:munmap rw (ring-test-page-size))
       (sb-posix:munmap ro (ring-test-ro-size)))))
 
 (test ring-poll-refuses-a-closed-consumer
@@ -122,14 +126,14 @@
          (ro (whistler/loader::ring-consumer-producer-ptr consumer))
          (data (whistler/loader::ring-consumer-data-ptr consumer)))
     (whistler/loader:close-ring-consumer consumer)
-    (map-anon-pages +ring-test-page-size+ rw)
+    (map-anon-pages (ring-test-page-size) rw)
     (map-anon-pages (ring-test-ro-size) ro)
     (stage-one-event rw ro data)
     (unwind-protect
          (is (signals-bpf-error-p
               (lambda () (whistler/loader:ring-poll consumer :timeout-ms 0)))
              "ring-poll waited on a descriptor the consumer no longer owns")
-      (sb-posix:munmap rw +ring-test-page-size+)
+      (sb-posix:munmap rw (ring-test-page-size))
       (sb-posix:munmap ro (ring-test-ro-size)))))
 
 ;;; ========== ELF header validation ==========
@@ -408,3 +412,18 @@
                (unless (typep attachment 'error)
                  (whistler/loader:detach attachment)))
           (sb-posix:close fd)))))
+
+;;; ========== Page size ==========
+
+(test page-size-is-the-hosts-own
+  ;; whistler-8hp: this returned a hard-coded 4096, which puts every
+  ;; ringbuf mmap offset in the wrong place on the 16K and 64K page
+  ;; kernels aarch64 ships. The kernel counts those offsets in real
+  ;; pages, so the loader has to agree with the machine.
+  (let ((reported (whistler/loader::page-size))
+        (actual (sb-posix:getpagesize)))
+    (is (= actual reported)
+        "the loader thinks a page is ~D bytes; this host uses ~D"
+        reported actual)
+    (is (and (plusp reported) (zerop (logand reported (1- reported))))
+        "a page size must be a power of two, got ~D" reported)))

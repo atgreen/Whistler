@@ -21,8 +21,20 @@
   map-fd ring-size mmap-ptr consumer-ptr producer-ptr data-ptr
   epoll-fd callback closed)
 
+(defvar *page-size* nil
+  "Cached host page size; see PAGE-SIZE.")
+
 (defun page-size ()
-  4096)
+  "The host's page size.
+
+   The kernel lays a ringbuf out in whole pages -- the consumer page
+   first, then the producer page and the data -- and mmap offsets are
+   counted in real pages, so this has to be the machine's own value.
+   Hard-coding 4096 puts every offset in the wrong place on the 16K and
+   64K page kernels that aarch64 ships."
+  (or *page-size*
+      (setf *page-size*
+            (or (ignore-errors (sb-posix:getpagesize)) 4096))))
 
 (defun open-ring-consumer (map-info callback)
   "Create a ring buffer consumer for a ringbuf map.
