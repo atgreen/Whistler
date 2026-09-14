@@ -675,12 +675,62 @@
       ((bpf-exit-p insn) (zerop reg))
       (t nil))))
 
+(defun stack-addr-fold-uses (vec len targets i ra)
+  "Indices of the memory-base uses of RA a fold at I could rewrite, or
+   NIL when the fold is unsafe.
+
+   Deleting `mov rA, r10; add rA, K' is only sound if every read of RA
+   before it dies is one of the returned uses, since those are the only
+   ones that get rewritten to address r10 directly. So the scan has to
+   reach the point RA dies. It used to stop after eight instructions, or
+   at the first branch, and call the fold safe either way — leaving a
+   use beyond that horizon naming a register whose definition had just
+   been deleted (whistler-5b4)."
+  (let ((uses '()))
+    (loop for j from (+ i 2) below len
+          for insn = (aref vec j)
+          do (cond
+               ;; Another path lands here, and it may arrive with RA live.
+               ((gethash j targets) (return-from stack-addr-fold-uses nil))
+               ;; A use this fold can rewrite.
+               ((eql ra (bpf-mem-base-reg insn))
+                ;; `stx [rA+off], rA' still wants RA as the value once the
+                ;; base becomes r10, and nothing rewrites that.
+                (when (and (bpf-stx-p insn)
+                           (= (whistler/bpf:bpf-insn-src insn) ra))
+                  (return-from stack-addr-fold-uses nil))
+                (push j uses)
+                ;; `ldx rA, [rA+off]' ends RA's life in the same breath.
+                (when (bpf-reg-written-p insn ra)
+                  (return-from stack-addr-fold-uses uses)))
+               ;; Read some other way — the fold cannot rewrite it.
+               ((bpf-reg-read-p insn ra) (return-from stack-addr-fold-uses nil))
+               ;; A branch hides the rest of RA's life.
+               ((or (bpf-unconditional-jmp-p insn)
+                    (bpf-conditional-jmp-p insn))
+                (return-from stack-addr-fold-uses nil))
+               ;; A call reads R1-R5 as arguments and clobbers R0-R5.
+               ;; R6-R9 survive it untouched, so the scan may go on.
+               ((= (whistler/bpf:bpf-insn-code insn) #x85)
+                (when (<= ra 5) (return-from stack-addr-fold-uses nil)))
+               ;; Exit ends every path: RA is dead unless it is the
+               ;; register the program returns in.
+               ((bpf-exit-p insn)
+                (return-from stack-addr-fold-uses (and (/= ra 0) uses)))
+               ;; RA redefined — everything that could read the old value
+               ;; has already gone past.
+               ((bpf-reg-written-p insn ra)
+                (return-from stack-addr-fold-uses uses))))
+    ;; Ran off the end without an exit: malformed, so refuse.
+    nil))
+
 (defun peephole-fold-stack-addr (insns)
   "Fold mov rA, r10; add rA, K; mem [rA+off] into mem [r10+(K+off)]."
-  (let ((vec (coerce insns 'vector))
-        (len (length insns))
-        (to-delete (make-hash-table))
-        (changed nil))
+  (let* ((vec (coerce insns 'vector))
+         (len (length insns))
+         (targets (collect-jump-targets vec))
+         (to-delete (make-hash-table))
+         (changed nil))
     (loop for i from 0 below (- len 2)
           for mov-insn = (aref vec i)
           for add-insn = (aref vec (1+ i))
@@ -689,54 +739,21 @@
                     (= (whistler/bpf:bpf-insn-src mov-insn) whistler/bpf:+bpf-reg-10+)
                     (bpf-add64-imm-p add-insn)
                     (= (whistler/bpf:bpf-insn-dst add-insn)
-                       (whistler/bpf:bpf-insn-dst mov-insn)))
-          do (let ((ra (whistler/bpf:bpf-insn-dst mov-insn))
-                   (k (whistler/bpf:bpf-insn-imm add-insn))
-                   (all-mem t)
-                   (any-use nil))
-               ;; Scan forward: check if all uses of rA are as memory base regs
-               (loop for j from (+ i 2) below (min (+ i 10) len)
-                     for insn = (aref vec j)
-                     do (let ((base (bpf-mem-base-reg insn)))
-                          (cond
-                            ;; rA used as memory base — candidate for folding
-                            ((and base (= base ra))
-                             (setf any-use t))
-                            ;; rA is read in a non-memory context → can't delete mov+add
-                            ((bpf-reg-read-p insn ra)
-                             (setf all-mem nil)
-                             (return))
-                            ;; rA is redefined → stop scanning
-                            ((bpf-reg-written-p insn ra)
-                             (return))
-                            ;; Control flow → stop
-                            ((or (bpf-unconditional-jmp-p insn)
-                                 (bpf-conditional-jmp-p insn)
-                                 (bpf-exit-p insn)
-                                 (= (whistler/bpf:bpf-insn-code insn) #x85))
-                             ;; A call reads rA if it's r1-r5
-                             (when (and (= (whistler/bpf:bpf-insn-code insn) #x85)
-                                        (<= ra 5))
-                               (setf all-mem nil))
-                             (return)))))
-               ;; If all uses of rA are as memory bases, fold them and delete mov+add
-               (when (and all-mem any-use)
-                 (loop for j from (+ i 2) below (min (+ i 10) len)
-                       for insn = (aref vec j)
-                       do (let ((base (bpf-mem-base-reg insn)))
-                            (cond
-                              ((and base (= base ra))
-                               ;; Fold: change base to r10, adjust offset
-                               (if (bpf-stx-p insn)
-                                   (setf (whistler/bpf:bpf-insn-dst insn) whistler/bpf:+bpf-reg-10+)
-                                   (setf (whistler/bpf:bpf-insn-src insn) whistler/bpf:+bpf-reg-10+))
-                               (incf (whistler/bpf:bpf-insn-off insn) k))
-                              ((bpf-reg-written-p insn ra) (return))
-                              ((or (bpf-unconditional-jmp-p insn)
-                                   (bpf-conditional-jmp-p insn)
-                                   (bpf-exit-p insn)
-                                   (= (whistler/bpf:bpf-insn-code insn) #x85))
-                               (return)))))
+                       (whistler/bpf:bpf-insn-dst mov-insn))
+                    ;; A jump landing on the add would skip the mov that
+                    ;; set up its operand, and both are about to go.
+                    (not (gethash (1+ i) targets)))
+          do (let* ((ra (whistler/bpf:bpf-insn-dst mov-insn))
+                    (k (whistler/bpf:bpf-insn-imm add-insn))
+                    (uses (stack-addr-fold-uses vec len targets i ra)))
+               (when uses
+                 (dolist (j uses)
+                   (let ((insn (aref vec j)))
+                     ;; Address r10 directly, carrying K into the offset.
+                     (if (bpf-stx-p insn)
+                         (setf (whistler/bpf:bpf-insn-dst insn) whistler/bpf:+bpf-reg-10+)
+                         (setf (whistler/bpf:bpf-insn-src insn) whistler/bpf:+bpf-reg-10+))
+                     (incf (whistler/bpf:bpf-insn-off insn) k)))
                  (setf (gethash i to-delete) t)
                  (setf (gethash (1+ i) to-delete) t)
                  (setf changed t))))

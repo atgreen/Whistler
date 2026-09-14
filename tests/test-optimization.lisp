@@ -414,3 +414,60 @@
                           (peephole-insn #xbf 4 3)   ; reads rC
                           (peephole-insn #x95 0 0))))
       "rC is read afterwards, and the fold clobbers it"))
+
+;;; ========== fold-stack-addr must see every use (whistler-5b4) ==========
+;;;
+;;; The fold deletes `mov rA, r10; add rA, K' and rewrites the memory
+;;; instructions that used rA as a base to address r10 directly. That is
+;;; sound only if it finds *every* read of rA before the register dies,
+;;; since the ones it does not find keep naming a register whose
+;;; definition just went away. The scan used to stop after eight
+;;; instructions, or at the first branch, and call the fold safe either
+;;; way.
+
+(defun stack-addr-head ()
+  "mov64 r1, r10 ; add64 r1, -8 — a stack address in r1."
+  (list (peephole-insn #xbf 1 10)
+        (whistler/bpf::insn #x07 1 0 0 -8)))
+
+(defun stack-addr-fold (tail)
+  "Run fold-stack-addr over the pattern plus TAIL. Returns (values
+   folded-p leftover-use-p)."
+  (let* ((insns (append (stack-addr-head) tail))
+         (out (whistler/ir::peephole-fold-stack-addr insns)))
+    (values (< (length out) (length insns))
+            (and (some (lambda (i) (eql 1 (whistler/ir::bpf-mem-base-reg i))) out)
+                 t))))
+
+(test fold-stack-addr-still-folds-a-plain-use
+  (multiple-value-bind (folded leftover)
+      (stack-addr-fold (list (peephole-insn #x7b 1 2)   ; stx [r1+0], r2
+                             (peephole-insn #x95 0 0)))
+    (is-true folded "a single memory-base use should still fold")
+    (is-false leftover "no use of r1 should survive the fold")))
+
+;;; The invariant below is the one that matters, and it holds whichever
+;;; way the pass decides: refusing leaves the uses alone *and* their
+;;; definition, which is fine. What must never happen is deleting the
+;;; definition while a use of it survives.
+
+(test fold-stack-addr-never-deletes-a-def-a-use-still-needs
+  ;; Eight filler instructions push the second use beyond the horizon the
+  ;; scan used to stop at.
+  (multiple-value-bind (folded leftover)
+      (stack-addr-fold (append (list (peephole-insn #x7b 1 2))
+                               (loop repeat 7
+                                     collect (whistler/bpf::insn #x07 5 0 0 1))
+                               (list (peephole-insn #x79 3 1)  ; ldx r3, [r1+0]
+                                     (peephole-insn #x95 0 0))))
+    (is-false (and folded leftover)
+              "a use past the old 8-instruction horizon was left reading a deleted r1"))
+  ;; And on the far side of a jump, which the scan used to treat as proof
+  ;; that nothing could still want the register.
+  (multiple-value-bind (folded leftover)
+      (stack-addr-fold (list (peephole-insn #x7b 1 2)
+                             (peephole-insn #x05 0 0)    ; ja
+                             (peephole-insn #x79 3 1)    ; ldx r3, [r1+0]
+                             (peephole-insn #x95 0 0)))
+    (is-false (and folded leftover)
+              "a use on the far side of a jump was left reading a deleted r1")))
