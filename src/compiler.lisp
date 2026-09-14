@@ -421,6 +421,16 @@
 ;;; defmacro in their source files, and the compiler expands them into
 ;;; primitive forms. Full Common Lisp is available at compile time.
 
+(defun u64-value (n)
+  "N as the unsigned 64-bit value the program will actually hold.
+
+   Folding may leave a negative intermediate — (- 0 3) is -3 — and the
+   arithmetic that agrees with u64 in two's complement (+, -, *, <<, and
+   the bitwise ops) can keep it. Operations whose meaning depends on the
+   sign cannot: the BPF shift is logical, its division is unsigned, and
+   its comparisons are unsigned, so they read the value through here."
+  (ldb (byte 64 0) n))
+
 (defun whistler-macroexpand (form)
   "Recursively expand macros in FORM. Does not descend into quoted data.
    Only expands macros that are NOT Whistler built-in forms."
@@ -555,13 +565,20 @@
                ((and (string= name "-") (>= (length args) 2))
                 (reduce #'- args))
                ((string= name "*") (reduce #'* args))
+               ;; BPF_DIV is unsigned; TRUNCATE on a negative operand is
+               ;; not the division the program will perform.
                ((and (string= name "/") (>= (length args) 2)
                      (every (lambda (x) (/= x 0)) (rest args)))
-                (reduce #'truncate args))
+                (reduce (lambda (a b) (truncate (u64-value a) (u64-value b)))
+                        args))
                ((and (string= name "<<") (= (length args) 2))
                 (ash (first args) (second args)))
+               ;; `>>' is BPF_RSH, a logical shift on a 64-bit unsigned
+               ;; value. CL's ASH with a negative count is arithmetic, so
+               ;; a folded-negative operand has to be read as the u64 it
+               ;; will actually be before shifting (whistler-tjl).
                ((and (string= name ">>") (= (length args) 2))
-                (ash (first args) (- (second args))))
+                (ash (u64-value (first args)) (- (second args))))
                ((and (string= name "&") (= (length args) 2))
                 (logand (first args) (second args)))
                ((and (string= name "|") (= (length args) 2))
@@ -570,17 +587,20 @@
                ;; from blowing up on dead-branch patterns like
                ;; `(when (= 0 0) …)' that bpftrace tools generate via
                ;; getopt() of a literal flag.
+               ;; These compile to the unsigned BPF comparisons, so fold
+               ;; them the same way: a negative intermediate stands for a
+               ;; very large u64, not a small signed one.
                ((and (string= name "=")  (= (length args) 2))
-                (if (= (first args) (second args)) 1 0))
+                (if (= (u64-value (first args)) (u64-value (second args))) 1 0))
                ((and (string= name "/=") (= (length args) 2))
-                (if (/= (first args) (second args)) 1 0))
+                (if (/= (u64-value (first args)) (u64-value (second args))) 1 0))
                ((and (string= name "<")  (= (length args) 2))
-                (if (< (first args) (second args)) 1 0))
+                (if (< (u64-value (first args)) (u64-value (second args))) 1 0))
                ((and (string= name "<=") (= (length args) 2))
-                (if (<= (first args) (second args)) 1 0))
+                (if (<= (u64-value (first args)) (u64-value (second args))) 1 0))
                ((and (string= name ">")  (= (length args) 2))
-                (if (> (first args) (second args)) 1 0))
+                (if (> (u64-value (first args)) (u64-value (second args))) 1 0))
                ((and (string= name ">=") (= (length args) 2))
-                (if (>= (first args) (second args)) 1 0))
+                (if (>= (u64-value (first args)) (u64-value (second args))) 1 0))
                (t folded)))
            folded)))))

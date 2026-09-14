@@ -912,6 +912,16 @@
          (bpf-size (ir-type-to-bpf-size type-kw))
          (core-info (core-arg-info args))
          store-insn)
+    ;; The BPF store-immediate form carries a 32-bit field that the CPU
+    ;; sign-extends to the access width. For b, h and w the extension is
+    ;; discarded past the bytes written, so any constant is fine; for dw
+    ;; it reaches the top four bytes and fills them with ones whenever
+    ;; bit 31 is set. Such a value has to go through a register instead
+    ;; (whistler-9qd).
+    (when (and val-imm
+               (= bpf-size whistler/bpf:+bpf-dw+)
+               (not (typep val-imm '(signed-byte 32))))
+      (setf val-imm nil))
     (cond
       ;; Immediate value + struct base → direct st-mem to R10-relative
       ((and struct-base val-imm)

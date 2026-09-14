@@ -582,3 +582,59 @@
                     (list (peephole-insn #xbf 4 1)
                           (peephole-insn #x95 0 0)))))
       "a read past the old 18-instruction horizon still counts"))
+
+;;; ========== Unsigned semantics for folded constants (whistler-tjl) ==========
+;;;
+;;; Folding may leave a negative intermediate — (- 0 3) is -3 — and the
+;;; arithmetic that agrees with u64 in two's complement can keep it. The
+;;; operations whose meaning depends on the sign cannot: BPF's shift is
+;;; logical, its division unsigned, its comparisons unsigned. Folding
+;;; those with CL semantics gave answers the running program disagrees
+;;; with. Only the constant path was ever wrong; through a register the
+;;; instructions were always right, which is what makes the two
+;;; comparable here.
+
+(defun const-result (form)
+  (interpret-scalar-bpf (compile-insn-bytes `((return ,form))) '()))
+
+(test a-folded-shift-is-logical-not-arithmetic
+  (is (= (ash (ldb (byte 64 0) -3) -18) (const-result '(>> (- 0 3) 18)))
+      "(>> (- 0 3) 18) shifts a 64-bit unsigned value")
+  (is (= (ash (ldb (byte 64 0) -1) -1) (const-result '(>> (- 0 1) 1)))
+      "the sign bit must not propagate")
+  (is (= 3 (const-result '(>> 12 2)))
+      "a positive constant still folds the obvious way"))
+
+(test folded-comparisons-are-unsigned
+  ;; (- 1 1524046274) is a very large u64, so 3 is not >= it.
+  (is (= 0 (const-result '(if (>= 3 (- 1 1524046274)) 1 0)))
+      "a negative intermediate compares as the large u64 it becomes")
+  (is (= 1 (const-result '(if (< 3 (- 1 1524046274)) 1 0)))
+      "and the other way round")
+  (is (= 1 (const-result '(if (> 5 3) 1 0)))
+      "ordinary positive comparisons are unchanged"))
+
+(test folded-division-is-unsigned
+  (is (= (truncate (ldb (byte 64 0) -4) 2) (const-result '(/ (- 0 4) 2)))
+      "(/ (- 0 4) 2) divides the unsigned value"))
+
+;;; ========== Storing a wide constant (whistler-9qd) ==========
+
+(test a-u64-constant-store-fills-the-whole-slot
+  ;; BPF's store-immediate carries 32 bits that the CPU sign-extends to
+  ;; the access width, so a dw store of a constant with bit 31 set used
+  ;; to leave ones in the top four bytes. A same-width load cannot see
+  ;; it — store-to-load forwarding answers that out of the register — so
+  ;; read the bytes individually.
+  (dolist (value '(3198590608 1198590608))
+    (dotimes (k 8)
+      (let ((actual (interpret-scalar-bpf
+                     (compile-insn-bytes
+                      `((let ((x1 (get-prandom-u32)))
+                          (declare (type u64 x1))
+                          (let ((buf (struct-alloc 32)))
+                            (store u64 buf 16 ,value)
+                            (return (load u8 buf ,(+ 16 k)))))))
+                     (list 1))))
+        (is (= (ldb (byte 8 (* 8 k)) value) actual)
+            "byte ~D of a u64 store of ~D" k value)))))
