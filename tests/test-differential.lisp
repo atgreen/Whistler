@@ -83,6 +83,9 @@
                  (ash (eval-scalar-expr (second expr) env) (third expr)))
                 ((string= (symbol-name op) ">>")
                  (ash (eval-scalar-expr (second expr) env) (- (third expr))))
+                ((string= (symbol-name op) "CAST")
+                 (ldb (byte (cast-type-bits (second expr)) 0)
+                      (eval-scalar-expr (third expr) env)))
                 ((eq op 'if)
                  (let* ((cmp (second expr))
                         (a (eval-scalar-expr (second cmp) env))
@@ -323,4 +326,74 @@
             (push (list i spec leaf-values expected actual) failures)))))
     (is (null failures)
         (format nil "~D memory differential failure(s), first: case ~{~D spec=~S leaves=~S expected=~S actual=~S~}"
+                (length failures) (first (last failures))))))
+
+;;; ========== Casts and 32-bit arithmetic (whistler-2m0.2) ==========
+;;;
+;;; The scalar generator reaches alu32 only indirectly, through
+;;; narrow-alu-types deciding an operation fits in 32 bits — which is
+;;; how the lsh32 and mul32 narrowing bugs were caught. What it never
+;;; produces is an explicit (cast uN ...), where the truncation is asked
+;;; for rather than inferred, and where a narrower type flows back into
+;;; the surrounding arithmetic.
+
+(defparameter *fuzz-cast-bits* '(8 16 32 64))
+
+(defun cast-type-symbol (bits)
+  (intern (ecase bits (8 "U8") (16 "U16") (32 "U32") (64 "U64")) '#:whistler))
+
+(defun cast-type-bits (type-symbol)
+  (let ((name (symbol-name type-symbol)))
+    (cond ((string= name "U8") 8)
+          ((string= name "U16") 16)
+          ((string= name "U32") 32)
+          (t 64))))
+
+(defun gen-cast-expr (leaves depth)
+  "A scalar expression with (cast uN ...) nodes threaded through it."
+  (if (or (zerop depth) (< (fuzz-int 100) 30))
+      (gen-scalar-expr leaves (max 0 (1- depth)))
+      (case (fuzz-int 6)
+        ((0 1 2)
+         (list (intern "CAST" '#:whistler)
+               (cast-type-symbol (elt *fuzz-cast-bits* (fuzz-int 4)))
+               (gen-cast-expr leaves (1- depth))))
+        (3 (list 'ash (gen-cast-expr leaves (1- depth)) (+ 1 (fuzz-int 31))))
+        (4 (list (intern ">>" '#:whistler)
+                 (gen-cast-expr leaves (1- depth)) (+ 1 (fuzz-int 31))))
+        (t (list (elt *fuzz-binops* (fuzz-int (length *fuzz-binops*)))
+                 (gen-cast-expr leaves (1- depth))
+                 (gen-cast-expr leaves (1- depth)))))))
+
+(defun fuzz-one-cast-case (n-leaves depth)
+  (let* ((leaves (loop for i from 1 to n-leaves
+                       collect (intern (format nil "X~D" i) '#:whistler)))
+         (leaf-values (loop repeat n-leaves collect (fuzz-int (expt 2 32))))
+         (expr (gen-cast-expr leaves depth))
+         (body `((let ,(loop for l in leaves
+                             collect `(,l (,(intern "GET-PRANDOM-U32" '#:whistler))))
+                   (declare (type ,(intern "U64" '#:whistler) ,@leaves))
+                   (return ,expr))))
+         (expected (eval-scalar-expr expr (mapcar #'cons leaves leaf-values)))
+         (bytes (compile-insn-bytes body))
+         (actual (interpret-scalar-bpf bytes (copy-list leaf-values))))
+    (values (eql expected actual) expr leaf-values expected actual)))
+
+(test differential-cast-fuzz
+  "Explicit casts: the value must be truncated where the program says
+   so, whatever width the compiler decides to compute in."
+  (fuzz-seed 20260916)
+  (let ((failures '()))
+    (dotimes (i 140)
+      (let ((n-leaves (+ 1 (mod i 4)))
+            (depth (+ 2 (fuzz-int 3))))
+        (multiple-value-bind (ok expr leaf-values expected actual)
+            (handler-case (fuzz-one-cast-case n-leaves depth)
+              (error (e)
+                (values nil (format nil "case ~D signalled: ~A" i e)
+                        nil nil nil)))
+          (unless ok
+            (push (list i expr leaf-values expected actual) failures)))))
+    (is (null failures)
+        (format nil "~D cast differential failure(s), first: case ~{~D expr=~S leaves=~S expected=~S actual=~S~}"
                 (length failures) (first (last failures))))))
