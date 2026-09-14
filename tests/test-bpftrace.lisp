@@ -616,3 +616,76 @@
               (length bracketed) (first bracketed))
           (is (null (remove-if-not (lambda (n) (find #\Space n)) names))
               "a kernel function name cannot contain a space")))))
+
+;;; ========== Remembered kprobe refusals (whistler-tu7) ==========
+;;;
+;;; KPROBE_MULTI refuses a whole batch if one name will not resolve, and
+;;; kallsyms lists more text symbols than ftrace can attach to. The
+;;; authoritative list lives in tracefs, which is mode 0700, so a
+;;; CAP_BPF-but-not-root process cannot read it — but the sequential
+;;; fallback learns the same thing the hard way, and writing it down
+;;; turns the next run back into one call.
+
+(defmacro with-private-cache ((&key) &body body)
+  "Run BODY with the refusal cache pointed at a throwaway directory, so
+   a test can never read or scribble on the caller's real one."
+  (let ((dir (gensym)) (saved (gensym)))
+    `(let* ((,dir (format nil "/tmp/whistler-test-cache-~D/" (sb-posix:getpid)))
+            (,saved (sb-posix:getenv "XDG_CACHE_HOME")))
+       (unwind-protect
+            (progn
+              (sb-posix:setenv "XDG_CACHE_HOME" ,dir 1)
+              (let ((whistler/bpftrace::*unattachable* nil))
+                ,@body))
+         (if ,saved
+             (sb-posix:setenv "XDG_CACHE_HOME" ,saved 1)
+             (sb-posix:unsetenv "XDG_CACHE_HOME"))
+         (ignore-errors (uiop:delete-directory-tree
+                         (pathname ,dir) :validate t :if-does-not-exist :ignore))))))
+
+(test refusals-start-empty-and-survive-a-reread
+  (with-private-cache ()
+    (is (zerop (hash-table-count (whistler/bpftrace::unattachable-names)))
+        "a fresh cache remembers nothing")
+    (let ((learned (whistler/bpftrace::remember-unattachable
+                    '("tcp_clock_ts" "tcp_prot"))))
+      (is (= 2 (length learned)) "both names are new"))
+    ;; Drop the in-memory copy: the next read must come off disk.
+    (setf whistler/bpftrace::*unattachable* nil)
+    (let ((set (whistler/bpftrace::unattachable-names)))
+      (is (gethash "tcp_clock_ts" set) "a remembered name survives a reread")
+      (is (gethash "tcp_prot" set) "and so does the other one")
+      (is (not (gethash "tcp_sendmsg" set))
+          "a name never refused must not appear"))))
+
+(test remembering-a-name-twice-adds-it-once
+  (with-private-cache ()
+    (whistler/bpftrace::remember-unattachable '("tcp_clock_ts"))
+    (let ((again (whistler/bpftrace::remember-unattachable
+                  '("tcp_clock_ts" "tcp_prot"))))
+      (is (equal '("tcp_prot") again)
+          "only the genuinely new name is reported, got ~S" again))
+    (is (= 2 (hash-table-count (whistler/bpftrace::unattachable-names)))
+        "the set holds each name once")))
+
+(test the-cache-is-keyed-by-kernel-release
+  ;; The refusals belong to one kernel image, so a different kernel must
+  ;; not inherit them.
+  (let ((path (namestring (whistler/bpftrace::unattachable-cache-path))))
+    (is (search (whistler/bpftrace::kernel-release) path)
+        "the cache path ~S should name the running kernel" path)))
+
+(test an-unwritable-cache-is-not-an-error
+  ;; Losing the speed-up is acceptable; failing the attach is not.
+  (let ((saved (sb-posix:getenv "XDG_CACHE_HOME")))
+    (unwind-protect
+         (progn
+           (sb-posix:setenv "XDG_CACHE_HOME" "/proc/nonexistent-cache/" 1)
+           (let ((whistler/bpftrace::*unattachable* nil))
+             (is (null (nth-value 1 (ignore-errors
+                                     (whistler/bpftrace::remember-unattachable
+                                      '("some_name")))))
+                 "a cache that cannot be written must not signal")))
+      (if saved
+          (sb-posix:setenv "XDG_CACHE_HOME" saved 1)
+          (sb-posix:unsetenv "XDG_CACHE_HOME")))))

@@ -284,18 +284,98 @@
           when (cl-ppcre:scan rx name)
             collect name)))
 
+;;; ========== Remembering what the kernel refuses ==========
+;;;
+;;; KPROBE_MULTI attaches a whole batch in one call, and refuses the
+;;; whole batch if a single name will not resolve. /proc/kallsyms lists
+;;; more text symbols than ftrace can attach to — inlined functions,
+;;; __init and __exit code freed after boot, data parked in a text
+;;; section — so a wildcard spanning one of those falls back to
+;;; attaching every name separately, which is ~40x slower.
+;;;
+;;; The authoritative list is available_filter_functions, but tracefs is
+;;; mode 0700, so a CAP_BPF-but-not-root process cannot read it. What
+;;; such a process can do is remember: the sequential fallback already
+;;; tries every name on its own and learns exactly which ones the kernel
+;;; refused. Writing that down turns the next run of the same wildcard
+;;; back into a single link_create.
+;;;
+;;; The set belongs to one kernel image, so the file is keyed by release
+;;; and re-derived after a reboot into a different one. It is only ever a
+;;; hint: a stale entry costs a probe we could have attached, never a
+;;; wrong attach, and a batch that still fails falls back and relearns.
+
+(defvar *unattachable* nil
+  "Names this kernel has already refused, or NIL before the cache is read.")
+
+(defun kernel-release ()
+  (handler-case
+      (with-open-file (s "/proc/sys/kernel/osrelease" :direction :input)
+        (string-trim '(#\Space #\Newline) (read-line s nil "")))
+    (error () "unknown")))
+
+(defun unattachable-cache-path ()
+  (merge-pathnames
+   (format nil "whistler/kprobe-unattachable-~A.txt" (kernel-release))
+   (or (uiop:getenv-absolute-directory "XDG_CACHE_HOME")
+       (merge-pathnames ".cache/" (user-homedir-pathname)))))
+
+(defun unattachable-names ()
+  "The remembered refusals for this kernel."
+  (or *unattachable*
+      (setf *unattachable*
+            (let ((set (make-hash-table :test 'equal)))
+              (handler-case
+                  (with-open-file (s (unattachable-cache-path)
+                                     :direction :input :if-does-not-exist nil)
+                    (when s
+                      (loop for line = (read-line s nil nil)
+                            while line
+                            for name = (string-trim '(#\Space #\Return) line)
+                            unless (zerop (length name))
+                              do (setf (gethash name set) t))))
+                (error () nil))
+              set))))
+
+(defun remember-unattachable (names)
+  "Add NAMES to the remembered refusals, in memory and on disk.
+   Returns the ones that were not already known."
+  (let* ((set (unattachable-names))
+         (fresh (remove-if (lambda (n) (gethash n set)) names)))
+    (dolist (n fresh) (setf (gethash n set) t))
+    (when fresh
+      (handler-case
+          (let ((path (unattachable-cache-path)))
+            (ensure-directories-exist path)
+            (with-open-file (s path :direction :output
+                                    :if-exists :append
+                                    :if-does-not-exist :create)
+              (dolist (n fresh) (write-line n s))))
+        ;; A cache we cannot write is a missed speed-up, not a failure.
+        (error () nil)))
+    fresh))
+
 (defun attach-kprobe-glob-sequential (fd target names retprobe)
   "Fallback when KPROBE_MULTI isn't supported — one perf_event_open
-   per match. Slow (~2ms each) but works on older kernels."
-  (let* ((attachments
+   per match. Slow (~2ms each) but works on older kernels.
+
+   Records the names the kernel refused, so the next run of this
+   wildcard can skip them and take the single-call path."
+  (let* ((refused '())
+         (attachments
            (loop for name in names
                  collect (handler-case
                              (whistler/loader:attach-kprobe
                               fd name :retprobe retprobe)
-                           (error () nil))))
+                           (error () (push name refused) nil))))
          (live (remove nil attachments)))
     (format t ";; ~A attached on ~D of ~D (sequential fallback).~%"
             target (length live) (length names))
+    (let ((learned (remember-unattachable (nreverse refused))))
+      (when learned
+        (format t ";; noted ~D name~:p this kernel will not attach; the next ~
+                   run of this probe takes the fast path.~%"
+                (length learned))))
     (when (null live)
       (error "kprobe:~A: none of ~D candidates accepted the probe"
              target (length names)))
@@ -316,11 +396,19 @@
      ;; kernel knows to attach via BPF_TRACE_KPROBE_MULTI. We just
      ;; supply the list of function names — one syscall, no
      ;; sequential perf_event_open fan-out.
-     (let ((names (kallsyms-functions-matching target)))
-       (when (null names)
+     (let* ((all (kallsyms-functions-matching target))
+            (known-bad (unattachable-names))
+            ;; Drop what this kernel has already refused. One such name
+            ;; is enough to fail the whole batch, and dropping it costs
+            ;; nothing: it could not have been attached anyway.
+            (names (or (remove-if (lambda (n) (gethash n known-bad)) all)
+                       all))
+            (skipped (- (length all) (length names))))
+       (when (null all)
          (error "kprobe:~A matched no functions" target))
-       (format t ";; kprobe:~A → attaching ~D function~:p via KPROBE_MULTI...~%"
-               target (length names))
+       (format t ";; kprobe:~A → attaching ~D function~:p via KPROBE_MULTI~
+                  ~[~:;, skipping ~:*~D this kernel refuses~]...~%"
+               target (length names) skipped)
        (force-output)
        (handler-case
            (let ((att (whistler/loader:attach-kprobe-multi

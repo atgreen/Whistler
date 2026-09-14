@@ -106,6 +106,27 @@ Pure CL BPF loader — no libbpf, no CFFI. ASDF system `whistler/loader`. Key AP
 
 Permissions: `CAP_BPF` + `CAP_PERFMON` loads/attaches **tracing** programs (kprobe, tracepoint, perf_event). **Networking** programs (XDP, TC/sched_cls) additionally need `CAP_NET_ADMIN` — without it, `BPF_PROG_LOAD` fails with `EPERM` (not a verifier rejection). Use `sudo setcap cap_bpf,cap_perfmon,cap_net_admin+ep /usr/bin/sbcl` instead of root to cover both. Tracepoint format files need `chmod a+r`. Note: `make test-torture`'s `has-cap-bpf-p` probes by loading a trivial *XDP* program, so with only `cap_bpf,cap_perfmon` it reports no-cap and the suite verifies compilation but **skips** the kernel-load assertions.
 
+Wildcard kprobes (`kprobe:tcp_*`) attach all matches in one
+`BPF_LINK_CREATE` via `KPROBE_MULTI`, which is all-or-nothing: a single
+name ftrace cannot resolve fails the whole batch. The authoritative list
+of attachable functions is `/sys/kernel/tracing/available_filter_functions`,
+but tracefs is mode 0700, so a `CAP_BPF`-but-not-root process falls back
+to `/proc/kallsyms`, whose text symbols are a strict superset (inlined
+functions, `__init`/`__exit` code freed after boot, data parked in a text
+section). Two ways to get the fast path:
+
+- Run as root, or grant read access once: `sudo chmod -R a+rX /sys/kernel/tracing`
+  (the same treatment tracepoint format files need).
+- Otherwise just run the probe twice. The sequential fallback records
+  which names this kernel refused, under
+  `${XDG_CACHE_HOME:-~/.cache}/whistler/kprobe-unattachable-$(uname -r).txt`,
+  and the next run skips them and takes the single-call path. Measured
+  on 7.2.4-200.fc44.x86_64, `kprobe:tcp_*` attaches in ~1180 ms cold and
+  ~84 ms warm (507 candidates, 42 of them refused). The
+  file is keyed by kernel release and is only a hint — a stale entry
+  costs a probe, never a wrong attach, and a batch that still fails
+  falls back and relearns.
+
 Protocol headers: Ethernet, IPv4, IPv6, TCP, UDP, ICMP with constants and `with-packet`/`with-tcp`/`with-udp` parsing macros. TC (sched_cls) programs use `with-tc-packet`/`with-tc-tcp`/`with-tc-udp` (same API, `__sk_buff` offsets, `TC_ACT_OK`/`TC_ACT_SHOT` return codes).
 
 Types: `u8`, `u16`, `u32`, `u64`. The `whistler` package shadows `case`, `defstruct`, `incf`, and `decf` from CL. Standalone BPF source files use `(in-package #:whistler)` which avoids conflicts. To use Whistler from another package, add `:shadowing-import-from`:
