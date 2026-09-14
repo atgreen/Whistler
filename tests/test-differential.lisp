@@ -222,3 +222,105 @@
     (is (null failures)
         (format nil "~D loop differential failure(s), first: case ~{~D spec=~S leaves=~S expected=~S actual=~S~}"
                 (length failures) (first (last failures))))))
+
+;;; ========== Stack memory (whistler-2m0.2) ==========
+;;;
+;;; Scalars and loops never leave registers. These programs allocate a
+;;; stack buffer, store into it at mixed widths and offsets, then read
+;;; it back — which is what drives the stack-address folding, the
+;;; store/load elimination and load/load forwarding passes, and the
+;;; narrowing that decides a store's width. A store that overlaps an
+;;; earlier one has to win on exactly the bytes it covers, so the oracle
+;;; models the buffer byte by byte rather than slot by slot.
+
+(defparameter *fuzz-buffer-size* 32)
+(defparameter *fuzz-widths* '(1 2 4 8))
+
+(defun width-type (width)
+  (intern (ecase width (1 "U8") (2 "U16") (4 "U32") (8 "U64")) '#:whistler))
+
+(defun fuzz-offset (width)
+  "A naturally aligned offset with room for a WIDTH-byte access."
+  (* width (fuzz-int (floor *fuzz-buffer-size* width))))
+
+(defun gen-memory-spec (leaves depth)
+  "Describe a program that fills a stack buffer and then reads it."
+  (let ((stores (loop repeat (+ 1 (fuzz-int 4))
+                      for width = (elt *fuzz-widths* (fuzz-int 4))
+                      collect (list :width width
+                                    :offset (fuzz-offset width)
+                                    :value (gen-scalar-expr leaves depth))))
+        (loads (loop repeat (+ 1 (fuzz-int 3))
+                     for width = (elt *fuzz-widths* (fuzz-int 4))
+                     collect (list :width width :offset (fuzz-offset width)))))
+    (list :stores stores :loads loads)))
+
+(defun memory-spec-body (spec leaves)
+  (destructuring-bind (&key stores loads) spec
+    (let ((buf (intern "BUF" '#:whistler)))
+      `((let ((,buf (,(intern "STRUCT-ALLOC" '#:whistler) ,*fuzz-buffer-size*)))
+          ,@(loop for s in stores
+                  collect `(,(intern "STORE" '#:whistler)
+                            ,(width-type (getf s :width))
+                            ,buf ,(getf s :offset) ,(getf s :value)))
+          (return ,(let ((terms (loop for l in loads
+                                      collect `(,(intern "LOAD" '#:whistler)
+                                                ,(width-type (getf l :width))
+                                                ,buf ,(getf l :offset)))))
+                     ;; Combine the loads (and a leaf, when there is one)
+                     ;; so every one of them reaches the result.
+                     (reduce (lambda (a b) (list '+ a b))
+                             (if leaves (cons (first leaves) terms) terms)))))))))
+
+(defun eval-memory-spec (spec leaves env)
+  (destructuring-bind (&key stores loads) spec
+    (let ((buffer (make-array *fuzz-buffer-size* :initial-element 0)))
+      (dolist (s stores)
+        (let ((value (eval-scalar-expr (getf s :value) env)))
+          (dotimes (k (getf s :width))
+            (setf (aref buffer (+ (getf s :offset) k))
+                  (ldb (byte 8 (* 8 k)) value)))))
+      (let ((values (loop for l in loads
+                          collect (let ((v 0))
+                                    (dotimes (k (getf l :width) v)
+                                      (setf (ldb (byte 8 (* 8 k)) v)
+                                            (aref buffer (+ (getf l :offset) k))))))))
+        (ldb (byte 64 0)
+             (reduce #'+ (if leaves
+                             (cons (cdr (assoc (first leaves) env)) values)
+                             values)))))))
+
+(defun fuzz-one-memory-case (n-leaves depth)
+  (let* ((leaves (loop for i from 1 to n-leaves
+                       collect (intern (format nil "X~D" i) '#:whistler)))
+         (leaf-values (loop repeat n-leaves collect (fuzz-int (expt 2 32))))
+         (spec (gen-memory-spec leaves depth))
+         (env (mapcar #'cons leaves leaf-values))
+         (body `((let ,(loop for l in leaves
+                             collect `(,l (,(intern "GET-PRANDOM-U32" '#:whistler))))
+                   (declare (type ,(intern "U64" '#:whistler) ,@leaves))
+                   ,@(memory-spec-body spec leaves))))
+         (expected (eval-memory-spec spec leaves env))
+         (bytes (compile-insn-bytes body))
+         (actual (interpret-scalar-bpf bytes (copy-list leaf-values))))
+    (values (eql expected actual) spec leaf-values expected actual)))
+
+(test differential-memory-fuzz
+  "Stack stores and loads at mixed widths and offsets: what comes back
+   out must be what the overlapping stores actually left behind."
+  (fuzz-seed 20260915)
+  (let ((failures '()))
+    (dotimes (i 120)
+      ;; At least one leaf: gen-scalar-expr picks from this list.
+      (let ((n-leaves (+ 1 (mod i 3)))
+            (depth (+ 1 (fuzz-int 3))))
+        (multiple-value-bind (ok spec leaf-values expected actual)
+            (handler-case (fuzz-one-memory-case n-leaves depth)
+              (error (e)
+                (values nil (format nil "case ~D signalled: ~A" i e)
+                        nil nil nil)))
+          (unless ok
+            (push (list i spec leaf-values expected actual) failures)))))
+    (is (null failures)
+        (format nil "~D memory differential failure(s), first: case ~{~D spec=~S leaves=~S expected=~S actual=~S~}"
+                (length failures) (first (last failures))))))

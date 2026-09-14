@@ -565,6 +565,15 @@
   (and (bpf-ldx-p insn)
        (= (whistler/bpf:bpf-insn-src insn) whistler/bpf:+bpf-reg-10+)))
 
+(defun bpf-dw-access-p (insn)
+  "Does INSN move a full 64-bit word?
+
+   Only a dw store paired with a dw load round-trips a register
+   unchanged. A narrower store keeps just its own bytes and a narrower
+   load zero-extends them back, and a mismatched pair reads bytes the
+   store never wrote — neither is a register copy (whistler-wvy)."
+  (= (logand (whistler/bpf:bpf-insn-code insn) #x18) whistler/bpf:+bpf-dw+))
+
 (defun peephole-store-load-elimination (insns)
   "Replace an immediately-adjacent stx/ldx pair with stx + mov.
    Restricting this to adjacent instructions avoids erasing reloads that
@@ -592,7 +601,12 @@
                  (let ((insn (aref vec j)))
                    (when (and (not (gethash j targets))
                               (bpf-stack-load-p insn)
-                              (= (whistler/bpf:bpf-insn-off insn) store-off))
+                              (= (whistler/bpf:bpf-insn-off insn) store-off)
+                              ;; Both must move the whole word; see
+                              ;; BPF-DW-ACCESS-P. Spill reloads, which
+                              ;; this pass exists for, are always dw.
+                              (bpf-dw-access-p store)
+                              (bpf-dw-access-p insn))
                      (let ((load-dst (whistler/bpf:bpf-insn-dst insn)))
                        ;; Replace ldx rY, [r10+off] → mov rY, rX
                        (setf (whistler/bpf:bpf-insn-code insn)
@@ -791,9 +805,15 @@
                           ;; Entering a jump target crosses a CFG edge.
                           ((gethash j targets)
                            (return))
-                          ;; Found another load from same stack slot
+                          ;; Found another load from the same stack slot.
+                          ;; The opcode must match, not just the offset: a
+                          ;; ldxb and a ldxdw at one address read different
+                          ;; values, and copying the register hands the
+                          ;; narrow one to the wide load (whistler-6qw).
                           ((and (bpf-stack-load-p insn)
-                                (= (whistler/bpf:bpf-insn-off insn) load-off))
+                                (= (whistler/bpf:bpf-insn-off insn) load-off)
+                                (= (whistler/bpf:bpf-insn-code insn)
+                                   (whistler/bpf:bpf-insn-code load1)))
                            ;; Replace with mov rB, rA
                            (let ((load2-dst (whistler/bpf:bpf-insn-dst insn)))
                              (setf (whistler/bpf:bpf-insn-code insn)
@@ -805,9 +825,12 @@
                              (setf (whistler/bpf:bpf-insn-off insn) 0)
                              (setf (whistler/bpf:bpf-insn-imm insn) 0))
                            (return))
-                          ;; Store to same offset invalidates
-                          ((and (bpf-stack-store-p insn)
-                                (= (whistler/bpf:bpf-insn-off insn) load-off))
+                          ;; Any store touching the bytes this load read
+                          ;; invalidates it — including a narrow one landing
+                          ;; inside the slot, and an immediate store, neither
+                          ;; of which an equal-offsets test catches.
+                          ((stack-store-overlaps-p insn load-off
+                                                   (bpf-access-byte-width load1))
                            (return))
                           ;; rA is redefined — can't forward
                           ((and (not (bpf-exit-p insn))
@@ -1157,16 +1180,31 @@
                (cond
                  ;; AND rX, MASK — check if redundant, then update width
                  ((or (bpf-and32-imm-p insn) (bpf-and64-imm-p insn))
-                  (let* ((known-w (aref widths dst))
-                         ;; Compute effective mask width as bit-length of the mask.
-                         ;; 0x0f→4, 0xff→8, 0xffff→16, 0xffffffff→32
-                         (mask-w (if (zerop imm) 0 (integer-length imm))))
-                    ;; AND is a no-op only if register width < mask width
-                    ;; (all possible values already fit within the mask)
-                    (if (and known-w (< known-w mask-w))
+                  (let* ((alu32 (bpf-and32-imm-p insn))
+                         (known-w (aref widths dst))
+                         ;; The immediate is a signed 32-bit field. A
+                         ;; 64-bit AND masks with it sign-extended; a
+                         ;; 32-bit AND masks with its low half and then
+                         ;; zeroes the top of the register.
+                         (mask (if alu32 (ldb (byte 32 0) imm) (ldb (byte 64 0) imm)))
+                         (mask-w (integer-length mask)))
+                    (if (and known-w
+                             ;; A 32-bit AND also clears the upper half,
+                             ;; so it is only removable when the value is
+                             ;; known to live in the lower one.
+                             (or (not alu32) (<= known-w 32))
+                             ;; The AND does nothing only when the mask
+                             ;; keeps every bit the value could have set.
+                             ;; Comparing bit-lengths instead assumed the
+                             ;; mask was a run of low bits: `and rX, 2'
+                             ;; has length 2 yet clears bit 0, so a
+                             ;; register known to hold 0 or 1 had its
+                             ;; mask dropped and kept the 1 (whistler-0wv).
+                             (zerop (logandc2 (1- (ash 1 known-w)) mask)))
                         (setf (gethash i to-delete) t)
-                        ;; Update width: AND narrows to mask width
-                        (setf (aref widths dst) mask-w))))
+                        ;; Update width: AND narrows to the mask's extent
+                        (setf (aref widths dst)
+                              (min mask-w (if alu32 32 64))))))
 
                  ;; RSH rX, N — narrows the value
                  ;; ALU32 RSH caps input at 32 bits; ALU64 uses full 64
@@ -1374,6 +1412,24 @@
   (and (bpf-st-imm-p insn)
        (= (whistler/bpf:bpf-insn-dst insn) whistler/bpf:+bpf-reg-10+)))
 
+(defun bpf-access-byte-width (insn)
+  "Bytes written or read by a BPF memory instruction."
+  (ecase (logand (whistler/bpf:bpf-insn-code insn) #x18)
+    (#x00 4) (#x08 2) (#x10 1) (#x18 8)))
+
+(defun stack-store-overlaps-p (insn off width)
+  "Does INSN write any of the WIDTH stack bytes starting at OFF?
+
+   Both forms of store count: `stx' from a register and `st' of an
+   immediate. Comparing offsets for equality instead — as the memory
+   passes used to — misses a narrow store landing inside a wider slot,
+   and misses immediate stores entirely."
+  (let ((base (and (or (bpf-stack-store-p insn) (bpf-st-imm-stack-p insn))
+                   (whistler/bpf:bpf-insn-off insn))))
+    (and base
+         (< base (+ off width))
+         (> (+ base (bpf-access-byte-width insn)) off))))
+
 (defun peephole-merge-zero-stores (insns)
   "Merge zero-init u64 store + constant u32 overwrite at same offset into one u64 store."
   (let* ((vec (coerce insns 'vector))
@@ -1396,11 +1452,24 @@
                             ((and (bpf-st-imm-stack-p next)
                                   (= (whistler/bpf:bpf-insn-code next) #x62)  ; st-mem u32
                                   (= (whistler/bpf:bpf-insn-off next) off))
-                             ;; Merge: change the u64 store to use the u32's value
-                             ;; and delete the u32 store
-                             (setf (gethash i to-modify)
-                                   (whistler/bpf:bpf-insn-imm next))
-                             (setf (gethash j to-delete) t)
+                             ;; Zero-init plus a 4-byte constant equals an
+                             ;; 8-byte store of that constant only while it
+                             ;; zero-extends. A dw store SIGN-extends its
+                             ;; 32-bit immediate, so an N with bit 31 set
+                             ;; would fill the four bytes above it with
+                             ;; ones instead of zeros (whistler-fzh).
+                             (when (zerop (ldb (byte 1 31)
+                                               (whistler/bpf:bpf-insn-imm next)))
+                               ;; Merge: change the u64 store to use the u32's
+                               ;; value and delete the u32 store
+                               (setf (gethash i to-modify)
+                                     (whistler/bpf:bpf-insn-imm next))
+                               (setf (gethash j to-delete) t))
+                             (return-from scan))
+                            ;; Another store already inside the slot: the
+                            ;; merged store would land before it rather
+                            ;; than after, so leave the pair alone.
+                            ((stack-store-overlaps-p next off 8)
                              (return-from scan))
                             ;; Load/call/jump from this region — stop
                             ((or (and (bpf-stack-load-p next)

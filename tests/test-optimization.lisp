@@ -471,3 +471,80 @@
                              (peephole-insn #x95 0 0)))
     (is-false (and folded leftover)
               "a use on the far side of a jump was left reading a deleted r1")))
+
+;;; ========== Memory passes must respect access width ==========
+;;;
+;;; Four separate passes compared stack offsets while ignoring how many
+;;; bytes the access actually moves. A store truncates to its width and
+;;; a load zero-extends, so a register is only the same value on both
+;;; sides of memory when the whole 64-bit word makes the trip.
+
+(defun stack-roundtrip (type value)
+  "Store VALUE at one width and read it back at the same width."
+  (interpret-scalar-bpf
+   (compile-insn-bytes
+    `((let ((x1 (get-prandom-u32)))
+        (declare (type u64 x1))
+        (let ((buf (struct-alloc 32)))
+          (store ,type buf 8 x1)
+          (return (load ,type buf 8))))))
+   (list value)))
+
+(test a-narrow-store-and-load-keeps-only-its-own-bytes
+  ;; whistler-wvy: forward-stores-to-loads (IR) and
+  ;; peephole-store-load-elimination both replaced the load with a copy
+  ;; of the stored register, handing back the value unmasked.
+  (let ((value 2888944060))            ; needs more than 8 and 16 bits
+    (is (= (ldb (byte 8 0) value) (stack-roundtrip 'u8 value))
+        "a u8 round trip must keep one byte")
+    (is (= (ldb (byte 16 0) value) (stack-roundtrip 'u16 value))
+        "a u16 round trip must keep two bytes")
+    (is (= (ldb (byte 32 0) value) (stack-roundtrip 'u32 value))
+        "a u32 round trip must keep four bytes")
+    (is (= value (stack-roundtrip 'u64 value))
+        "a u64 round trip is the identity")))
+
+(test a-byte-load-is-not-the-value-of-a-word-load
+  ;; whistler-6qw: peephole-load-load-forwarding matched two stack loads
+  ;; on offset alone, so the second one was handed the first one's
+  ;; register however many bytes they differed by.
+  (let* ((value 53535693602816)        ; low byte zero, low word not
+         (bytes (compile-insn-bytes
+                 `((let ((x1 (get-prandom-u32)))
+                     (declare (type u64 x1))
+                     (let ((buf (struct-alloc 32)))
+                       (store u64 buf 8 x1)
+                       (return (+ (load u8 buf 8) (load u64 buf 8)))))))))
+    (is (= (ldb (byte 64 0) (+ (ldb (byte 8 0) value) value))
+           (interpret-scalar-bpf bytes (list value))))))
+
+(test a-u32-constant-store-does-not-sign-extend
+  ;; whistler-fzh: merge-zero-stores folded the zero-init and a u32
+  ;; constant into one dw store, and BPF sign-extends a dw immediate, so
+  ;; a constant with bit 31 set filled the bytes above it with ones.
+  (let ((bytes (compile-insn-bytes
+                '((let ((x1 (get-prandom-u32)))
+                    (declare (type u64 x1))
+                    (let ((buf (struct-alloc 32)))
+                      (store u32 buf 8 3221225472)
+                      (return (load u64 buf 8))))))))
+    (is (= 3221225472 (interpret-scalar-bpf bytes (list 1)))
+        "the four bytes above a u32 store must stay zero")))
+
+;;; ========== Masking ==========
+
+(test a-mask-that-is-not-a-run-of-low-bits-is-not-redundant
+  ;; whistler-0wv: eliminate-redundant-mask removed `and rX, MASK'
+  ;; whenever the register's known bit width was below the mask's
+  ;; bit-length. That holds only for masks like 0xff; `and rX, 2' has
+  ;; bit-length 2 but clears bit 0, so a register known to hold 0 or 1
+  ;; kept its 1.
+  (is (= 0 (interpret-scalar-bpf
+            (compile-insn-bytes '((return (logand (logand 1 1) 2)))) '()))
+      "(logand (logand 1 1) 2) is 0")
+  (is (= 2 (interpret-scalar-bpf
+            (compile-insn-bytes '((return (logand (logand 3 3) 2)))) '()))
+      "a mask that does keep the bit must still keep it")
+  (is (= 0 (interpret-scalar-bpf
+            (compile-insn-bytes '((return (logand (logand 5 7) 8)))) '()))
+      "bit 3 is not set in 5, so masking it leaves nothing"))

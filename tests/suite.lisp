@@ -221,12 +221,24 @@
 ;;; reuse) that the kernel verifier happily accepts. Errors loudly on any
 ;;; opcode outside the subset so coverage gaps surface as test failures.
 
+(defun bpf-access-width (opcode)
+  "Bytes touched by a BPF memory opcode, from its size field."
+  (ecase (logand opcode #x18)
+    (#x00 4)    ; BPF_W
+    (#x08 2)    ; BPF_H
+    (#x10 1)    ; BPF_B
+    (#x18 8)))  ; BPF_DW
+
 (defun interpret-scalar-bpf (bytes call-results)
-  "Interpret scalar BPF: ALU64/ALU32 reg+imm ops, dw ldx/stx via R10,
-   ld_imm64, ja/jlt/jge-imm, helper calls, exit. CALL-RESULTS supplies
-   successive R0 values for call instructions; calls clobber R1-R5 with
-   a poison symbol so reading a clobbered register errors. Returns R0
-   at exit."
+  "Interpret scalar BPF: ALU64/ALU32 reg+imm ops, ldx/stx/st at every
+   width via R10, ld_imm64, ja/jlt/jge-imm, helper calls, exit.
+   CALL-RESULTS supplies successive R0 values for call instructions;
+   calls clobber R1-R5 with a poison symbol so reading a clobbered
+   register errors. Returns R0 at exit.
+
+   Memory is modelled byte by byte rather than as whole slots, so a
+   narrow store landing inside a wider one, or two stores that overlap,
+   read back the way the hardware would."
   (let ((regs (make-array 11 :initial-element 0))
         (stack (make-hash-table))
         (n (/ (length bytes) 8))
@@ -242,7 +254,17 @@
            (rr (i) (let ((v (aref regs i)))
                      (unless (integerp v)
                        (error "interpret-scalar-bpf: read of clobbered R~D" i))
-                     v)))
+                     v))
+           (mem-store (addr width value)
+             (dotimes (k width)
+               (setf (gethash (+ addr k) stack) (ldb (byte 8 (* 8 k)) value))))
+           (mem-load (addr width)
+             ;; Untouched bytes read as zero, and every BPF load
+             ;; zero-extends, so the result is already unsigned.
+             (let ((value 0))
+               (dotimes (k width value)
+                 (setf (ldb (byte 8 (* 8 k)) value)
+                       (or (gethash (+ addr k) stack) 0))))))
       (loop with pc = 0
             while (< pc n)
             do (when (> (incf steps) step-budget)
@@ -284,13 +306,14 @@
                           (logior (ldb (byte 32 0) imm)
                                   (ash (ldb (byte 32 0) (nth-insn-imm bytes (1+ pc))) 32)))
                     (incf pc))
-                   ((= op #x79)          ; ldx dw
+                   ;; ldx / stx / st at widths b(1) h(2) w(4) dw(8).
+                   ((member op '(#x71 #x69 #x61 #x79))   ; ldx
                     (setf (aref regs dst)
-                          (or (gethash (+ (rr src) off) stack) 0)))
-                   ((= op #x7b)          ; stx dw
-                    (setf (gethash (+ (rr dst) off) stack) (rr src)))
-                   ((= op #x7a)          ; st dw, imm sign-extended to 64
-                    (setf (gethash (+ (rr dst) off) stack) (u64 imm)))
+                          (mem-load (+ (rr src) off) (bpf-access-width op))))
+                   ((member op '(#x73 #x6b #x63 #x7b))   ; stx
+                    (mem-store (+ (rr dst) off) (bpf-access-width op) (rr src)))
+                   ((member op '(#x72 #x6a #x62 #x7a))   ; st imm
+                    (mem-store (+ (rr dst) off) (bpf-access-width op) (u64 imm)))
                    ((= op #x05) (incf pc off))                             ; ja
                    ;; Conditional jumps (JMP class, reg or sign-extended imm).
                    ((and (= (logand op #x07) #x05)

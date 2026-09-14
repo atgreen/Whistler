@@ -1886,6 +1886,16 @@
 ;;; from the same location with the same type and no intervening aliasing
 ;;; store or call, replace the load with the stored value.
 
+(defun full-width-access-p (type-kw)
+  "Does a memory access of TYPE-KW carry all 64 bits?
+
+   Only then is a store followed by a load of the same location the
+   identity on the stored register. Every narrower width truncates on
+   the way in and zero-extends on the way out."
+  (and (symbolp type-kw)
+       (let ((name (symbol-name type-kw)))
+         (or (string= name "U64") (string= name "I64")))))
+
 (defun forward-stores-to-loads (prog)
   "Forward stored values to subsequent loads from the same location."
   (let ((any-change nil))
@@ -1930,7 +1940,15 @@
                  (when (and (integerp ptr) off type-kw)
                    (let ((entry (gethash (cons ptr off) pending)))
                      (when (and entry
-                                (eq type-kw (cdr entry)))
+                                (eq type-kw (cdr entry))
+                                ;; Only a full-width access round-trips
+                                ;; the register unchanged. A narrower one
+                                ;; keeps just its own bytes going in and
+                                ;; zero-extends them coming out, so the
+                                ;; load produces value AND mask(width) --
+                                ;; forwarding the register itself hands
+                                ;; back the unmasked value (whistler-wvy).
+                                (full-width-access-p type-kw))
                        ;; Forward: replace load with mov from stored value
                        (setf (ir-insn-op insn) :mov)
                        (setf (ir-insn-args insn) (list (car entry)))
