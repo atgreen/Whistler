@@ -201,7 +201,28 @@
    when readable (canonical), otherwise filtered from /proc/kallsyms.
    Either way, names containing `.' (compiler-generated specialisations
    like .cold, .constprop.0, .isra.0, .part.0) are dropped — they
-   show up in kallsyms but perf_event_open rejects them.")
+   show up in kallsyms but perf_event_open rejects them.
+
+   Names are bare and unique: no `[module]' suffix, and no name twice.
+   Both matter to the attach paths, not just to tidiness — a suffixed
+   name resolves to nothing, and a repeated one fails a whole
+   KPROBE_MULTI batch.")
+
+(defun dedup-names (names)
+  "Drop repeated names, keeping the first occurrence of each.
+
+   The kernel lists a name twice when two functions share it, and a
+   KPROBE_MULTI batch carrying the same name twice is refused outright —
+   ESRCH for the whole batch, however attachable every name in it is.
+   Nothing is lost by dropping the repeat: a name-based attach cannot
+   say which of the two it means, so the second was never reachable.
+
+   Hash-based rather than REMOVE-DUPLICATES: kallsyms carries ~300k text
+   symbols here, and the quadratic form would not finish."
+  (let ((seen (make-hash-table :test 'equal)))
+    (loop for name in names
+          unless (gethash name seen)
+            collect (progn (setf (gethash name seen) t) name))))
 
 (defun load-attachable-funcs ()
   "Populate *attachable-funcs*. Tries tracefs's canonical list first;
@@ -209,39 +230,47 @@
    through *kallsyms* (which filters zero-address entries that
    kptr_restrict hides from non-root) — for listing we only need
    names, not addresses."
-  (or
-   ;; (1) tracefs canonical list — requires CAP_SYS_ADMIN/sudo.
-   (handler-case
-       (with-open-file (s "/sys/kernel/tracing/available_filter_functions"
-                          :direction :input)
-         (loop for line = (read-line s nil nil)
-               while line
-               for space = (position #\Space line)
-               for name = (subseq line 0 (or space (length line)))
-               unless (find #\. name)
-                 collect name))
-     (error () nil))
-   ;; (2) Direct /proc/kallsyms parse — names only, ignore addresses.
-   ;; Filter to text-section ('t'/'T') symbols since data symbols
-   ;; aren't kprobe-attachable.
-   (handler-case
-       (with-open-file (s "/proc/kallsyms" :direction :input)
-         (loop for line = (read-line s nil nil)
-               while line
-               for sp1 = (position #\Space line)
-               for sp2 = (and sp1 (position #\Space line :start (1+ sp1)))
-               when (and sp1 sp2)
-                 collect (let* ((type-ch (char line (1+ sp1)))
-                                (tail (subseq line (1+ sp2)))
-                                ;; Strip ` [module]' suffix if present.
-                                (sp3 (position #\Space tail))
-                                (name (if sp3 (subseq tail 0 sp3) tail)))
-                           (when (and (or (char= type-ch #\t) (char= type-ch #\T))
-                                      (not (find #\. name)))
-                             name))
-                 into names
-               finally (return (remove nil names))))
-     (error () nil))))
+  (dedup-names
+   (or
+    ;; (1) tracefs canonical list — requires CAP_SYS_ADMIN/sudo.
+    (handler-case
+        (with-open-file (s "/sys/kernel/tracing/available_filter_functions"
+                           :direction :input)
+          (loop for line = (read-line s nil nil)
+                while line
+                for space = (position #\Space line)
+                for name = (subseq line 0 (or space (length line)))
+                unless (find #\. name)
+                  collect name))
+      (error () nil))
+    ;; (2) Direct /proc/kallsyms parse — names only, ignore addresses.
+    ;; Filter to text-section ('t'/'T') symbols since data symbols
+    ;; aren't kprobe-attachable.
+    (handler-case
+        (with-open-file (s "/proc/kallsyms" :direction :input)
+          (loop for line = (read-line s nil nil)
+                while line
+                for sp1 = (position #\Space line)
+                for sp2 = (and sp1 (position #\Space line :start (1+ sp1)))
+                when (and sp1 sp2)
+                  collect (let* ((type-ch (char line (1+ sp1)))
+                                 (tail (subseq line (1+ sp2)))
+                                 ;; Strip the `[module]' suffix. kallsyms
+                                 ;; separates it with a TAB, not a space;
+                                 ;; splitting on a space alone leaves every
+                                 ;; module function named "foo<TAB>[bar]",
+                                 ;; which no attach can ever resolve.
+                                 (sp3 (position-if (lambda (c)
+                                                     (or (char= c #\Space)
+                                                         (char= c #\Tab)))
+                                                   tail))
+                                 (name (if sp3 (subseq tail 0 sp3) tail)))
+                            (when (and (or (char= type-ch #\t) (char= type-ch #\T))
+                                       (not (find #\. name)))
+                              name))
+                  into names
+                finally (return (remove nil names))))
+      (error () nil)))))
 
 (defun attachable-funcs ()
   (or *attachable-funcs*

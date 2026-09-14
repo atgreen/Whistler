@@ -553,3 +553,66 @@
          (preprocessed (whistler/bpftrace::cpp-preprocess src)))
     (is (search "should_be_kept" preprocessed))
     (is (not (search "should_be_skipped" preprocessed)))))
+
+;;; ========== Wildcard probe name lists ==========
+;;;
+;;; KPROBE_MULTI attaches a whole batch in one link_create, and refuses
+;;; the entire batch with ESRCH if a single name appears twice — however
+;;; attachable every name in it is. The kernel lists a name twice when
+;;; two functions share it (ext4_update_super on this host), so a
+;;; wildcard that happens to span one used to fail for a reason that had
+;;; nothing to do with the functions the user asked for.
+
+(test dedup-names-keeps-the-first-of-each
+  (is (equal '("a" "b" "c")
+             (whistler/bpftrace::dedup-names '("a" "b" "a" "c" "b" "a")))
+      "wanted first occurrences in order")
+  (is (null (whistler/bpftrace::dedup-names '()))
+      "an empty list has nothing to dedup"))
+
+(test the-attachable-function-list-carries-no-repeats
+  (let ((names (whistler/bpftrace::attachable-funcs)))
+    (if (null names)
+        (pass "no readable kernel symbol source on this host")
+        (let ((counts (make-hash-table :test 'equal))
+              (repeated '()))
+          (dolist (name names) (incf (gethash name counts 0)))
+          (maphash (lambda (name n) (when (> n 1) (push name repeated))) counts)
+          (is (null repeated)
+              "~D name~:P appear more than once, e.g. ~{~A ~}"
+              (length repeated)
+              (subseq repeated 0 (min 5 (length repeated))))))))
+
+(test a-wildcard-match-carries-no-repeats
+  ;; `*' alone spans every name the kernel reports, so it catches a
+  ;; duplicate anywhere in the table rather than only in one subsystem.
+  (dolist (pattern '("*" "ext4_*" "tcp_*" "vfs_*"))
+    (let* ((matches (whistler/bpftrace::kallsyms-functions-matching pattern))
+           (distinct (let ((seen (make-hash-table :test 'equal)))
+                       (dolist (m matches) (setf (gethash m seen) t))
+                       (hash-table-count seen))))
+      (is (= distinct (length matches))
+          "kprobe:~A matched ~D names but only ~D distinct ones"
+          pattern (length matches) distinct))))
+
+;;; /proc/kallsyms separates a symbol from its owning module with a TAB,
+;;; not a space, so a parser that splits on a space alone hands back
+;;; "nft_masq_dump<TAB>[nft_masq]" as the function's name. No attach can
+;;; resolve that, which silently cost every module function: before this
+;;; was fixed, kprobe:nft_* matched 469 names and attached to none of
+;;; them. Names must come back bare.
+
+(test kernel-function-names-carry-no-module-suffix
+  (let ((names (whistler/bpftrace::attachable-funcs)))
+    (if (null names)
+        (pass "no readable kernel symbol source on this host")
+        (let ((tabbed (remove-if-not (lambda (n) (find #\Tab n)) names))
+              (bracketed (remove-if-not (lambda (n) (find #\[ n)) names)))
+          (is (null tabbed)
+              "~D name~:P kept a tab-separated module suffix, e.g. ~S"
+              (length tabbed) (first tabbed))
+          (is (null bracketed)
+              "~D name~:P kept a [module] suffix, e.g. ~S"
+              (length bracketed) (first bracketed))
+          (is (null (remove-if-not (lambda (n) (find #\Space n)) names))
+              "a kernel function name cannot contain a space")))))
