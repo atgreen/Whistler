@@ -280,3 +280,60 @@
                                 (setf bf 1))))
                           (return bf))")))
     (is (= 1 (interpret-scalar-bpf bytes '())))))
+
+;;; ========== fuse-mov-alu-mov must not orphan rX (whistler-jt8) ==========
+;;;
+;;; The pass rewrites
+;;;     mov rX, rY ; alu rX, rZ ; mov rY, rX
+;;; to a single `alu rY, rZ', which stops writing rX altogether. That is
+;;; only sound while nothing downstream still reads rX — otherwise the
+;;; read sees whatever rX held before the pattern, and the ALU result it
+;;; expected is simply gone. The pass checked jump targets but never
+;;; asked this, so a fall-through reader was miscompiled silently.
+;;;
+;;; These build instructions directly rather than compiling source: the
+;;; emitter does not currently produce a shape where rX outlives the
+;;; pattern, which is exactly why the hole went unnoticed. Note that the
+;;; passes rewrite in place, so each case needs its own instructions.
+
+(defun peephole-insn (code dst src &optional (imm 0))
+  (whistler/bpf::insn code dst src 0 imm))
+
+(defun mov-alu-mov-pattern ()
+  "mov64 r1, r2 ; add64 r1, r3 ; mov64 r2, r1 — the fusable shape."
+  (list (peephole-insn #xbf 1 2)
+        (peephole-insn #x0f 1 3)
+        (peephole-insn #xbf 2 1)))
+
+(defun fuses-p (tail)
+  "Does fuse-mov-alu-mov rewrite the pattern when TAIL follows it?"
+  (let ((insns (append (mov-alu-mov-pattern) tail)))
+    (< (length (whistler/ir::peephole-fuse-mov-alu-mov insns))
+       (length insns))))
+
+(test fuse-mov-alu-mov-still-fires-when-rx-is-dead
+  ;; Guarding the pass must not disable it: rX overwritten before any
+  ;; read is the case the fusion exists for.
+  (is (fuses-p (list (peephole-insn #xb7 1 0 99)   ; mov64 r1, 99 — kills rX
+                     (peephole-insn #x95 0 0)))
+      "the pattern should still fuse when rX is overwritten afterwards"))
+
+(test fuse-mov-alu-mov-spares-a-later-reader-of-rx
+  (is (not (fuses-p (list (peephole-insn #xbf 4 1)  ; mov64 r4, r1 — reads rX
+                          (peephole-insn #x95 0 0))))
+      "fusing here drops the definition of r1 that the next insn reads")
+  (is (not (fuses-p (list (peephole-insn #x7b 10 1) ; stx [r10+0], r1 — reads rX
+                          (peephole-insn #x95 0 0))))
+      "a store reading rX keeps it live just as a mov does"))
+
+(test fuse-mov-alu-mov-is-conservative-around-control-flow
+  ;; Nothing past a branch, a call, or an exit is this block's to judge,
+  ;; so rX must be treated as live rather than guessed at.
+  (is (not (fuses-p (list (peephole-insn #x05 0 0)   ; ja
+                          (peephole-insn #x95 0 0))))
+      "rX cannot be proven dead across an unconditional jump")
+  (is (not (fuses-p (list (peephole-insn #x85 0 0)   ; call
+                          (peephole-insn #x95 0 0))))
+      "a call reads R1-R5 as arguments, so rX=r1 is live into it")
+  (is (not (fuses-p (list (peephole-insn #x95 0 0))))
+      "rX cannot be proven dead when the block just exits"))

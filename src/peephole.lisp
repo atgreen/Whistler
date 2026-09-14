@@ -164,6 +164,34 @@
       ;; Everything else writes dst
       (t (= (whistler/bpf:bpf-insn-dst insn) reg)))))
 
+(defun reg-dead-after-p (vec start reg targets)
+  "Is REG dead from index START onward, judging only straight-line code?
+
+   A pass that stops writing REG has to know nobody downstream still
+   reads it. Answering that properly needs BPF-level liveness; this
+   answers the safe half of the question instead. Anything that leaves
+   the straight line — a jump, a call, an exit, or an index some other
+   instruction can jump to — ends the scan with REG reported live, since
+   what happens beyond it is not this block's to know. REG is dead only
+   when an instruction plainly overwrites it before anything reads it.
+
+   A call is checked before the read test on purpose: it reads R1-R5 as
+   arguments, but INSN-READS-REG does not model that, so leaving it to
+   the read test would call an argument register dead."
+  (loop for j from start below (length vec)
+        for insn = (aref vec j)
+        do (cond
+             ((or (gethash j targets)
+                  (bpf-unconditional-jmp-p insn)
+                  (bpf-conditional-jmp-p insn)
+                  (= (whistler/bpf:bpf-insn-code insn) #x85)
+                  (bpf-exit-p insn))
+              (return nil))
+             ((insn-reads-reg insn reg) (return nil))
+             ((insn-writes-reg insn reg) (return t)))
+        ;; Ran off the end without an exit: malformed, so assume live.
+        finally (return nil)))
+
 (defun peephole-forward-mov-chain (insns)
   "Forward register copies through adjacent instructions.
    mov rA, rB; <next using rA as src> → substitute rB for rA in <next>,
@@ -827,7 +855,14 @@
                     ;; For reg ALU: rZ (src of ALU) must not be rY
                     (or (bpf-alu64-imm-p b)
                         (/= (whistler/bpf:bpf-insn-src b)
-                            (whistler/bpf:bpf-insn-src a))))
+                            (whistler/bpf:bpf-insn-src a)))
+                    ;; Fusing stops writing rX altogether — the ALU result
+                    ;; lands in rY instead. Anything downstream still
+                    ;; reading rX would see whatever it held before the
+                    ;; pattern, so fuse only when rX is provably dead.
+                    (reg-dead-after-p vec (+ i 3)
+                                      (whistler/bpf:bpf-insn-dst a)
+                                      targets))
           do ;; Fuse: change alu to operate on rY directly, delete mov's.
              ;; When the ALU's src is rX itself (alu rX, rX — both operands
              ;; the same copied value), rewrite the src to rY too: rX no
