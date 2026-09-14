@@ -80,8 +80,44 @@
 
 ;;; ========== End-to-end lookup ==========
 
+;;; Pick the probe address out of libc's own symbol table rather than
+;;; guessing a fixed offset: a fixed offset lands wherever the current
+;;; libc build happens to put things, so it can fall in a gap between
+;;; functions and fail for reasons that say nothing about the
+;;; symbolizer.
+(defun libc-probe-point (symb libc)
+  "Choose a FUNC symbol from LIBC's parsed table that sits wholly
+   inside the mapped executable segment and neither shares a start
+   address nor overlaps ranges with its neighbours, so exactly one
+   name is the right answer. Returns (values RUNTIME-ADDRESS NAME),
+   or NIL when the table offers no usable candidate."
+  (let* ((elf  (whistler/symbolize::cached-elf
+                symb (whistler/symbolize:mapping-path libc)))
+         (syms (and elf (whistler/symbolize::elf-info-symbols elf)))
+         (seg-start (whistler/symbolize:mapping-start libc))
+         (seg-end   (whistler/symbolize:mapping-end libc))
+         ;; A recorded vaddr becomes a runtime address by undoing the
+         ;; segment's file offset, the inverse of what SYMBOLIZE does.
+         (base (- seg-start (whistler/symbolize:mapping-offset libc))))
+    (when syms
+      (loop with n = (length syms)
+            for i from 0 below n
+            for e = (aref syms i)
+            for prev = (and (plusp i) (aref syms (1- i)))
+            for next = (and (< (1+ i) n) (aref syms (1+ i)))
+            for size = (aref e 1)
+            for start = (+ base (aref e 0))
+            when (and (>= size 2)
+                      (>= start seg-start)
+                      (<= (+ start size) seg-end)
+                      (or (null prev)
+                          (<= (+ (aref prev 0) (aref prev 1)) (aref e 0)))
+                      (or (null next)
+                          (<= (+ (aref e 0) size) (aref next 0))))
+              do (return (values (+ start (floor size 2)) (aref e 2)))))))
+
 (test symbolize-libc-address
-  "An address inside libc's r-xp segment resolves to a libc function."
+  "An address inside a known libc function resolves back to that function."
   (let* ((symb (whistler/symbolize:open-symbolizer))
          (pid  (sb-posix:getpid)))
     (whistler/symbolize:snapshot-pid symb pid)
@@ -90,12 +126,18 @@
                             (search "libc.so" (whistler/symbolize:mapping-path m)))
                           (coerce (car data) 'list))))
       (when libc
-        (let* ((addr (+ (whistler/symbolize:mapping-start libc) #x80000))
-               (sym  (whistler/symbolize:symbolize symb pid addr)))
-          (is (not (null (whistler/symbolize:sym-name sym)))
-              "lookup inside libc resolves to a name")
-          (is (search "libc.so" (whistler/symbolize:sym-file sym))
-              "file is libc"))))
+        (multiple-value-bind (addr name) (libc-probe-point symb libc)
+          (cond
+            ((null addr)
+             (pass "libc exposes no usable FUNC symbols on this host"))
+            (t
+             (let ((sym (whistler/symbolize:symbolize symb pid addr)))
+               (is (not (null (whistler/symbolize:sym-name sym)))
+                   "lookup inside libc resolves to a name")
+               (is (equal name (whistler/symbolize:sym-name sym))
+                   "the name is the function the probe address came from")
+               (is (search "libc.so" (whistler/symbolize:sym-file sym))
+                   "file is libc")))))))
     (whistler/symbolize:close-symbolizer symb)))
 
 ;;; ========== DWARF .debug_line ==========
