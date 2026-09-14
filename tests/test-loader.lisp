@@ -228,3 +228,183 @@
                    "wanted one program section, got ~D"
                    (length (whistler/loader::bpf-elf-prog-sections elf)))))
         (when (probe-file object-path) (delete-file object-path))))))
+
+;;; ========== Attach-type constants ==========
+;;;
+;;; A wrong attach-type constant is the quietest bug the loader can carry.
+;;; BPF_PROG_TYPE_KPROBE has no expected_attach_type check, so prog-load
+;;; accepts any value and stores it; the mistake only surfaces much later,
+;;; as an EINVAL out of link_create with nothing in dmesg. Whistler shipped
+;;; BPF_TRACE_KPROBE_MULTI as 47 (BPF_TCX_EGRESS) and four cgroup bind
+;;; types off by the same kind of miscount, so pin the values down here.
+;;;
+;;; Two independent checks: the kernel's own header, and the kernel itself.
+
+(defun uapi-bpf-header ()
+  (find-if #'probe-file '(#p"/usr/include/linux/bpf.h")))
+
+(defun enum-constant-values (path enum-name)
+  "Parse `enum ENUM-NAME' out of the C header at PATH, returning a hash
+   table of name → value. Handles both explicit initialisers and aliases
+   (`BPF_PROG_RUN = BPF_PROG_TEST_RUN'), which take a neighbour's value
+   without consuming one of their own."
+  (let ((values (make-hash-table :test 'equal))
+        (header (format nil "enum ~A {" enum-name))
+        (next 0)
+        (inside nil))
+    (with-open-file (in path :direction :input :external-format :latin-1)
+      (loop for line = (read-line in nil nil)
+            while line
+            for trimmed = (string-trim '(#\Space #\Tab #\Return) line)
+            do (cond
+                 ((not inside)
+                  (when (eql 0 (search header trimmed)) (setf inside t)))
+                 ((eql 0 (search "};" trimmed)) (return))
+                 ((eql 0 (search "BPF_" trimmed))
+                  (let* ((body (string-right-trim '(#\,) trimmed))
+                         (eq-pos (position #\= body))
+                         (name (string-trim '(#\Space #\Tab)
+                                            (subseq body 0 (or eq-pos (length body)))))
+                         (init (and eq-pos
+                                    (string-trim '(#\Space #\Tab)
+                                                 (subseq body (1+ eq-pos))))))
+                    (cond
+                      ;; Alias: borrows a value, does not advance the counter.
+                      ((and init (alpha-char-p (char init 0)))
+                       (setf (gethash name values) (gethash init values)))
+                      (t
+                       (when init
+                         (setf next (parse-integer init :junk-allowed t)))
+                       (setf (gethash name values) next)
+                       (incf next))))))))
+    values))
+
+(test attach-type-constants-match-the-kernel-header
+  (let ((header (uapi-bpf-header)))
+    (if (null header)
+        (pass "no /usr/include/linux/bpf.h on this host to check against")
+        (let ((attach (enum-constant-values header "bpf_attach_type"))
+              (prog   (enum-constant-values header "bpf_prog_type")))
+          (loop for (name . value)
+                  in (list (cons "BPF_TRACE_KPROBE_MULTI"
+                                 whistler/loader::+bpf-trace-kprobe-multi+)
+                           (cons "BPF_CGROUP_INET4_BIND"
+                                 whistler/loader::+bpf-cgroup-inet4-bind+)
+                           (cons "BPF_CGROUP_INET6_BIND"
+                                 whistler/loader::+bpf-cgroup-inet6-bind+)
+                           (cons "BPF_CGROUP_INET4_POST_BIND"
+                                 whistler/loader::+bpf-cgroup-inet4-post-bind+)
+                           (cons "BPF_CGROUP_INET6_POST_BIND"
+                                 whistler/loader::+bpf-cgroup-inet6-post-bind+)
+                           (cons "BPF_CGROUP_INET4_CONNECT"
+                                 whistler/loader::+bpf-cgroup-inet4-connect+)
+                           (cons "BPF_CGROUP_INET6_CONNECT"
+                                 whistler/loader::+bpf-cgroup-inet6-connect+)
+                           (cons "BPF_CGROUP_UDP4_SENDMSG"
+                                 whistler/loader::+bpf-cgroup-udp4-sendmsg+)
+                           (cons "BPF_CGROUP_UDP6_SENDMSG"
+                                 whistler/loader::+bpf-cgroup-udp6-sendmsg+)
+                           (cons "BPF_CGROUP_INET_SOCK_CREATE"
+                                 whistler/loader::+bpf-cgroup-inet-sock-create+)
+                           (cons "BPF_CGROUP_INET_SOCK_RELEASE"
+                                 whistler/loader::+bpf-cgroup-inet-sock-release+)
+                           (cons "BPF_CGROUP_INET_INGRESS"
+                                 whistler/loader::+bpf-cgroup-inet-ingress+)
+                           (cons "BPF_CGROUP_INET_EGRESS"
+                                 whistler/loader::+bpf-cgroup-inet-egress+)
+                           (cons "BPF_TRACE_FENTRY"
+                                 whistler/loader::+bpf-trace-fentry+)
+                           (cons "BPF_TRACE_FEXIT"
+                                 whistler/loader::+bpf-trace-fexit+)
+                           (cons "BPF_SK_LOOKUP"
+                                 whistler/loader::+bpf-sk-lookup+)
+                           (cons "BPF_PERF_EVENT"
+                                 whistler/loader::+bpf-perf-event+)
+                           (cons "BPF_LSM_MAC"
+                                 whistler/loader::+bpf-lsm-mac+))
+                for expected = (gethash name attach)
+                do (is (eql expected value)
+                       "~A is ~D in the kernel header, ~D in the loader"
+                       name expected value))
+          (loop for (name . value)
+                  in (list (cons "BPF_PROG_TYPE_KPROBE"
+                                 whistler/loader::+bpf-prog-type-kprobe+)
+                           (cons "BPF_PROG_TYPE_CGROUP_SOCK"
+                                 whistler/loader::+bpf-prog-type-cgroup-sock+)
+                           (cons "BPF_PROG_TYPE_CGROUP_SOCK_ADDR"
+                                 whistler/loader::+bpf-prog-type-cgroup-sock-addr+)
+                           (cons "BPF_PROG_TYPE_CGROUP_SKB"
+                                 whistler/loader::+bpf-prog-type-cgroup-skb+)
+                           (cons "BPF_PROG_TYPE_TRACING"
+                                 whistler/loader::+bpf-prog-type-tracing+)
+                           (cons "BPF_PROG_TYPE_LSM"
+                                 whistler/loader::+bpf-prog-type-lsm+)
+                           (cons "BPF_PROG_TYPE_SK_LOOKUP"
+                                 whistler/loader::+bpf-prog-type-sk-lookup+)
+                           (cons "BPF_PROG_TYPE_XDP"
+                                 whistler/loader::+bpf-prog-type-xdp+))
+                for expected = (gethash name prog)
+                do (is (eql expected value)
+                       "~A is ~D in the kernel header, ~D in the loader"
+                       name expected value))))))
+
+;;; The header check above catches a miscount, but only the kernel can say
+;;; whether a (prog_type, expected_attach_type) pair is one it will accept.
+;;; Every cgroup section the loader maps must load; a wrong attach type for
+;;; these program types is refused outright, which is how the four bind
+;;; constants were found.
+
+(defparameter *trivial-allow-program*
+  (coerce #(#xb7 0 0 0 1 0 0 0    ; mov64 r0, 1
+            #x95 0 0 0 0 0 0 0)   ; exit
+          '(vector (unsigned-byte 8))))
+
+(defun cgroup-section-loads-p (section)
+  "Load a trivial program under SECTION's prog type and expected attach
+   type. Returns T when the kernel accepts the pair."
+  (let ((prog-type (whistler/loader::section-to-prog-type section))
+        (attach-type (whistler/loader::section-to-expected-attach-type section)))
+    (handler-case
+        (let ((fd (whistler/loader::load-program
+                   *trivial-allow-program* prog-type "GPL"
+                   :expected-attach-type attach-type)))
+          (sb-posix:close fd)
+          t)
+      (error () nil))))
+
+(test every-cgroup-section-loads-with-the-attach-type-the-loader-picks
+  (if (not (has-cap-bpf-p))
+      (pass "no CAP_BPF on this host: cannot ask the kernel to judge the pairs")
+      (dolist (section '("cgroup/sock_create" "cgroup/sock_release"
+                         "cgroup/post_bind4" "cgroup/post_bind6"
+                         "cgroup/bind4" "cgroup/bind6"
+                         "cgroup/connect4" "cgroup/connect6"
+                         "cgroup/sendmsg4" "cgroup/sendmsg6"
+                         "cgroup_skb/ingress" "cgroup_skb/egress"))
+        (is (cgroup-section-loads-p section)
+            "the kernel refused ~A with expected_attach_type ~D"
+            section
+            (whistler/loader::section-to-expected-attach-type section)))))
+
+(test kprobe-multi-attaches-with-one-link-create
+  ;; A KPROBE program loads with any expected_attach_type at all, so the
+  ;; attach is the only thing that can tell a right constant from a wrong
+  ;; one. vfs_read and vfs_write are ftrace-attachable on any normal kernel.
+  (if (not (has-cap-tracing-p))
+      (pass "no CAP_BPF/CAP_PERFMON on this host: cannot attach a kprobe")
+      (let ((fd (whistler/loader::load-program
+                 *trivial-allow-program*
+                 whistler/loader::+bpf-prog-type-kprobe+ "GPL"
+                 :expected-attach-type
+                 whistler/loader::+bpf-trace-kprobe-multi+)))
+        (unwind-protect
+             (let ((attachment
+                     (handler-case
+                         (whistler/loader:attach-kprobe-multi
+                          fd '("vfs_read" "vfs_write"))
+                       (error (e) e))))
+               (is (not (typep attachment 'error))
+                   "KPROBE_MULTI link create was refused: ~a" attachment)
+               (unless (typep attachment 'error)
+                 (whistler/loader:detach attachment)))
+          (sb-posix:close fd)))))

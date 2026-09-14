@@ -71,8 +71,12 @@
 (defconstant +bpf-trace-fexit+  25)
 
 ;; Multi-kprobe: a single program attached to N functions in one
-;; BPF_LINK_CREATE call. Kernel ≥ 5.18.
-(defconstant +bpf-trace-kprobe-multi+ 47)
+;; BPF_LINK_CREATE call. Kernel ≥ 5.18. The value is the kernel's
+;; BPF_TRACE_KPROBE_MULTI; link_create() dispatches a KPROBE program to
+;; the multi-attach path on this value alone, and prog-load will not
+;; catch a wrong one — BPF_PROG_TYPE_KPROBE has no expected_attach_type
+;; check, so the kernel stores whatever we send.
+(defconstant +bpf-trace-kprobe-multi+ 42)
 (defconstant +bpf-f-kprobe-multi-return+ 1)
 (defconstant +bpf-prog-type-lsm+ 29)
 (defconstant +bpf-prog-type-syscall+ 31)
@@ -99,10 +103,10 @@
 (defconstant +bpf-cgroup-inet-ingress+ 0)
 (defconstant +bpf-cgroup-inet-egress+ 1)
 (defconstant +bpf-cgroup-inet-sock-create+ 2)
-(defconstant +bpf-cgroup-inet4-bind+ 4)
-(defconstant +bpf-cgroup-inet6-bind+ 5)
-(defconstant +bpf-cgroup-inet4-post-bind+ 6)
-(defconstant +bpf-cgroup-inet6-post-bind+ 7)
+(defconstant +bpf-cgroup-inet4-bind+ 8)
+(defconstant +bpf-cgroup-inet6-bind+ 9)
+(defconstant +bpf-cgroup-inet4-post-bind+ 12)
+(defconstant +bpf-cgroup-inet6-post-bind+ 13)
 (defconstant +bpf-cgroup-inet4-connect+ 10)
 (defconstant +bpf-cgroup-inet6-connect+ 11)
 (defconstant +bpf-cgroup-udp4-sendmsg+ 14)
