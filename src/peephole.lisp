@@ -912,34 +912,21 @@
                     ;; alu rB, rA: c.dst=rB, c.src=rA (c.dst==b.dst, c.src==a.dst)
                     (= (whistler/bpf:bpf-insn-dst c) (whistler/bpf:bpf-insn-dst b))
                     (= (whistler/bpf:bpf-insn-src c) (whistler/bpf:bpf-insn-dst a)))
-          do (let ((ra (whistler/bpf:bpf-insn-dst a))
-                   (rc (whistler/bpf:bpf-insn-src b))
-                   (ra-dead t)
-                   (rc-dead t))
-               ;; Check if rA and rC are dead after i+2
-               (loop for j from (+ i 3) below (min (+ i 19) len)
-                     for insn = (aref vec j)
-                     do ;; Check reads first
-                        (when (bpf-reg-read-p insn ra)
-                          (setf ra-dead nil))
-                        (when (bpf-reg-read-p insn rc)
-                          (setf rc-dead nil))
-                        (when (or (not ra-dead) (not rc-dead))
-                          (return))
-                        ;; Path-ending: exit reads r0, goto/exit end the path
-                        (when (or (bpf-exit-p insn)
-                                  (bpf-unconditional-jmp-p insn))
-                          ;; Path ends — unread registers are dead here
-                          (return))
-                        ;; Conditional jump: conservative for branch target
-                        (when (bpf-conditional-jmp-p insn)
-                          (setf ra-dead nil rc-dead nil)
-                          (return))
-                        ;; Track redefinitions
-                        (when (bpf-reg-written-p insn ra)
-                          (setf ra-dead t))
-                        (when (bpf-reg-written-p insn rc)
-                          (setf rc-dead t)))
+          do (let* ((ra (whistler/bpf:bpf-insn-dst a))
+                    (rc (whistler/bpf:bpf-insn-src b))
+                    ;; The rewrite clobbers rC, so both rA and rC have to
+                    ;; be dead past the pattern. This used to be judged by
+                    ;; a scan that read an unconditional jump as "the path
+                    ;; ends here, so anything unread is dead" — which is
+                    ;; how a loop got miscompiled (whistler-c4s): the jump
+                    ;; ending a loop body is a *back edge*, and the code it
+                    ;; returns to reads rC again on the next turn. It also
+                    ;; gave up after 16 instructions and called the
+                    ;; registers dead, and never asked whether some other
+                    ;; branch lands in the middle of the range it scanned.
+                    (ra-dead (reg-dead-after-p vec (+ i 3) ra targets))
+                    (rc-dead (and ra-dead
+                                  (reg-dead-after-p vec (+ i 3) rc targets))))
                (when (and ra-dead rc-dead)
                  ;; Transform: delete insn i, change i+1 to alu rC, rB, change i+2 to mov rB, rC
                  (let ((rb (whistler/bpf:bpf-insn-src a)))

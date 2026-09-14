@@ -337,3 +337,80 @@
       "a call reads R1-R5 as arguments, so rX=r1 is live into it")
   (is (not (fuses-p (list (peephole-insn #x95 0 0))))
       "rX cannot be proven dead when the block just exits"))
+
+;;; ========== fold-swap-add vs the back edge (whistler-c4s) ==========
+;;;
+;;; The fold clobbers rC, so it needs rA and rC dead past the pattern.
+;;; It used to decide that with a scan that read an unconditional jump as
+;;; "the path ends here, so anything unread is dead". The jump closing a
+;;; loop body is a back edge: the code it returns to reads those
+;;; registers again on the next turn. A loop-invariant constant
+;;; materialised in the preheader was therefore destroyed by the first
+;;; iteration, and every later one computed from the wreckage. The scan
+;;; also gave up after 16 instructions and called the registers dead, and
+;;; never asked whether another branch lands inside the range it read.
+
+(test loop-invariant-survives-the-back-edge
+  "A constant set before the loop must still be that constant on every
+   turn. This returned 4C-3x instead of 3C-2x; the loop did the work of
+   2^(n-1) turns rather than n."
+  (let* ((x 1895525382)
+         (c 467281060)
+         (bytes (w-body "(let ((x3 (get-prandom-u32)))
+                           (declare (type u64 x3))
+                           (let ((acc x3))
+                             (declare (type u64 acc))
+                             (dotimes (i 3)
+                               (setf acc (- 467281060 (- x3 acc))))
+                             (return acc)))")))
+    (is (= (ldb (byte 64 0)
+                (let ((acc x))
+                  (dotimes (turn 3 acc)
+                    (setf acc (- c (- x acc))))))
+           (interpret-scalar-bpf bytes (list x))))))
+
+(test loop-invariant-survives-longer-loops
+  "The error compounded with the trip count, so check more than one."
+  (dolist (turns '(1 2 3 4 5))
+    (let* ((x 1895525382)
+           (c 467281060)
+           (bytes (compile-insn-bytes
+                   `((let ((x3 (get-prandom-u32)))
+                       (declare (type u64 x3))
+                       (let ((acc x3))
+                         (declare (type u64 acc))
+                         (dotimes (i ,turns)
+                           (setf acc (- 467281060 (- x3 acc))))
+                         (return acc)))))))
+      (is (= (ldb (byte 64 0)
+                  (let ((acc x))
+                    (dotimes (turn turns acc)
+                      (setf acc (- c (- x acc))))))
+             (interpret-scalar-bpf bytes (list x)))
+          "~D-turn loop computed the wrong value" turns))))
+
+(defun swap-add-pattern ()
+  "mov64 r1, r2 ; mov64 r2, r3 ; add64 r2, r1 — rA=r1, rB=r2, rC=r3."
+  (list (peephole-insn #xbf 1 2)
+        (peephole-insn #xbf 2 3)
+        (peephole-insn #x0f 2 1)))
+
+(defun folds-p (tail)
+  (let ((insns (append (swap-add-pattern) tail)))
+    (< (length (whistler/ir::peephole-fold-swap-add insns))
+       (length insns))))
+
+(test fold-swap-add-still-fires-when-both-are-dead
+  (is (folds-p (list (peephole-insn #xb7 1 0)    ; kills rA
+                     (peephole-insn #xb7 3 0)    ; kills rC
+                     (peephole-insn #x95 0 0)))
+      "the fold should still happen when rA and rC are both overwritten"))
+
+(test fold-swap-add-refuses-across-a-jump
+  (is (not (folds-p (list (peephole-insn #x05 0 0)   ; ja — may be a back edge
+                          (peephole-insn #x95 0 0))))
+      "a jump is not proof the registers are dead; it may re-enter a loop")
+  (is (not (folds-p (list (peephole-insn #xb7 1 0)   ; kills rA only
+                          (peephole-insn #xbf 4 3)   ; reads rC
+                          (peephole-insn #x95 0 0))))
+      "rC is read afterwards, and the fold clobbers it"))

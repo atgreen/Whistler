@@ -230,7 +230,13 @@
   (let ((regs (make-array 11 :initial-element 0))
         (stack (make-hash-table))
         (n (/ (length bytes) 8))
-        (results call-results))
+        (results call-results)
+        ;; A miscompiled back edge can loop forever. The verifier would
+        ;; refuse such a program, but this interpreter is the oracle that
+        ;; runs *before* the kernel ever sees it, so it needs its own
+        ;; stop: fail the case instead of hanging the suite.
+        (steps 0)
+        (step-budget (* 1000 (max 1 (/ (length bytes) 8)))))
     (flet ((u64 (x) (ldb (byte 64 0) x))
            (u32 (x) (ldb (byte 32 0) x))
            (rr (i) (let ((v (aref regs i)))
@@ -239,7 +245,10 @@
                      v)))
       (loop with pc = 0
             while (< pc n)
-            do (let* ((op (nth-insn-opcode bytes pc))
+            do (when (> (incf steps) step-budget)
+                 (error "interpret-scalar-bpf: exceeded ~D steps — non-terminating program"
+                        step-budget))
+               (let* ((op (nth-insn-opcode bytes pc))
                       (dst (logand (nth-insn-regs bytes pc) #x0f))
                       (src (ash (nth-insn-regs bytes pc) -4))
                       (off (nth-insn-off bytes pc))
@@ -280,6 +289,8 @@
                           (or (gethash (+ (rr src) off) stack) 0)))
                    ((= op #x7b)          ; stx dw
                     (setf (gethash (+ (rr dst) off) stack) (rr src)))
+                   ((= op #x7a)          ; st dw, imm sign-extended to 64
+                    (setf (gethash (+ (rr dst) off) stack) (u64 imm)))
                    ((= op #x05) (incf pc off))                             ; ja
                    ;; Conditional jumps (JMP class, reg or sign-extended imm).
                    ((and (= (logand op #x07) #x05)

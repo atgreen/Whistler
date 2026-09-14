@@ -137,3 +137,88 @@
     (is (null failures)
         (format nil "~D differential failure(s), first: case ~{~D expr=~S leaves=~S expected=~S actual=~S~}"
                 (length failures) (first (last failures))))))
+
+;;; ========== Loops (whistler-2m0.2) ==========
+;;;
+;;; Everything above is one straight line of blocks, so nothing here ever
+;;; built a back edge. A loop is a different shape: lower-dotimes opens a
+;;; phi at the header for *every* in-scope variable, live ranges span the
+;;; body, and the peephole passes meet a jump target that sits behind
+;;; them rather than ahead. Those are the parts no straight-line case can
+;;; reach.
+;;;
+;;; The generated shape is an accumulator:
+;;;
+;;;     (let ((acc <init>))
+;;;       (declare (type u64 acc))
+;;;       (dotimes (i <n>) (setf acc <step>))
+;;;       (return acc))
+;;;
+;;; <step> may read acc and the loop counter as well as the leaves, so
+;;; the value has to survive the back edge to come out right.
+
+(defun fuzz-loop-spec (leaves depth)
+  "Describe one accumulator loop: how many turns, what ACC starts at,
+   and what it becomes each turn."
+  (let ((acc (intern "ACC" '#:whistler))
+        (idx (intern "I" '#:whistler)))
+    (list :acc acc
+          :idx idx
+          :count (+ 1 (fuzz-int 4))
+          :init (gen-scalar-expr leaves depth)
+          ;; ACC and the counter join the leaves, so the body can depend
+          ;; on the previous turn — the whole point of the back edge.
+          :step (gen-scalar-expr (list* acc idx leaves) depth))))
+
+(defun loop-spec-body (spec)
+  "Render SPEC as the body forms of a defprog."
+  (destructuring-bind (&key acc idx count init step) spec
+    `((let ((,acc ,init))
+        (declare (type ,(intern "U64" '#:whistler) ,acc))
+        (dotimes (,idx ,count)
+          (setf ,acc ,step))
+        (return ,acc)))))
+
+(defun eval-loop-spec (spec env)
+  "Evaluate SPEC the obvious way, to compare the compiler against."
+  (destructuring-bind (&key acc idx count init step) spec
+    (let ((value (eval-scalar-expr init env)))
+      (dotimes (turn count value)
+        (setf value (eval-scalar-expr
+                     step
+                     (list* (cons acc value) (cons idx turn) env)))))))
+
+(defun fuzz-one-loop-case (n-leaves depth)
+  "Build one random loop program, compile it, interpret the emitted BPF,
+   and return (values ok spec leaf-values expected actual)."
+  (let* ((leaves (loop for i from 1 to n-leaves
+                       collect (intern (format nil "X~D" i) '#:whistler)))
+         (leaf-values (loop repeat n-leaves collect (fuzz-int (expt 2 32))))
+         (spec (fuzz-loop-spec leaves depth))
+         (body `((let ,(loop for l in leaves
+                             collect `(,l (,(intern "GET-PRANDOM-U32" '#:whistler))))
+                   (declare (type ,(intern "U64" '#:whistler) ,@leaves))
+                   ,@(loop-spec-body spec))))
+         (expected (eval-loop-spec spec (mapcar #'cons leaves leaf-values)))
+         (bytes (compile-insn-bytes body))
+         (actual (interpret-scalar-bpf bytes (copy-list leaf-values))))
+    (values (eql expected actual) spec leaf-values expected actual)))
+
+(test differential-loop-fuzz
+  "Random accumulator loops: the value carried across the back edge must
+   survive phi insertion, register allocation and the peephole passes."
+  (fuzz-seed 20260914)
+  (let ((failures '()))
+    (dotimes (i 120)
+      (let ((n-leaves (+ 1 (mod i 4)))
+            (depth (+ 1 (fuzz-int 3))))
+        (multiple-value-bind (ok spec leaf-values expected actual)
+            (handler-case (fuzz-one-loop-case n-leaves depth)
+              (error (e)
+                (values nil (format nil "case ~D signalled: ~A" i e)
+                        nil nil nil)))
+          (unless ok
+            (push (list i spec leaf-values expected actual) failures)))))
+    (is (null failures)
+        (format nil "~D loop differential failure(s), first: case ~{~D spec=~S leaves=~S expected=~S actual=~S~}"
+                (length failures) (first (last failures))))))
