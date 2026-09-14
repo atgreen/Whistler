@@ -1033,33 +1033,16 @@
                     ;; rA != ALU dst (rC) — mov target is only used as src
                     (/= (whistler/bpf:bpf-insn-dst mov)
                         (whistler/bpf:bpf-insn-dst alu)))
-          do (let ((ra (whistler/bpf:bpf-insn-dst mov))
-                   (rb (whistler/bpf:bpf-insn-src mov))
-                   (dead t))
-               ;; Check if rA is dead after the ALU instruction
-               (loop for j from (+ i 2) below (min (+ i 18) len)
-                     for insn = (aref vec j)
-                     do (cond
-                          ;; Another predecessor can reach this point without
-                          ;; executing the copy, so the rewrite isn't local.
-                          ((gethash j targets)
-                           (setf dead nil)
-                           (return))
-                          ;; rA is read → not dead
-                          ((bpf-reg-read-p insn ra)
-                           (setf dead nil)
-                           (return))
-                          ;; rA is redefined → dead
-                          ((bpf-reg-written-p insn ra)
-                           (return))
-                          ;; Unconditional jump or exit ends the path — rA is dead
-                          ((or (bpf-unconditional-jmp-p insn)
-                               (bpf-exit-p insn))
-                           (return))
-                          ;; Conditional jump: conservative
-                          ((bpf-conditional-jmp-p insn)
-                           (setf dead nil)
-                           (return))))
+          do (let* ((ra (whistler/bpf:bpf-insn-dst mov))
+                    (rb (whistler/bpf:bpf-insn-src mov))
+                    ;; Deleting the copy leaves rA unwritten, so it has to
+                    ;; be dead past the pattern. The scan this replaces
+                    ;; gave up after 18 instructions and called rA dead,
+                    ;; and read an unconditional jump as the end of the
+                    ;; path — but the jump closing a loop body is a back
+                    ;; edge, and the code it returns to reads rA again on
+                    ;; the next turn (whistler-4gu).
+                    (dead (reg-dead-after-p vec (+ i 2) ra targets)))
                (when dead
                  ;; Replace ALU src with rB, delete the mov
                  (setf (whistler/bpf:bpf-insn-src alu) rb)

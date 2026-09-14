@@ -548,3 +548,37 @@
   (is (= 0 (interpret-scalar-bpf
             (compile-insn-bytes '((return (logand (logand 5 7) 8)))) '()))
       "bit 3 is not set in 5, so masking it leaves nothing"))
+
+;;; ========== eliminate-copy-for-alu needs rA dead (whistler-4gu) ==========
+;;;
+;;; The fourth pass to make the same mistake. It rewrites
+;;; `mov rA, rB; alu rC, rA' to `alu rC, rB' and deletes the copy, which
+;;; leaves rA unwritten — so rA has to be dead past the pattern. The
+;;; scan gave up after 18 instructions and called rA dead, and read an
+;;; unconditional jump as the end of the path.
+
+(defun copy-for-alu-folds-p (tail)
+  (let ((insns (append (list (peephole-insn #xbf 1 2)    ; mov64 r1, r2
+                             (peephole-insn #x0f 3 1))   ; add64 r3, r1
+                       tail)))
+    (< (length (whistler/ir::peephole-eliminate-copy-for-alu insns))
+       (length insns))))
+
+(test eliminate-copy-for-alu-still-fires-when-the-copy-is-dead
+  (is (copy-for-alu-folds-p (list (peephole-insn #xb7 1 0)   ; kills rA
+                                  (peephole-insn #x95 0 0)))
+      "the copy should still be removed when rA is overwritten afterwards"))
+
+(test eliminate-copy-for-alu-keeps-a-copy-its-source-outlives
+  (is (not (copy-for-alu-folds-p (list (peephole-insn #xbf 4 1)   ; reads rA
+                                       (peephole-insn #x95 0 0))))
+      "rA is read immediately after")
+  (is (not (copy-for-alu-folds-p (list (peephole-insn #x05 0 0)   ; ja
+                                       (peephole-insn #xbf 4 1)
+                                       (peephole-insn #x95 0 0))))
+      "a jump may be a back edge returning to code that reads rA")
+  (is (not (copy-for-alu-folds-p
+            (append (loop repeat 18 collect (whistler/bpf::insn #x07 5 0 0 1))
+                    (list (peephole-insn #xbf 4 1)
+                          (peephole-insn #x95 0 0)))))
+      "a read past the old 18-instruction horizon still counts"))
