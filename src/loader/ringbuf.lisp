@@ -19,7 +19,7 @@
 
 (defstruct ring-consumer
   map-fd ring-size mmap-ptr consumer-ptr producer-ptr data-ptr
-  epoll-fd callback)
+  epoll-fd callback closed)
 
 (defun page-size ()
   4096)
@@ -85,8 +85,18 @@
           (progn ,@body)
        (close-ring-consumer ,var))))
 
+(defun check-ring-consumer-open (consumer context)
+  "Refuse CONTEXT on a closed consumer. The mmapped pages are gone and the
+   epoll fd may have been reissued, and neither a raw SAP read nor a syscall
+   on a recycled descriptor reports the mistake on its own."
+  (when (ring-consumer-closed consumer)
+    (error 'bpf-error
+           :context (format nil "~a on a closed ring consumer" context)
+           :errno 9)))  ; EBADF
+
 (defun ring-poll (consumer &key (timeout-ms 100))
   "Wait for ring buffer events, then consume them. Returns event count."
+  (check-ring-consumer-open consumer "ring-poll")
   (let ((event-buf (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)))
     (sb-sys:with-pinned-objects (event-buf)
       (let ((ret (syscall +sys-epoll-wait+
@@ -100,6 +110,7 @@
 
 (defun ring-consume (consumer)
   "Process all available events in the ring buffer. Returns event count."
+  (check-ring-consumer-open consumer "ring-consume")
   (let* ((ring-size (ring-consumer-ring-size consumer))
          (mask (1- ring-size))
          (data-ptr (ring-consumer-data-ptr consumer))
@@ -134,12 +145,27 @@
     count))
 
 (defun close-ring-consumer (consumer)
-  "Close a ring buffer consumer, unmapping memory and closing epoll."
-  (let ((pgsz (page-size))
-        (ring-size (ring-consumer-ring-size consumer)))
-    ;; Unmap consumer page (rw)
-    (sb-posix:munmap (ring-consumer-mmap-ptr consumer) pgsz)
-    ;; Unmap producer + data pages (ro)
-    (sb-posix:munmap (ring-consumer-producer-ptr consumer)
-                     (+ pgsz (* 2 ring-size))))
-  (sb-posix:close (ring-consumer-epoll-fd consumer)))
+  "Close a ring buffer consumer, unmapping memory and closing epoll.
+   Idempotent: a second close is a no-op, so it can never unmap a region
+   or close a descriptor the process has since handed to something else."
+  (unless (ring-consumer-closed consumer)
+    (let ((pgsz (page-size))
+          (ring-size (ring-consumer-ring-size consumer))
+          (rw-ptr (ring-consumer-mmap-ptr consumer))
+          (ro-ptr (ring-consumer-producer-ptr consumer))
+          (epoll-fd (ring-consumer-epoll-fd consumer)))
+      ;; Drop every handle first. Whatever the syscalls below do, this
+      ;; consumer is finished with these resources and must not name them
+      ;; again — nor let ring-poll or ring-consume read through them.
+      (setf (ring-consumer-closed consumer) t
+            (ring-consumer-mmap-ptr consumer) nil
+            (ring-consumer-consumer-ptr consumer) nil
+            (ring-consumer-producer-ptr consumer) nil
+            (ring-consumer-data-ptr consumer) nil
+            (ring-consumer-epoll-fd consumer) nil)
+      ;; Unmap consumer page (rw)
+      (sb-posix:munmap rw-ptr pgsz)
+      ;; Unmap producer + data pages (ro)
+      (sb-posix:munmap ro-ptr (+ pgsz (* 2 ring-size)))
+      (sb-posix:close epoll-fd)))
+  nil)
