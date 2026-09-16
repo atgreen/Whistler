@@ -2,6 +2,173 @@
 
 All notable user-facing changes per release. Newest first.
 
+## 1.15.0 — 2026-09-16
+
+A correctness release, and a larger one than 1.14.0. The differential
+fuzzer grew three new dimensions — counted loops, stack memory, and
+explicit casts — and each found wrong-code bugs the scalar generator
+could never have reached. Sweeping the finished harness with seeds the
+committed tests don't use found two more after the queue was already
+empty.
+
+Two features turn out never to have worked at all: multi-kprobe attach
+and the cgroup bind hooks were both sending the wrong
+`expected_attach_type`, and wildcards over module functions attached to
+nothing. If you tried any of those and gave up, try again.
+
+Every codegen fix below leaves the instruction counts of all 17 examples
+unchanged, and each ships with a regression test that fails on 1.14.0.
+
+### New Features
+
+#### Wildcard kprobes attach in a single call
+
+`kprobe:tcp_*` compiles to a `kprobe.multi/` section so the loader can
+attach every match in one `BPF_LINK_CREATE`. That never happened:
+`BPF_TRACE_KPROBE_MULTI` was defined as 47, the value of
+`BPF_TCX_EGRESS`, so `link_create()` matched no arm of its switch and
+returned `EINVAL` before the multi-attach path ran. Nothing caught it
+earlier because `BPF_PROG_TYPE_KPROBE` has no `expected_attach_type`
+check — the kernel stores whatever it is sent — so the program loaded
+cleanly and only the attach failed, falling back to one
+`perf_event_open` per function.
+
+`KPROBE_MULTI` is all-or-nothing, and `/proc/kallsyms` lists more text
+symbols than ftrace can attach to (inlined functions, `__init` and
+`__exit` code freed after boot, data parked in a text section). The
+authoritative list lives in tracefs, which is mode 0700 and so
+unreadable to a `CAP_BPF`-but-not-root process. Rather than give up the
+fast path, the sequential fallback now records which names this kernel
+refused, under
+`${XDG_CACHE_HOME:-~/.cache}/whistler/kprobe-unattachable-$(uname -r).txt`,
+and the next run skips them. On 7.2.4-200.fc44.x86_64, `kprobe:tcp_*`
+(507 candidates, 42 refused) attaches in ~1180 ms the first time and
+~84 ms thereafter. The file is keyed by kernel release and is only ever
+a hint: a stale entry costs a probe, never a wrong attach, and a batch
+that still fails falls back and relearns. Granting read access to
+tracefs (`sudo chmod -R a+rX /sys/kernel/tracing`) gets the fast path on
+the first run instead.
+
+#### cgroup bind and post-bind programs load
+
+`cgroup/bind4`, `cgroup/bind6`, `cgroup/post_bind4` and
+`cgroup/post_bind6` were loaded with attach types 4, 5, 6 and 7 — the
+values of `BPF_SK_SKB_STREAM_PARSER`, `BPF_SK_SKB_STREAM_VERDICT`,
+`BPF_CGROUP_DEVICE` and `BPF_SK_MSG_VERDICT`. Unlike kprobe program
+types, cgroup types are validated at load, so all four were rejected
+outright with `EINVAL` and could not be used at all. They now carry 8,
+9, 12 and 13, and every cgroup section the loader recognises loads.
+
+The rest of the attach-type, program-type and command constants were
+audited against the kernel headers at the same time; no others were
+wrong.
+
+#### Differential fuzzing over loops, memory and casts
+
+The 1.14.0 harness only built straight-line scalar expressions. It now
+also generates counted `dotimes` loops that accumulate across the back
+edge, programs that store into a `struct-alloc` buffer at mixed widths
+and offsets and read it back, and expressions threaded with explicit
+`(cast uN ...)`. The oracle models the stack byte by byte, so a store
+overlapping an earlier one has to win on exactly the bytes it covers,
+and the interpreter gained a step budget so a miscompiled back edge
+fails its case instead of hanging the suite. Loops found a miscompile on
+their second run; memory found three more.
+
+### Bug Fixes
+
+#### Wrong code
+
+- **A loop-invariant register was destroyed inside the loop body.**
+  `fold-swap-add` decided a register was dead by reading an
+  unconditional jump as the end of the path — but the jump closing a
+  loop body is a back edge, and the code it returns to reads that
+  register again on the next turn. A constant materialised in the
+  preheader was overwritten by the first iteration, so
+  `(dotimes (i 3) (setf acc (- C (- x acc))))` did the work of
+  2^(n-1) iterations rather than n, the error compounding with the trip
+  count.
+- **Four passes deleted register definitions that were still read.**
+  `fuse-mov-alu-mov`, `fold-stack-addr`, `eliminate-copy-for-alu` and
+  `fold-swap-add` each concluded a register was dead from a scan that
+  could not support it: bounded to 8, 16 or 18 instructions with
+  anything past the horizon assumed absent, and treating a branch as
+  proof that nothing downstream could still want the value. They now
+  share one conservative liveness scan that runs until the register
+  actually dies and refuses to reason across control flow.
+- **A mask that was not a run of low bits was dropped as redundant.**
+  `eliminate-redundant-mask` removed `and rX, MASK` whenever the
+  register's tracked width was below the mask's bit-length. That holds
+  for masks like `0xff` but not for `2`, whose bit-length is 2 yet which
+  clears bit 0 — so a register known to hold 0 or 1 kept its 1 and
+  `(logand (logand 1 1) 2)` returned 1 instead of 0.
+- **Narrow stores and loads round-tripped unmasked.** A store truncates
+  to its width and a load zero-extends, so `(store u8 p 0 x)` followed
+  by `(load u8 p 0)` yields `x AND 0xff` — but both the IR-level
+  store-to-load forwarding and the peephole replaced the load with a
+  copy of the stored register, handing back the full value. The peephole
+  never compared widths at all, so a byte store could also feed a `dw`
+  load.
+- **Load-to-load forwarding ignored access width.** Two stack loads at
+  one offset were matched on the offset alone, so a `ldxb` followed by a
+  `ldxdw` forwarded the single byte as the whole word, with no wide load
+  emitted. Its store invalidation compared offsets for equality and
+  considered only register stores, so neither an overlapping narrow
+  store nor any immediate store invalidated a pending load.
+- **Wide constant stores sign-extended into bytes they did not own.**
+  BPF's store-immediate carries 32 bits that the CPU sign-extends to the
+  access width. `merge-zero-stores` folded a zero-init and a `u32`
+  constant into one `dw` store, and the emitter chose the immediate form
+  for `u64` stores, so any constant with bit 31 set filled the four
+  bytes above it with ones: `(store u64 buf 16 3198590608)` read back as
+  `… 190 255 255 255 255`.
+- **Constant folding used signed semantics for unsigned operations.**
+  `>>` is a logical shift, `/` is unsigned, and the ordering comparisons
+  compile to the unsigned BPF jumps, but all were folded with Lisp
+  semantics on a possibly-negative intermediate. `(>> (- 0 3) 18)`
+  folded to all-ones instead of `70368744177663`, and
+  `(>= 3 (- 1 1524046274))` folded true where the program computes
+  false. Only constants were affected; the same expressions through a
+  register were always correct.
+
+#### Wildcard probes
+
+- **Module functions attached to nothing.** `/proc/kallsyms` separates a
+  symbol from its owning module with a tab, not a space, and the parser
+  split on a space — so every module function came back named
+  `foo<TAB>[bar]`, which no attach can resolve. 104,285 of 272,854 names
+  carried the malformed suffix. `kprobe:nft_*` matched 469 functions and
+  attached to none of them, through both the batch and the sequential
+  path. `kprobe:tcp_*` also silently lost 10 module-owned functions.
+- **A repeated name failed the whole batch.** The kernel lists a name
+  twice when two functions share it (`ext4_update_super` here), and
+  `KPROBE_MULTI` refuses a batch carrying a duplicate however attachable
+  every name in it is. The name list is now deduplicated, which also
+  stops the sequential path attaching the same function twice.
+
+#### Loader
+
+- **Closing a ring-buffer consumer twice could close an unrelated file
+  descriptor** (issue #46). `close-ring-consumer` cleared none of its
+  pointers or its epoll fd, so a second close — reachable through
+  `with-decoding-ring-consumer`'s cleanup after an explicit close —
+  unmapped memory the process no longer owned and closed a descriptor
+  number the kernel may since have reissued. Close is now idempotent,
+  and `ring-poll` and `ring-consume` signal a `bpf-error` on a closed
+  consumer rather than reading through stale pointers into whatever has
+  been mapped there since. Thanks to Brian O'Reilly.
+- **A short file reported an array index error instead of "not an ELF
+  file"** (issue #47). `read-bpf-elf` bound four header fields before the
+  magic check meant to guard them, so a file too small to hold them
+  failed with an index error, and an empty one failed on the magic read
+  itself. The length and magic are now checked before the fields they
+  justify, with a distinct message for a file that is an ELF but too
+  short to hold a header. Thanks to Brian O'Reilly.
+- **The ring-buffer page size was hard-coded to 4096.** The kernel lays
+  a ringbuf out in whole pages and counts the mmap offsets in real ones,
+  so on the 16K and 64K page kernels aarch64 ships every offset landed
+  in the wrong place. The host's own page size is used now.
+
 ## 1.14.0 — 2026-09-07
 
 A correctness release. A new differential-fuzzing harness — random
