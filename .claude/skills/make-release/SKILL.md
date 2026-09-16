@@ -93,12 +93,24 @@ make clean && make 2>&1 | tail -3
 
 Run each example through the compiler:
 
+Only the examples that define a program with `defprog` can be compiled
+this way. The rest — `cgroup-skb-session`, `ffi-call-tracker`,
+`fork-tracker` — are `with-bpf-session` programs that compile *and load*
+BPF as they run, so `compile-file*` finds nothing in them to compile and
+loading them would try to attach to the live kernel. Skip those.
+
+Note the registry path must be absolute: a relative `#P"."` makes ASDF
+fail to resolve any system at all, which looks like every example
+failing at once.
+
 ```bash
+ROOT=$(pwd)
 for f in examples/*.lisp; do
+  grep -q '^(defprog' "$f" || { echo "skip $f (session-style, no defprog)"; continue; }
   echo "Compiling $f ..."
   sbcl --noinform --non-interactive \
     --eval '(require :asdf)' \
-    --eval '(push #P"." asdf:*central-registry*)' \
+    --eval "(push #P\"$ROOT/\" asdf:*central-registry*)" \
     --eval '(asdf:load-system "whistler")' \
     --eval "(whistler::compile-file* \"$f\" \"/tmp/$(basename "$f" .lisp).bpf.o\")" \
     2>&1
@@ -112,6 +124,24 @@ If any example fails to compile, stop and report the failure. Do NOT continue.
 ```bash
 XDG_CACHE_HOME=/tmp/.cache make test
 ```
+
+Then run it again against an SBCL carrying the BPF capabilities, since
+the default `sbcl` on PATH may not have them and silently skips every
+kernel-load assertion — precisely the ones that matter for a codegen
+release:
+
+```bash
+XDG_CACHE_HOME=/tmp/.cache make test SBCL=/usr/bin/sbcl
+XDG_CACHE_HOME=/tmp/.cache SBCL=/usr/bin/sbcl \
+  sbcl --noinform --non-interactive \
+    --eval '(require :asdf)' --eval "(push #P\"$(pwd)/\" asdf:*central-registry*)" \
+    --eval '(asdf:load-system "whistler/tests")' \
+    --eval '(unless (fiveam:run! (quote whistler/tests::torture-suite)) (uiop:quit 1))'
+```
+
+The second run should report noticeably more checks than the first. If
+it reports the same number, the capabilities are missing and the
+kernel-load coverage did not actually run.
 
 If any tests fail, stop and report the failure. Do NOT continue.
 
