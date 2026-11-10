@@ -247,3 +247,286 @@
     ;; log2(1000) = 9 (floor), so the result must be 1009.
     (is (= 1009 (interpret-scalar-bpf bytes '(1000)))
         "log2 corrupted its source: (+ (log2 1000) 1000) must be 1009")))
+
+;;; Spill homes have storage lifetimes beyond register allocation decisions.
+(defun spill-compaction-test-program (instructions)
+  (whistler/ir::make-ir-program
+   :entry 'entry
+   :blocks (list (whistler/ir::make-basic-block
+                  :label 'entry
+                  :insns (mapcar (lambda (spec)
+                                   (destructuring-bind (op dst args) spec
+                                     (whistler/ir::make-ir-insn :op op :dst dst :args args :type :u64)))
+                                 instructions)))))
+
+(defun forced-spill-homes (&rest vregs)
+  (let ((result (make-hash-table)))
+    (loop for vreg in vregs for offset from 1
+          do (setf (gethash vreg result) (list :stack (* -8 offset))))
+    result))
+
+(test spill-compaction-keeps-inclusive-boundaries
+  "A result cannot overwrite an operand that is still consumed at the same instruction."
+  (let ((prog (spill-compaction-test-program
+               '((:mov 1 ((:imm 11))) (:add 2 (1 (:imm 1)))
+                 (:mov 3 ((:imm 99))) (:ret nil (3)))))
+        (homes (forced-spill-homes 1 2 3)))
+    (multiple-value-bind (result extent) (whistler/ir::compact-spill-slots prog homes)
+      (is (not (equal (gethash 1 result) (gethash 2 result))))
+      (is (equal (gethash 1 result) (gethash 3 result)))
+      (is (= -16 extent)))))
+
+(test spill-compaction-preserves-address-backed-storage
+  "Emitter caches can continue using address-backed values after their register use ends."
+  (let ((prog (spill-compaction-test-program
+               '((:mov 1 ((:imm 11))) (:stack-addr 2 (1))
+                 (:mov 3 ((:imm 22))) (:call nil ((:helper 7) 2 3))
+                 (:struct-alloc 4 ((:imm 16))) (:mov 5 ((:imm 33))) (:ret nil (5)))))
+        (homes (forced-spill-homes 1 2 3 4 5)))
+    (multiple-value-bind (result extent) (whistler/ir::compact-spill-slots prog homes)
+      (dolist (private '(1 2 4))
+        (is (not (equal (gethash private result) (gethash 3 result))))
+        (is (not (equal (gethash private result) (gethash 5 result)))))
+      (is (equal (gethash 3 result) (gethash 5 result)))
+      (is (= -32 extent)))))
+
+(test spill-compaction-preserves-phi-edge-copies
+  "PHI homes become live on predecessor edges, before their textual definitions."
+  (let* ((entry (whistler/ir::make-basic-block
+                 :label 'entry :succs '(join)
+                 :insns (list (whistler/ir::make-ir-insn :op :mov :dst 1 :args '((:imm 11)) :type :u64)
+                              (whistler/ir::make-ir-insn :op :mov :dst 2 :args '((:imm 22)) :type :u64)
+                              (whistler/ir::make-ir-insn :op :br :args '((:label join))))))
+         (join (whistler/ir::make-basic-block
+                :label 'join :preds '(entry)
+                :insns (list (whistler/ir::make-ir-insn :op :phi :dst 3 :args '((2 (:label entry))) :type :u64)
+                             (whistler/ir::make-ir-insn :op :phi :dst 4 :args '((1 (:label entry))) :type :u64)
+                             (whistler/ir::make-ir-insn :op :add :dst 5 :args '(3 4) :type :u64)
+                             (whistler/ir::make-ir-insn :op :ret :args '(5)))))
+         (prog (whistler/ir::make-ir-program :entry 'entry :blocks (list entry join)))
+         (homes (forced-spill-homes 1 2 3 4 5)))
+    (multiple-value-bind (result extent) (whistler/ir::compact-spill-slots prog homes)
+      (is (not (equal (gethash 1 result) (gethash 3 result))))
+      (is (not (equal (gethash 2 result) (gethash 4 result))))
+      (is (not (equal (gethash 3 result) (gethash 4 result))))
+      (is (= -32 extent)))))
+
+(test disjoint-spill-pressure-fits-bpf-stack
+  "Many disjoint helper-result groups must fit and execute correctly without accumulating homes."
+  (let* ((body (format nil "(let ((total u64 0)) ~{~A~%~} (return total))"
+                       (loop repeat 80 collect
+                         "(setf total (+ total (let ((a (get-prandom-u32)) (b (get-prandom-u32))
+                                                    (c (get-prandom-u32)) (d (get-prandom-u32))
+                                                    (e (get-prandom-u32)) (f (get-prandom-u32)))
+                                               (+ (+ (+ a b) (+ c d)) (+ e f)))))")))
+         (bytes (w-body body))
+         (values (loop repeat 80 append '(1 2 4 8 16 32))))
+    (is (= (* 80 63) (interpret-scalar-bpf bytes values)))))
+
+(test spill-liveness-stays-a-set-across-diamonds
+  "A long-lived spilled value must not multiply by the number of CFG paths."
+  (let* ((body (format nil
+                       "(let ((a (get-prandom-u32)) (b (get-prandom-u32))
+                              (c (get-prandom-u32)) (d (get-prandom-u32))
+                              (e (get-prandom-u32)) (f (get-prandom-u32)))
+                          (let ((total u64 0)) ~{~A~%~}
+                            (return (+ total (+ (+ (+ a b) (+ c d)) (+ e f))))))"
+                       (loop repeat 25 collect
+                         "(setf total (if (> (get-prandom-u32) 0) (+ total 1) (+ total 2)))")))
+         (bytes (w-body body)))
+    (is (= 88 (interpret-scalar-bpf bytes (append '(1 2 4 8 16 32) (make-list 25 :initial-element 1)))))))
+
+(test spilled-buffer-address-preserves-live-caller-register
+  "Stack buffer/address emission must use reserved R0, never overwrite an allocated R1."
+  (dolist (address-op '(:struct-alloc :stack-addr))
+    (let* ((prog (spill-compaction-test-program
+                  (append '((:call 1 ((:helper 7))))
+                          (if (eq address-op :struct-alloc)
+                              '((:struct-alloc 2 ((:imm 16))))
+                              '((:stack-addr 2 (1))))
+                          '((:ret nil (1))))))
+           (homes (make-hash-table)))
+      (setf (gethash 1 homes) '(:reg 1) (gethash 2 homes) '(:stack -8))
+      (sb-int:encapsulate 'whistler/ir::linear-scan-alloc 'force-buffer-spill
+                         (lambda (function &rest arguments)
+                           (declare (ignore function arguments))
+                           (values homes -8)))
+      (unwind-protect
+           (let* ((cu (whistler/ir::emit-ir-to-bpf prog))
+                  (bytes (whistler/bpf:insn-bytes (whistler/compiler:cu-insns cu))))
+             (is (= 42 (interpret-scalar-bpf bytes '(42)))))
+        (sb-int:unencapsulate 'whistler/ir::linear-scan-alloc 'force-buffer-spill)))))
+
+(test context-entry-loads-after-map-helpers-require-a-saved-context
+  "Pure map lookups still clobber the register carrying the entry context."
+  (dolist (op '(:map-lookup :map-lookup-ptr :map-update :map-delete :call
+                :tail-call :get-stackid :kfunc-call :ringbuf-reserve))
+    (dolist (access '(:ctx-load :ctx-store :load :store))
+      (let ((prog (spill-compaction-test-program
+                   `((:arg0 1 ()) (,op 2 ()) (,access 3 (1 (:imm 48))) (:ret nil (3))))))
+        (is-false (whistler/ir::ctx-loads-early-p prog)))))
+  (dolist (op '(:map-lookup :map-lookup-ptr))
+    (let ((prog (spill-compaction-test-program
+                 `((:arg0 1 ()) (:ctx-load 2 (1 (:imm 76))) (,op 3 ()) (:ret nil (2))))))
+      (is-true (whistler/ir::ctx-loads-early-p prog)))))
+
+(defun compile-context-helper-regression (body)
+  (let* ((maps '((whistler::ctx-test :type :array :key-size 4 :value-size 8 :max-entries 1)))
+         (whistler::*maps* maps)
+         (cu (whistler::compile-program "classifier" "GPL" maps
+                                        (read-whistler-forms body) :prog-type :tc)))
+    (whistler/bpf:insn-bytes (whistler/compiler:cu-insns cu))))
+
+(test emitted-context-load-after-map-lookup-survives-helper-clobber
+  "Execute the map-first context read with the full R1-R5 helper poison model."
+  (let ((bytes (compile-context-helper-regression
+                "(let ((hit (map-lookup ctx-test 0))
+                       (data (ctx u32 76)) (end (ctx u32 80)))
+                   (return (+ data (+ end (if (/= hit 0) 7 9)))))")))
+    (is (= 7 (interpret-scalar-bpf bytes '(42))))
+    (is (= 9 (interpret-scalar-bpf bytes '(0))))))
+
+(test emitted-raw-context-store-after-map-lookup-survives-helper-clobber
+  "Raw ctx-ptr use is also live across the helper, even without a ctx-load op."
+  (let ((bytes (compile-context-helper-regression
+                "(let ((hit (map-lookup ctx-test 0)))
+                   (when (/= hit 0) (store u32 (ctx-ptr) 48 123))
+                   (return 2))")))
+    (is (= 2 (interpret-scalar-bpf bytes '(42))))
+    (is (= 2 (interpret-scalar-bpf bytes '(0))))))
+
+(test helper-and-kfunc-immediates-preserve-full-width
+  "Observe every argument register at the call boundary, including constants
+propagated into a helper/kfunc and values whose low32 sign bit is set."
+  (dolist (kind '(:helper :kfunc))
+    (dolist (propagated '(nil t))
+      (dolist (value '(0 #x7fffffff #x80000000 #xffffffff #x100000000
+                      #x0e00000000000053 #x8000000000000000 #xffffffffffffffff
+                      -102 -2147483648 #xffffffff80000000))
+        (loop for target from 1 to 5 do
+          (let* ((ctx (whistler/ir::make-emit-ctx))
+                 (arguments
+                   (loop for reg from 1 to 5
+                         for constant = (if (= reg target) value (+ reg 10))
+                         collect (if propagated
+                                     (progn (setf (gethash reg (whistler/ir::emit-ctx-const-values ctx)) constant) reg)
+                                     (list :imm constant)))))
+            (if (eq kind :helper)
+                (whistler/ir::emit-call-insn ctx nil (cons '(:helper 7) arguments))
+                (whistler/ir::emit-kfunc-call-insn ctx nil (cons '(:kfunc "test") arguments)))
+            ;; Replace CALL with an observation of its argument. Setup is the
+            ;; real emitter path; the scalar oracle would otherwise poison R1-R5.
+            (pop (whistler/ir::emit-ctx-insns ctx))
+            (whistler/ir::ectx-emit ctx (whistler/bpf:emit-mov64-reg 0 target))
+            (whistler/ir::ectx-emit ctx (whistler/bpf:emit-exit))
+            (let ((bytes (whistler/bpf:insn-bytes (reverse (whistler/ir::emit-ctx-insns ctx)))))
+              (is (= (ldb (byte 64 0) value) (interpret-scalar-bpf bytes nil))))))))))
+
+(test phi-threading-preserves-values-after-validation
+  "A merged value remains live after a later conditional early return."
+  (dolist (initial '(0 7))
+    (dolist (selected '(1 102))
+      (dolist (nested '(nil t))
+        (let* ((source
+                 (format nil
+                         "(let ((offset u32 ~D))
+                            (when (= (get-prandom-u32) 1) (setf offset ~D))
+                            (when (/= offset 0)
+                              ~A)
+                            (return offset))"
+                         initial selected
+                         (if nested
+                             "(let ((local u32 0))
+                                (unless (= (get-prandom-u32) 1) (return 2))
+                                (if (= (get-prandom-u32) 1)
+                                    (setf local 10) (setf local 20))
+                                (unless (= local 10) (return 3)))"
+                             "(unless (= (get-prandom-u32) 1) (return 2))")))
+               (bytes (compile-insn-bytes (read-whistler-forms source))))
+          (dolist (choose '(0 1))
+            (dolist (allow '(0 1))
+              (dolist (inner '(0 1))
+                (let* ((value (if (= choose 1) selected initial))
+                       (expected (cond ((zerop value) value)
+                                       ((zerop allow) 2)
+                                       ((and nested (zerop inner)) 3)
+                                       (t value))))
+                  (is (= expected (interpret-scalar-bpf bytes (list choose allow inner)))
+                      "~A inputs ~S" source (list choose allow inner)))))))))))
+
+(test peephole-map-relocations-retain-surviving-identities
+  "Deleting unreachable map references cannot relabel a later program array."
+  (dolist (dead-count '(1 2 3))
+    (dolist (live-count '(1 2 3))
+      (let* ((maps '((dead-map :type :hash :key-size 4 :value-size 8 :max-entries 1)
+                     (live-map :type :hash :key-size 4 :value-size 8 :max-entries 1)
+                     (stages :type :prog-array :key-size 4 :value-size 4 :max-entries 4)))
+             (source (format nil
+                             "(when (= (get-prandom-u32) 1) (return 0) ~{~A~})
+                              ~{~A~} (tail-call stages 3) (return 2)"
+                             (make-list dead-count :initial-element "(map-delete dead-map 0) ")
+                             (make-list live-count :initial-element "(map-delete live-map 0) ")))
+             (cu (compile-single (read-whistler-forms source) :maps maps))
+             (relocs (whistler/compiler:cu-map-relocs cu))
+             (indices (mapcar #'second relocs))
+             (bytes (whistler/bpf:insn-bytes (whistler/compiler:cu-insns cu))))
+        (is (not (null (member 1 indices))))
+        (is (not (null (member 2 indices))))
+        (is (not (member 0 indices)))
+        (is (= 2 (car (last indices))))
+        (dolist (reloc relocs)
+          (is (= #x18 (aref bytes (first reloc))))
+          (is (= 1 (ash (aref bytes (1+ (first reloc))) -4))))))))
+
+(test peephole-kfunc-relocations-retain-surviving-identities
+  "Deleting an unreachable kfunc cannot replace the names of surviving calls."
+  (let ((whistler/compiler:*builtin-kfuncs* whistler/compiler:*builtin-kfuncs*))
+    (dolist (name '("dead-probe" "first-probe" "second-probe"))
+      (whistler/compiler:register-kfunc name (substitute #\_ #\- name) nil 'whistler::u64 nil))
+    (dolist (dead-count '(1 2 3))
+      (let* ((source (format nil
+                             "(when (= (get-prandom-u32) 1) (return 0) ~{~A~})
+                              (first-probe) (second-probe) (return 2)"
+                             (make-list dead-count :initial-element "(dead-probe) ")))
+             (cu (compile-single (read-whistler-forms source)))
+             (relocs (whistler/compiler:cu-kfunc-relocs cu))
+             (bytes (whistler/bpf:insn-bytes (whistler/compiler:cu-insns cu))))
+        (is (equal '("first_probe" "second_probe") (mapcar #'second relocs)))
+        (dolist (reloc relocs)
+          (is (= #x85 (aref bytes (first reloc))))
+          (is (= whistler/bpf:+bpf-pseudo-kfunc-call+
+                 (ash (aref bytes (1+ (first reloc))) -4))))))))
+
+(test call-spanning-packet-bounds-retain-the-checked-pointer
+  "Register pressure must not replace a bounded packet pointer after a helper."
+  (let* ((maps '((pointer-state :type :hash :key-size 4 :value-size 8 :max-entries 3)))
+         (bytes (compile-insn-bytes
+                 (read-whistler-forms
+                  "(let ((data u64 (ctx u32 76)) (end u64 (ctx u32 80)))
+                     (when (> (+ data 34) end) (return 2))
+                     (let ((row (map-lookup pointer-state 0))
+                           (row1 (map-lookup pointer-state 1))
+                           (row2 (map-lookup pointer-state 2)))
+                       (when (or (= row 0) (= row1 0) (= row2 0)) (return 2))
+                       (get-prandom-u32)
+                       (when (< (ctx u32 0) 34) (return 2))
+                       (return (+ (load u8 data 26) (load u64 row 0)
+                                  (load u64 row1 0) (load u64 row2 0)))))")
+                 :maps maps)))
+    (is (= 1 (loop for offset from 0 below (length bytes) by 8
+                   count (and (= (aref bytes offset) #x61)
+                              (= (nth-insn-off bytes (/ offset 8)) 76)))))))
+
+(test context-loads-are-not-rematerialized-after-helpers
+  "Context reloads require explicit source bounds, even after pure helpers."
+  (let ((spanning (make-hash-table)) (definitions (make-hash-table)))
+    (setf (gethash 1 spanning) t)
+    (dolist (offset '(0 4 76 80 140))
+      (let ((load (whistler/ir::make-ir-insn :op :ctx-load :dst 2
+                                          :args (list 1 (list :imm offset)) :type :u32)))
+        (is-false (whistler/ir::reloadable-insn-p load spanning definitions))
+        (is-false (whistler/ir::reloadable-insn-p load spanning))
+        (dolist (helper '(1 2 3 5 7 26 50))
+          (is-false (whistler/ir::reloadable-after-call-p
+                     load (whistler/ir::make-ir-insn :op :call :args (list (list :helper helper)))
+                     spanning definitions)))))))

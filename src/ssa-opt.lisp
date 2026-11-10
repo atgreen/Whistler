@@ -405,10 +405,10 @@
     (when ctx-vreg
       (dolist (block (ir-program-blocks prog))
         (dolist (insn (basic-block-insns block))
-          (when (member (ir-insn-op insn) '(:call :tail-call :get-stackid))
-            ;; All three argument layouts include ctx-vreg somewhere
-            ;; in the list of args (after a leading :helper/:map tag).
-            (dolist (arg (rest (ir-insn-args insn)))
+          (when (call-like-op-p (ir-insn-op insn))
+            ;; Map and other specialized helper ops obey the same ABI as
+            ;; explicit calls. Argument setup may itself overwrite R1.
+            (dolist (arg (ir-insn-vreg-uses insn))
               (when (and (integerp arg) (eql arg ctx-vreg))
                 (return-from ctx-loads-early-p nil)))))))
     ;; Strategy: check if all ctx-loads are in the entry block before barriers
@@ -417,14 +417,18 @@
           (entry-ok t))
       ;; Check entry block
       (dolist (insn (basic-block-insns entry-block))
-        (when (and seen-barrier (member (ir-insn-op insn) '(:ctx-load :ctx-store)))
+        (when (and seen-barrier
+                   (or (member (ir-insn-op insn) '(:ctx-load :ctx-store))
+                       (and ctx-vreg (member ctx-vreg (ir-insn-vreg-uses insn)))))
           (setf entry-ok nil))
-        (when (ir-insn-side-effect-p insn)
+        ;; A lookup is logically pure but its helper still clobbers R1-R5.
+        (when (or (ir-insn-side-effect-p insn) (call-like-op-p (ir-insn-op insn)))
           (setf seen-barrier t)))
       ;; Check non-entry blocks: any ctx-load/ctx-store disqualifies
       (dolist (block (rest (ir-program-blocks prog)))
         (dolist (insn (basic-block-insns block))
-          (when (member (ir-insn-op insn) '(:ctx-load :ctx-store))
+          (when (or (member (ir-insn-op insn) '(:ctx-load :ctx-store))
+                    (and ctx-vreg (member ctx-vreg (ir-insn-vreg-uses insn))))
             (return-from ctx-loads-early-p nil))))
       entry-ok)))
 
@@ -444,10 +448,13 @@
   "Thread branches through PHI nodes to eliminate boolean materialization."
   (let ((def-map (make-hash-table))
         (const-map (make-hash-table))
+        (users (make-hash-table))
         (changed nil))
     ;; Build def map and constant map
     (dolist (block (ir-program-blocks prog))
       (dolist (insn (basic-block-insns block))
+        (dolist (vreg (ir-insn-all-vreg-uses insn))
+          (push insn (gethash vreg users)))
         (when (ir-insn-dst insn)
           (setf (gethash (ir-insn-dst insn) def-map) insn))
         (when (and (eq (ir-insn-op insn) :mov)
@@ -472,7 +479,17 @@
                                (basic-block-insns block)))
                     (then-label (fourth args))
                     (else-label (fifth args)))
-                (when phi-insn
+                ;; Bypassing this block also bypasses its definitions. A PHI
+                ;; used after the branch must still merge values on every
+                ;; incoming path; repairing successor PHI labels cannot repair
+                ;; ordinary downstream uses of that definition. Likewise, do
+                ;; not skip any other computation or side effect in the block.
+                (when (and phi-insn
+                           (every (lambda (user) (eq user terminator))
+                                  (gethash (ir-insn-dst phi-insn) users))
+                           (every (lambda (insn)
+                                    (or (eq insn phi-insn) (eq insn terminator)))
+                                  (basic-block-insns block)))
                   ;; Copy args list: threading mutates it via removal
                   (dolist (phi-arg (copy-list (ir-insn-args phi-insn)))
                     (when (and (consp phi-arg) (integerp (first phi-arg)))
@@ -1042,7 +1059,9 @@
 ;;; A vreg is "reloadable" if its defining instruction can be cheaply
 ;;; re-executed after a call:
 ;;;   - mov (:imm N)            — constant, always reloadable
-;;;   - ctx-load TYPE OFF       — reloadable when ctx itself spans calls
+;;; Context loads must retain their original values across calls: a fresh
+;;; packet-pointer load loses the verifier's bounds provenance even when the
+;;; helper preserves the packet. Explicit source reloads can establish new bounds.
 ;;;   - load TYPE base OFF      — reloadable when base itself spans calls
 ;;;   - add base (:imm N)       — reloadable when base spans calls
 ;;;
@@ -1098,15 +1117,9 @@
        (and (= (length args) 1)
             (consp (first args))
             (eq (car (first args)) :imm))))
-    ;; ctx-load base off — safe when the ctx pointer itself spans calls and
-    ;; the specific helper does not invalidate packet pointers.
-    ;; This is mainly useful for reloading data/data_end after safe helpers.
-    (:ctx-load
-     (let ((args (ir-insn-args insn)))
-       (and (>= (length args) 2)
-            (integerp (first args))
-            (gethash (first args) call-spanning-vregs)
-            (not (helper-invalidates-p call-insn :invalidates-packet-ptrs)))))
+    ;; Preserving packet contents does not give a fresh skb->data load the
+    ;; range proven for the old pointer. Keep the bounded pointer itself live.
+    (:ctx-load nil)
     ;; load type base off — safe if base spans calls AND call
     ;; does not invalidate the base's pointer kind
     (:load
@@ -1153,10 +1166,7 @@
                 (and (= (length args) 1)
                      (consp (first args))
                      (eq (car (first args)) :imm))))
-        (:ctx-load (let ((args (ir-insn-args insn)))
-                     (and (>= (length args) 2)
-                          (integerp (first args))
-                          (gethash (first args) call-spanning-vregs))))
+        (:ctx-load nil)
         (:load (let ((args (ir-insn-args insn)))
                  (and (>= (length args) 2)
                       (integerp (first args))
@@ -1177,10 +1187,7 @@
                 (and (= (length args) 1)
                      (consp (first args))
                      (eq (car (first args)) :imm))))
-        (:ctx-load (let ((args (ir-insn-args insn)))
-                     (and (>= (length args) 2)
-                          (integerp (first args))
-                          (gethash (first args) call-spanning-vregs))))
+        (:ctx-load nil)
         (:load (let ((args (ir-insn-args insn)))
                  (and (>= (length args) 2)
                       (integerp (first args))

@@ -462,15 +462,31 @@
                  (insn (nth bpf-idx bpf-insns)))
             (setf (whistler/bpf:bpf-insn-off insn) offset))))
 
-      ;; Apply peephole optimizations
+      ;; Bind relocation identities before peephole removes instructions. Pairing
+      ;; surviving references with the original list by position changes every
+      ;; later map/kfunc identity when an earlier reference is deleted.
+      (let ((map-identities (make-hash-table :test 'eq))
+            (kfunc-identities (make-hash-table :test 'eq))
+            (kfunc-names (reverse (emit-ctx-kfunc-relocs ctx))))
+        (dolist (entry (emit-ctx-map-relocs ctx))
+          (setf (gethash (nth (/ (first entry) 8) bpf-insns) map-identities)
+                (second entry)))
+        (dolist (insn bpf-insns)
+          (when (and (= (whistler/bpf:bpf-insn-code insn) #x85)
+                     (= (whistler/bpf:bpf-insn-src insn)
+                        whistler/bpf:+bpf-pseudo-kfunc-call+))
+            (assert kfunc-names)
+            (setf (gethash insn kfunc-identities) (pop kfunc-names))))
+        (assert (null kfunc-names))
+
+      ;; Apply peephole optimizations. Surviving reference objects retain their
+      ;; identities even when their byte offsets or order change.
       (setf bpf-insns (peephole-optimize bpf-insns))
 
       ;; Rebuild map relocations after peephole.
       ;; The peephole may remove instructions, shifting byte offsets.
-      ;; Scan for ld_imm64 with src=BPF_PSEUDO_MAP_FD (1) and pair
-      ;; with original relocs (which are in the same order of appearance).
-      (let ((new-relocs '())
-            (old-relocs (nreverse (emit-ctx-map-relocs ctx))))
+      ;; Scan for ld_imm64 with src=BPF_PSEUDO_MAP_FD (1).
+      (let ((new-relocs '()))
         (loop for insn in bpf-insns
               for idx from 0
               when (and (= (whistler/bpf:bpf-insn-code insn)
@@ -478,21 +494,21 @@
                                    whistler/bpf:+bpf-dw+
                                    whistler/bpf:+bpf-imm+))
                         (= (whistler/bpf:bpf-insn-src insn) 1))
-              do (let ((map-idx (second (pop old-relocs))))
+              do (multiple-value-bind (map-idx present) (gethash insn map-identities)
+                   (assert present)
                    (push (list (* idx 8) map-idx) new-relocs)))
 
         ;; Rebuild kfunc relocations after peephole. Scan for BPF_CALL
-        ;; insns with src=BPF_PSEUDO_KFUNC_CALL and pair with the recorded
-        ;; names (same order of appearance as emission).
-        (let ((new-kfunc-relocs '())
-              (old-kfunc-relocs (nreverse (emit-ctx-kfunc-relocs ctx))))
+        ;; insns with src=BPF_PSEUDO_KFUNC_CALL and retain their recorded names.
+        (let ((new-kfunc-relocs '()))
           (loop for insn in bpf-insns
                 for idx from 0
                 when (and (= (whistler/bpf:bpf-insn-code insn)
                              (logior whistler/bpf:+bpf-jmp+ whistler/bpf:+bpf-call+))
                           (= (whistler/bpf:bpf-insn-src insn)
                              whistler/bpf:+bpf-pseudo-kfunc-call+))
-                do (let ((name (pop old-kfunc-relocs)))
+                do (let ((name (gethash insn kfunc-identities)))
+                     (assert name)
                      (push (list (* idx 8) name) new-kfunc-relocs)))
           (setf new-kfunc-relocs (nreverse new-kfunc-relocs))
 
@@ -520,7 +536,7 @@
             (setf (whistler/compiler:cu-map-relocs cu) (nreverse new-relocs))
             (setf (whistler/compiler:cu-core-relocs cu) (nreverse final-core-relocs))
             (setf (whistler/compiler:cu-kfunc-relocs cu) new-kfunc-relocs)
-            cu))))))))
+            cu)))))))))
 
 (defun find-ctx-vreg (prog)
   "Find the vreg assigned to %%CTX (the arg0 instruction)."
@@ -986,7 +1002,7 @@
   (let* ((src-vreg (first args))
          (stack-offset (emit-key-to-stack ctx src-vreg))
          (dst-loc (allocate-vreg ctx dst))
-         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-1+)))
+         (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc) whistler/bpf:+bpf-reg-0+)))
     (emit-stack-ptr ctx stack-offset dst-reg)
     (when (eq (car dst-loc) :stack)
       (ectx-emit ctx (whistler/bpf:emit-stx-mem
@@ -1108,7 +1124,7 @@
          (offset (ectx-alloc-stack ctx size "struct-alloc"))
          (dst-loc (allocate-vreg ctx dst))
          (dst-reg (if (eq (car dst-loc) :reg) (cadr dst-loc)
-                      whistler/bpf:+bpf-reg-1+))
+                      whistler/bpf:+bpf-reg-0+))
          (ptr-uses (gethash dst (emit-ctx-struct-ptr-uses ctx) 0))
          (stack-home (and (eq (car dst-loc) :stack) (cadr dst-loc))))
     ;; Record struct base offset for direct R10-relative access optimization
@@ -1489,7 +1505,7 @@
            (setf pending (remove safe pending :test #'eq))
            (destructuring-bind (dst . src) safe
              (ecase (car src)
-               (:imm (ectx-emit ctx (whistler/bpf:emit-mov64-imm dst (cadr src))))
+               (:imm (emit-vreg-to-reg ctx (list :imm (cadr src)) dst))
                (:stack (ectx-emit ctx (whistler/bpf:emit-ldx-mem
                                        whistler/bpf:+bpf-dw+ dst
                                        whistler/bpf:+bpf-reg-10+ (cadr src))))

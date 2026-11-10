@@ -292,6 +292,100 @@
                counts))
     max-refs))
 
+(defun compact-spill-slots (prog result)
+  "Color spill storage using CFG liveness, including PHI predecessor copies.
+Address-backed values and cached struct pointers retain private homes because
+emitter caches can use them after their register lifetime ends. All other homes
+may overlap only when no execution path needs both values, including operands
+and results at the same instruction. Physical register assignments are unchanged."
+  (let ((spills (sort (loop for vreg being the hash-keys of result using (hash-value home)
+                            when (eq (car home) :stack) collect vreg) #'<))
+        (private (make-hash-table)) (graph (make-hash-table))
+        (uses (make-hash-table)) (defs (make-hash-table)) (phis (make-hash-table))
+        (edge-uses (make-hash-table :test #'equal))
+        (live-in (make-hash-table)) (live-out (make-hash-table))
+        (colors (make-hash-table)) (private-count 0) (color-count 0))
+    (labels ((spilled-p (vreg) (eq (car (gethash vreg result)) :stack))
+             (operands (insn) (remove-duplicates (remove-if-not #'spilled-p (ir-insn-all-vreg-uses insn))))
+             (connect (a b)
+               (unless (eql a b)
+                 (pushnew b (gethash a graph))
+                 (pushnew a (gethash b graph))))
+             (clique (values)
+               (loop for tail on values do (dolist (other (cdr tail)) (connect (car tail) other)))))
+      (dolist (block (ir-program-blocks prog))
+        (let ((label (basic-block-label block)) (defined nil) (used nil))
+          (dolist (insn (basic-block-insns block))
+            (when (member (ir-insn-op insn) '(:struct-alloc :stack-addr))
+              (setf (gethash (ir-insn-dst insn) private) t))
+            (when (eq (ir-insn-op insn) :stack-addr)
+              (dolist (vreg (operands insn)) (setf (gethash vreg private) t)))
+            (if (eq (ir-insn-op insn) :phi)
+                (progn
+                  (when (spilled-p (ir-insn-dst insn))
+                    (pushnew (ir-insn-dst insn) (gethash label phis)))
+                  (dolist (arg (ir-insn-args insn))
+                    (when (and (consp arg) (integerp (first arg)) (spilled-p (first arg))
+                               (consp (second arg)) (eq (car (second arg)) :label))
+                      (pushnew (first arg) (gethash (cons (cadr (second arg)) label) edge-uses)))))
+                (dolist (vreg (operands insn))
+                  (unless (member vreg defined) (pushnew vreg used))))
+            (when (spilled-p (ir-insn-dst insn)) (pushnew (ir-insn-dst insn) defined)))
+          (setf (gethash label uses) used (gethash label defs) defined)))
+      ;; PHI inputs are consumed on their particular incoming edge.
+      (loop with changed = t while changed do
+        (setf changed nil)
+        (dolist (block (reverse (ir-program-blocks prog)))
+          (let* ((label (basic-block-label block))
+                 (out (remove-duplicates
+                       (loop for successor in (basic-block-succs block)
+                             append (union (set-difference (gethash successor live-in) (gethash successor phis))
+                                           (gethash (cons label successor) edge-uses)))))
+                 (in (union (gethash label uses) (set-difference out (gethash label defs)))))
+            (unless (and (subsetp in (gethash label live-in)) (subsetp (gethash label live-in) in)
+                         (subsetp out (gethash label live-out)) (subsetp (gethash label live-out) out))
+              (setf changed t))
+            (setf (gethash label live-in) in (gethash label live-out) out))))
+      (dolist (block (ir-program-blocks prog))
+        (let* ((label (basic-block-label block)) (live (gethash label live-out))
+               (terminator (car (last (basic-block-insns block)))))
+          ;; The emitter performs parallel PHI copies before completing the
+          ;; branch. Destinations must not overwrite any source or predicate.
+          (dolist (successor (basic-block-succs block))
+            (clique (remove-duplicates
+                     (append (gethash successor phis)
+                             (set-difference (gethash successor live-in) (gethash successor phis))
+                             (gethash (cons label successor) edge-uses)
+                             (when terminator (operands terminator))))))
+          (dolist (insn (reverse (basic-block-insns block)))
+            (let ((dst (ir-insn-dst insn))
+                  (sources (unless (eq (ir-insn-op insn) :phi) (operands insn))))
+              (when (spilled-p dst)
+                (dolist (other (union live sources)) (connect dst other)))
+              (setf live (union sources (remove dst live)))))))
+      (dolist (vreg spills)
+        (when (gethash vreg private)
+          (incf private-count)
+          (setf (gethash vreg result) (list :stack (* -8 private-count)))))
+      (dolist (vreg (sort (remove-if (lambda (v) (gethash v private)) (copy-list spills))
+                         (lambda (a b)
+                           (let ((da (length (gethash a graph))) (db (length (gethash b graph))))
+                             (or (> da db) (and (= da db) (< a b)))))))
+        (let* ((occupied (loop for neighbor in (gethash vreg graph)
+                              for color = (gethash neighbor colors) when color collect color))
+               (color (loop for candidate from 0 unless (member candidate occupied) return candidate)))
+          (setf (gethash vreg colors) color
+                color-count (max color-count (1+ color))
+                (gethash vreg result) (list :stack (* -8 (+ private-count color 1))))))
+      (let ((offset (* -8 (+ private-count color-count))))
+        (when (< offset -512)
+          (whistler/compiler:whistler-error
+           :what (format nil "stack frame exceeds BPF 512-byte limit during register allocation ~
+                              (~d bytes after spill compaction)" (- offset))
+           :expected "total stack usage <= 512 bytes"
+           :hint "reduce live values, reuse buffers, or split logic across tail-called programs"))
+        (values result offset)))))
+
 (defun linear-scan-alloc (prog &key ctx-early reserve-callee-count auto-reserve-helper-setup)
   "Allocate physical registers for all vregs in PROG. Two-pass: if the
    first pass spills anything, rerun with R5 removed from the caller pool
@@ -300,17 +394,16 @@
    spill reload into a fixed scratch register can silently clobber a live
    caller-saved vreg — a wrong-value miscompile the verifier can't see.
    Returns (values result stack-offset); see linear-scan-alloc-pass."
-  (multiple-value-bind (result stack-offset)
-      (linear-scan-alloc-pass prog :ctx-early ctx-early
-                                   :reserve-callee-count reserve-callee-count
-                                   :auto-reserve-helper-setup auto-reserve-helper-setup)
-    (if (loop for loc being the hash-values of result
-              thereis (eq (car loc) :stack))
-        (linear-scan-alloc-pass prog :ctx-early ctx-early
-                                     :reserve-callee-count reserve-callee-count
-                                     :auto-reserve-helper-setup auto-reserve-helper-setup
-                                     :reserve-scratch t)
-        (values result stack-offset))))
+  (let ((result (linear-scan-alloc-pass prog :ctx-early ctx-early
+                                           :reserve-callee-count reserve-callee-count
+                                           :auto-reserve-helper-setup auto-reserve-helper-setup)))
+    (when (loop for loc being the hash-values of result
+                thereis (eq (car loc) :stack))
+      (setf result (linear-scan-alloc-pass prog :ctx-early ctx-early
+                                              :reserve-callee-count reserve-callee-count
+                                              :auto-reserve-helper-setup auto-reserve-helper-setup
+                                              :reserve-scratch t)))
+    (compact-spill-slots prog result)))
 
 (defun linear-scan-alloc-pass (prog &key ctx-early reserve-callee-count
                                          auto-reserve-helper-setup reserve-scratch)
@@ -535,15 +628,6 @@
               candidates))))
 
 (defun alloc-spill-slot (current-offset)
-  "Allocate 8 bytes on the stack. CURRENT-OFFSET is a negative offset (or 0).
-   Returns the new negative offset from R10."
-  (let ((off (- current-offset 8)))
-    (when (< off -512)
-      (whistler/compiler:whistler-error
-       :what (format nil "stack frame exceeds BPF 512-byte limit during register allocation ~
-                          (~d bytes in ~d spill slots)"
-                     (- off) (/ (- off) 8))
-       :expected "total stack usage <= 512 bytes"
-       :hint "reduce struct sizes, reuse buffers, or split logic across tail-called programs"))
-
-    off))
+  "Assign a logical spill home. COMPACT-SPILL-SLOTS checks physical stack usage
+   after nonoverlapping homes have been coalesced."
+  (- current-offset 8))
