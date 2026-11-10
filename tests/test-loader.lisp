@@ -6,6 +6,178 @@
 
 (in-suite loader-suite)
 
+(defun simulated-program-load (initial-errno retry-result log-bytes)
+  "Exercise the real attribute/retry/error path without loading host BPF."
+  (let ((calls 0))
+    (values
+     (handler-case
+         (whistler/loader::load-program
+          (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+          3 "GPL" :log-buf-size 32 :expected-attach-type 46 :attach-btf-id 17
+          :bpf (lambda (command attribute size context)
+                 (is (= 5 command))
+                 (is (= 256 size))
+                 (is (= 46 (whistler/loader::get-u32 attribute 68)))
+                 (is (= 17 (whistler/loader::get-u32 attribute 108)))
+                 (incf calls)
+                 (when (= calls 1)
+                   (is (= 0 (whistler/loader::get-u32 attribute 28)))
+                   (error 'whistler/loader:bpf-error :context context :errno initial-errno))
+                 (is (= 2 calls))
+                 (is (= 6 (whistler/loader::get-u32 attribute 24)))
+                 (is (= 32 (whistler/loader::get-u32 attribute 28)))
+                 (let* ((pointer (+ (whistler/loader::get-u32 attribute 32)
+                                    (ash (whistler/loader::get-u32 attribute 36) 32)))
+                        (sap (sb-sys:int-sap pointer)))
+                   (loop for byte across log-bytes for index from 0
+                         do (setf (sb-sys:sap-ref-8 sap index) byte)))
+                 (if (minusp retry-result)
+                     (error 'whistler/loader:bpf-error :context context :errno (- retry-result))
+                     retry-result)))
+       (whistler/loader:bpf-error (error) error))
+     calls)))
+
+(test program-load-preserves-original-rejection-when-log-retry-runs-out-of-space
+  (multiple-value-bind (error calls)
+      (simulated-program-load 13 -28 (sb-ext:string-to-octets "invalid access"))
+    (is (= 2 calls))
+    (is (typep error 'whistler/loader:bpf-verifier-error))
+    (is (= 13 (whistler/loader::bpf-error-errno
+               (whistler/loader:bpf-program-load-error-initial-error error))))
+    (is (= 28 (whistler/loader::bpf-error-errno error)))
+    (is (equal "invalid access" (whistler/loader:bpf-program-load-error-log error)))
+    (is (= 32 (whistler/loader:bpf-program-load-error-log-buf-size error)))
+    (let ((report (princ-to-string error)))
+      (is (search "errno 13" report))
+      (is (search "errno 28" report))
+      (is (search "invalid access" report)))))
+
+(test program-load-preserves-non-eacces-diagnostics-and-empty-permission-errors
+  (dolist (errno '(1 22 28))
+    (multiple-value-bind (error calls)
+        (simulated-program-load errno (- errno) #())
+      (is (= 2 calls))
+      (is (typep error 'whistler/loader:bpf-program-load-error))
+      (is-false (typep error 'whistler/loader:bpf-verifier-error))
+      (is (= errno (whistler/loader::bpf-error-errno error)))
+      (is (equal "" (whistler/loader:bpf-program-load-error-log error)))
+      (is (search "0/32 bytes" (princ-to-string error))))))
+
+(test program-load-full-log-and-arbitrary-bytes-cannot-mask-original-error
+  (multiple-value-bind (error calls)
+      (simulated-program-load 22 -28 (make-array 32 :initial-element 255))
+    (is (= 2 calls))
+    (is (typep error 'whistler/loader:bpf-program-load-error))
+    (is (= 32 (length (whistler/loader:bpf-program-load-error-log error))))
+    (is (search "32/32 bytes" (princ-to-string error)))))
+
+(test program-load-logging-retry-success-returns-the-live-fd
+  (multiple-value-bind (fd calls) (simulated-program-load 13 91 #())
+    (is (= 2 calls))
+    (is (= 91 fd))))
+
+(test program-load-first-success-does-not-retry-or-allocate-a-log
+  (let ((calls 0))
+    (is (= 92 (whistler/loader::load-program
+               (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+               3 "GPL" :bpf (lambda (command attribute size context)
+                             (declare (ignore command size context))
+                             (incf calls)
+                             (is (= 0 (whistler/loader::get-u32 attribute 28)))
+                             92))))
+    (is (= 1 calls))))
+
+(test legacy-verifier-conditions-remain-printable
+  (is (equal (format nil "BPF verifier rejected program~%legacy")
+             (princ-to-string (make-condition 'whistler/loader:bpf-verifier-error :log "legacy")))))
+
+(defun simulated-program-load-sequence (results &key (attempts 3))
+  (let ((remaining (copy-list results)) (phases nil)
+        (*trace-output* (make-string-output-stream)))
+    (values
+     (handler-case
+         (whistler/loader::load-program
+          (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+          3 "GPL" :attempts attempts :log-buf-size 32 :expected-attach-type 46 :attach-btf-id 17
+          :bpf (lambda (command attribute size context)
+                 (is (= 5 command))
+                 (is (= 256 size))
+                 (is (= 46 (whistler/loader::get-u32 attribute 68)))
+                 (is (= 17 (whistler/loader::get-u32 attribute 108)))
+                 (push (whistler/loader::get-u32 attribute 24) phases)
+                 (when (plusp (whistler/loader::get-u32 attribute 28))
+                   (let ((sap (sb-sys:int-sap
+                               (+ (whistler/loader::get-u32 attribute 32)
+                                  (ash (whistler/loader::get-u32 attribute 36) 32)))))
+                     (setf (sb-sys:sap-ref-8 sap 0) (char-code #\X))))
+                 (unless remaining (error "Program load exceeded the test's syscall budget"))
+                 (let ((result (pop remaining)))
+                   (if (minusp result)
+                       (error 'whistler/loader:bpf-error :context context :errno (- result))
+                       result))))
+       (whistler/loader:bpf-error (error) error))
+     (nreverse phases)
+     (get-output-stream-string *trace-output*))))
+
+(test program-load-eagain-recovers-before-allocating-the-diagnostic-log
+  (multiple-value-bind (fd phases trace) (simulated-program-load-sequence '(-11 -11 93))
+    (is (= 93 fd))
+    (is (equal '(0 0 0) phases))
+    (is (search "2 EAGAIN retries (initial phase)" trace))))
+
+(test program-load-eagain-can-recover-during-the-logging-phase
+  (multiple-value-bind (fd phases trace) (simulated-program-load-sequence '(-13 -11 -11 94))
+    (is (= 94 fd))
+    (is (equal '(0 6 6 6) phases))
+    (is (search "2 EAGAIN retries (logging phase)" trace))))
+
+(test program-load-eagain-exhaustion-preserves-every-failure-and-bounds-both-phases
+  (multiple-value-bind (error phases trace)
+      (simulated-program-load-sequence (make-list 10 :initial-element -11) :attempts 5)
+    (is (typep error 'whistler/loader:bpf-program-load-error))
+    (is-false (typep error 'whistler/loader:bpf-verifier-error))
+    (is (equal '(0 0 0 0 0 6 6 6 6 6) phases))
+    (is (= 11 (whistler/loader::bpf-error-errno error)))
+    (is (= 11 (whistler/loader::bpf-error-errno
+               (whistler/loader:bpf-program-load-error-initial-error error))))
+    (is (equal (make-list 10 :initial-element 11)
+               (mapcar #'whistler/loader::bpf-error-errno
+                       (whistler/loader:bpf-program-load-error-attempt-errors error))))
+    (is (equal "X" (whistler/loader:bpf-program-load-error-log error)))
+    (is-false (search "recovered" trace))))
+
+(test program-load-eagain-stops-at-a-permanent-error-and-preserves-the-first-one
+  (dolist (permanent '(1 13 22 28))
+    (multiple-value-bind (error phases trace)
+        (simulated-program-load-sequence (list -11 (- permanent) -28))
+      (is (equal '(0 0 6) phases))
+      (is (equal (list 11 permanent 28)
+                 (mapcar #'whistler/loader::bpf-error-errno
+                         (whistler/loader:bpf-program-load-error-attempt-errors error))))
+      (is (eql (= permanent 13) (typep error 'whistler/loader:bpf-verifier-error)))
+      (is (= 11 (whistler/loader::bpf-error-errno
+                 (whistler/loader:bpf-program-load-error-initial-error error))))
+      (is (= 28 (whistler/loader::bpf-error-errno error)))
+      (is-false (search "recovered" trace)))))
+
+(test program-load-attempt-budget-is-validated-before-any-syscall
+  (dolist (attempts '(0 17 -1 1/2))
+    (signals type-error
+      (whistler/loader::load-program
+       #() 3 "GPL" :attempts attempts
+       :bpf (lambda (&rest ignored) (declare (ignore ignored)) (error "must not load")))))
+  (multiple-value-bind (error phases trace)
+      (simulated-program-load-sequence '(-11 -11) :attempts 1)
+    (is (equal '(0 6) phases))
+    (is (typep error 'whistler/loader:bpf-program-load-error))
+    (is-false (search "recovered" trace))))
+
+(test libbpf-classifier-sections-are-sched-cls-programs
+  (dolist (section '("classifier" "action" "tc" "tc/egress"))
+    (is (= whistler/loader::+bpf-prog-type-sched-cls+
+           (whistler/loader::section-to-prog-type section))
+        "~A must load with a __sk_buff context" section)))
+
 ;;; A ring consumer owns two mmapped regions and an epoll fd, and close is
 ;;; the interesting path. It can be exercised without CAP_BPF and without a
 ;;; real ringbuf map: build the consumer over anonymous pages and a bare
@@ -233,6 +405,57 @@
                    (length (whistler/loader::bpf-elf-prog-sections elf)))))
         (when (probe-file object-path) (delete-file object-path))))))
 
+;;; ========== Persistent CNI objects ==========
+
+(test named-map-replacements-reuse-only-the-requested-map
+  (let* ((counter (whistler/loader::make-map-info :name "counter"))
+         (scratch (whistler/loader::make-map-info :name "scratch"))
+         (created nil))
+    (whistler/loader::prepare-map-fds
+     (list counter scratch)
+     '(("counter" . 41))
+     :creator (lambda (map)
+                (push (whistler/loader::map-info-name map) created)
+                73))
+    (is (= 41 (whistler/loader:map-info-fd counter)))
+    (is (= 73 (whistler/loader:map-info-fd scratch)))
+    (is (equal '("scratch") created))))
+
+(test tcx-link-attributes-name-the-program-interface-and-direction
+  (let ((attributes
+          (whistler/loader::make-tcx-link-attributes 17 29 "egress")))
+    (is (= 17 (whistler/binary:u32 attributes 0)))
+    (is (= 29 (whistler/binary:u32 attributes 4)))
+    (is (= whistler/loader::+bpf-tcx-egress+
+           (whistler/binary:u32 attributes 8)))
+    (is (zerop (whistler/binary:u32 attributes 12)))))
+
+(test tcx-link-attributes-reject-an-unknown-direction
+  (signals error
+    (whistler/loader::make-tcx-link-attributes 17 29 "sideways")))
+
+(test pinned-object-operations-encode-the-command-fd-and-attribute-size
+  (let* ((calls nil)
+        (caller (lambda (command attributes size context)
+                  (push (list command
+                              (whistler/binary:u32 attributes 8)
+                              size context)
+                        calls)
+                  53)))
+    (is (= 53 (whistler/loader:pin-bpf-object
+               31 "/sys/fs/bpf/gr8s/link" :bpf-call caller)))
+    (is (= 53 (whistler/loader:open-pinned-object
+               "/sys/fs/bpf/gr8s/map" :bpf-call caller)))
+    (destructuring-bind (open pin) (reverse calls)
+      (is (= whistler/loader::+bpf-obj-pin+ (first open)))
+      (is (= 31 (second open)))
+      (is (= 32 (third open)))
+      (is (search "/sys/fs/bpf/gr8s/link" (fourth open)))
+      (is (= whistler/loader::+bpf-obj-get+ (first pin)))
+      (is (zerop (second pin)))
+      (is (= 32 (third pin)))
+      (is (search "/sys/fs/bpf/gr8s/map" (fourth pin))))))
+
 ;;; ========== Attach-type constants ==========
 ;;;
 ;;; A wrong attach-type constant is the quietest bug the loader can carry.
@@ -322,6 +545,10 @@
                                  whistler/loader::+bpf-trace-fexit+)
                            (cons "BPF_SK_LOOKUP"
                                  whistler/loader::+bpf-sk-lookup+)
+                           (cons "BPF_TCX_INGRESS"
+                                 whistler/loader::+bpf-tcx-ingress+)
+                           (cons "BPF_TCX_EGRESS"
+                                 whistler/loader::+bpf-tcx-egress+)
                            (cons "BPF_PERF_EVENT"
                                  whistler/loader::+bpf-perf-event+)
                            (cons "BPF_LSM_MAC"
