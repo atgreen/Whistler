@@ -85,7 +85,9 @@
     ((and (>= (length section-name) 11)
           (string= (subseq section-name 0 11) "tracepoint/"))
      +bpf-prog-type-tracepoint+)
-    ((or (string= section-name "tc")
+    ((or (string= section-name "classifier")
+         (string= section-name "action")
+         (string= section-name "tc")
          (and (> (length section-name) 3)
               (string= (subseq section-name 0 3) "tc/")))
      +bpf-prog-type-sched-cls+)
@@ -169,12 +171,35 @@
 
 ;;; ========== Program loading ==========
 
+(defun load-program-attempts (bpf buf attempts record-error phase)
+  "Retry only EAGAIN, with a fixed syscall budget and no userspace delay.
+Linux libbpf's sys_bpf_prog_load uses the same bounded EAGAIN retry rule."
+  (loop for attempt from 1 to attempts
+        do (handler-case
+               (let ((fd (funcall bpf +bpf-prog-load+ buf 256 "prog-load")))
+                 (when (> attempt 1)
+                   ;; A diagnostic stream failure must not lose the new FD.
+                   (ignore-errors
+                     (format *trace-output* ";; BPF load recovered after ~D EAGAIN retries (~A phase)~%"
+                             (1- attempt) phase)))
+                 (return fd))
+             (bpf-error (error)
+               (funcall record-error error)
+               (unless (and (= 11 (bpf-error-errno error)) (< attempt attempts))
+                 (error error))))))
+
 (defun load-program (insns prog-type license &key (log-level 0) (log-buf-size (ash 1 20))
-                                                   expected-attach-type attach-btf-id)
+                                                   expected-attach-type attach-btf-id (bpf #'%bpf)
+                                                   (attempts 5))
   "Load a BPF program into the kernel. Returns the prog FD.
    EXPECTED-ATTACH-TYPE is required for cgroup program types.
-   On failure, retries with logging and signals bpf-verifier-error."
+   On failure, retries with logging. A failed retry preserves the original
+   condition, retry errno and log in bpf-program-load-error (or its
+   bpf-verifier-error subtype when any attempt returns EACCES).
+   Each phase makes at most ATTEMPTS syscalls, retrying only EAGAIN."
+  (check-type attempts (integer 1 16))
   (let* ((buf (make-attr-buf))
+         (errors nil)
          (insn-count (/ (length insns) 8))
          ;; SYSCALL programs require BPF_F_SLEEPABLE; nothing else
          ;; needs special flags at load time.
@@ -199,8 +224,9 @@
                     prog-type expected-attach-type attach-btf-id))
           ;; Try without log first
           (handler-case
-              (%bpf +bpf-prog-load+ buf 256 "prog-load")
-            (bpf-error ()
+              (load-program-attempts bpf buf attempts (lambda (error) (push error errors)) "initial")
+            (bpf-error (initial-error)
+              (setf initial-error (car (last errors)))
               ;; Retry with verifier log
               (let ((log-buf (make-array log-buf-size
                                          :element-type '(unsigned-byte 8)
@@ -220,25 +246,23 @@
                   (when attach-btf-id
                     (put-u32 buf 108 attach-btf-id))
                   (handler-case
-                      (%bpf +bpf-prog-load+ buf 256 "prog-load")
+                      (load-program-attempts bpf buf attempts (lambda (error) (push error errors)) "logging")
                     (bpf-error (e)
                       (let* ((end (or (position 0 log-buf) (length log-buf)))
                              (log-str (sb-ext:octets-to-string
-                                       log-buf :end end :external-format :utf-8))
+                                       log-buf :end end :external-format :latin-1))
                              (errno (bpf-error-errno e)))
-                        ;; Only EACCES (13) is a verifier-logic rejection — the
-                        ;; log buffer holds the verifier trace. Other errnos are
-                        ;; not verifier rejections and yield an empty log:
-                        ;; EPERM (1, missing capability such as CAP_NET_ADMIN),
-                        ;; EINVAL (22, bad attr / prog type), etc. Surfacing them
-                        ;; as bpf-verifier-error with a blank log is misleading,
-                        ;; so re-raise the underlying bpf-error (carrying errno).
-                        (if (= errno 13)
-                            (error 'bpf-verifier-error
-                                   :context "prog-load"
-                                   :errno errno
-                                   :log log-str)
-                            (error e))))))))))))))
+                        ;; Logging can itself fail (notably ENOSPC), masking
+                        ;; the original rejection. Preserve both errnos and
+                        ;; whatever trace the kernel wrote for every failure.
+                        ;; Decode bytes losslessly even if a full buffer ends
+                        ;; in the middle of a UTF-8 sequence.
+                        (error (if (some (lambda (error) (= 13 (bpf-error-errno error))) errors)
+                                   'bpf-verifier-error 'bpf-program-load-error)
+                               :context "prog-load" :errno errno
+                               :initial-error initial-error :log log-str
+                               :attempt-errors (nreverse errors)
+                               :log-buf-size log-buf-size)))))))))))))
 
 (defun prog-test-run (prog-fd)
   "Invoke a loaded BPF program once via BPF_PROG_TEST_RUN. Mirrors

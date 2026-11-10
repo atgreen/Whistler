@@ -43,7 +43,26 @@
     (make-bpf-object :pathname pathname :elf elf
                      :maps map-infos :progs nil :attachments nil)))
 
-(defun load-bpf-object (obj)
+(defun replacement-map-fd (replacement)
+  (etypecase replacement
+    (integer replacement)
+    (map-info (map-info-fd replacement))))
+
+(defun prepare-map-fds (map-infos map-replacements &key (creator #'create-map))
+  "Install named MAP-REPLACEMENTS and create every remaining map."
+  (dolist (replacement map-replacements)
+    (unless (find (car replacement) map-infos
+                  :key #'map-info-name :test #'string=)
+      (error "BPF object has no map named ~A" (car replacement))))
+  (dolist (map map-infos map-infos)
+    (let ((replacement
+            (assoc (map-info-name map) map-replacements :test #'string=)))
+      (setf (map-info-fd map)
+            (if replacement
+                (replacement-map-fd (cdr replacement))
+                (funcall creator map))))))
+
+(defun load-bpf-object (obj &key map-replacements)
   "Create maps, patch relocations, and load all programs into the kernel."
   (let* ((elf (bpf-object-elf obj))
          (map-infos (bpf-object-maps obj))
@@ -51,10 +70,7 @@
          (license (or (bpf-elf-license elf) "GPL")))
 
     ;; Step 1: Create all maps
-    (dolist (m map-infos)
-      (create-map m)
-      (format t "Created map ~a: fd=~d type=~d~%"
-              (map-info-name m) (map-info-fd m) (map-info-type m)))
+    (prepare-map-fds map-infos map-replacements)
 
     ;; Build map-name → fd alist for relocation patching
     (let ((map-fds (mapcar (lambda (m) (cons (map-info-name m) (map-info-fd m)))

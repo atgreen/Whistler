@@ -13,6 +13,7 @@
    #:bpf-session-map #:bpf-session-prog
    #:encode-int-key #:decode-int-value
    #:with-bpf-object #:open-bpf-object #:load-bpf-object #:close-bpf-object
+   #:pin-bpf-object #:open-pinned-object
    ;; Accessors
    #:bpf-object-map #:bpf-object-prog #:prog-info-fd #:prog-info-name
    #:prog-test-run
@@ -25,6 +26,7 @@
    #:map-info-fd #:map-info-name
    ;; Attachment
    #:attach-kprobe #:attach-uprobe #:attach-tracepoint #:attach-xdp #:attach-tc
+   #:attach-tcx
    #:attach-cgroup #:attach-lsm #:attach-fentry #:attach-kprobe-multi
    #:attach-sk-lookup #:detach
    #:attach-obj-kprobe #:attach-obj-uprobe #:attach-obj-cgroup
@@ -43,7 +45,10 @@
    #:open-ring-consumer #:ring-poll #:ring-consume #:close-ring-consumer
    #:open-decoding-ring-consumer #:with-decoding-ring-consumer
    ;; Conditions
-   #:bpf-error #:bpf-verifier-error))
+   #:bpf-error #:bpf-program-load-error #:bpf-verifier-error
+   #:bpf-program-load-error-initial-error #:bpf-program-load-error-log
+   #:bpf-program-load-error-attempt-errors
+   #:bpf-program-load-error-log-buf-size))
 
 (defpackage #:whistler-loader-user
   (:use #:cl #:whistler #:whistler/loader)

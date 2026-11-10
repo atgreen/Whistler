@@ -264,6 +264,29 @@
 
 ;;; ========== TC (traffic control) attachment ==========
 
+(defun make-tcx-link-attributes (prog-fd interface-index direction)
+  "Build BPF_LINK_CREATE attributes for a persistent TCX attachment."
+  (let ((attributes (make-attr-buf))
+        (attach-type
+          (cond
+            ((string= direction "ingress") +bpf-tcx-ingress+)
+            ((string= direction "egress") +bpf-tcx-egress+)
+            (t (error "TCX direction must be ingress or egress, not ~S"
+                      direction)))))
+    (put-u32 attributes 0 prog-fd)
+    (put-u32 attributes 4 interface-index)
+    (put-u32 attributes 8 attach-type)
+    attributes))
+
+(defun attach-tcx (prog-fd interface-index &key (direction "ingress"))
+  "Attach PROG-FD to INTERFACE-INDEX with a pinnable TCX BPF link.
+   Returns the link file descriptor. Linux 6.6 or newer is required."
+  (%bpf +bpf-link-create+
+        (make-tcx-link-attributes prog-fd interface-index direction)
+        16
+        (format nil "attach-tcx ifindex=~D direction=~A"
+                interface-index direction)))
+
 (defun attach-tc (prog-fd interface-name &key (direction "ingress"))
   "Attach a BPF program as a TC filter on INTERFACE-NAME.
    DIRECTION is \"ingress\" or \"egress\".
